@@ -6,13 +6,14 @@
 
 TMP_AUDIO="/tmp/claude-tts-$$.aiff"
 VOICE_MODE_FLAG="/tmp/claude-voice-mode"
+trap 'rm -f "$TMP_AUDIO"' EXIT
 
 # Read JSON from stdin, extract message
 json=$(cat)
 msg=$(echo "$json" | jq -r '.stop_hook_message // .message // .content // ""' 2>/dev/null)
 
 # Skip if empty or too short
-[ -z "$msg" ] || [ ${#msg} -lt 30 ] && exit 0
+if [ -z "$msg" ] || [ ${#msg} -lt 30 ]; then exit 0; fi
 
 strip_markdown() {
     # Replace code blocks (``` ... ```) with "See code on screen."
@@ -45,11 +46,9 @@ strip_markdown() {
 
 speak() {
     local text="$1"
-    local rate="${2:-}"
-    local rate_flag=""
-    [ -n "$rate" ] && rate_flag="-r $rate"
-    echo "$text" | say $rate_flag -o "$TMP_AUDIO" 2>/dev/null && afplay "$TMP_AUDIO" 2>/dev/null
-    rm -f "$TMP_AUDIO"
+    local -a say_args=()
+    [ -n "${2:-}" ] && say_args+=(-r "$2")
+    echo "$text" | say "${say_args[@]}" -o "$TMP_AUDIO" 2>/dev/null && afplay "$TMP_AUDIO" 2>/dev/null
 }
 
 if [ -f "$VOICE_MODE_FLAG" ]; then
