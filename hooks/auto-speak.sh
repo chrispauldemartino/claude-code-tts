@@ -6,6 +6,7 @@
 CONFIG_FILE="/tmp/claude-voice-config"
 SKIP_FLAG="/tmp/claude-tts-skip"
 TMP_AUDIO="/tmp/claude-tts-$$.aiff"
+trap 'rm -f "$TMP_AUDIO"' EXIT
 LISTEN_SOUND="/System/Library/Sounds/Tink.aiff"
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_BIN="$PLUGIN_DIR/bin"
@@ -83,6 +84,8 @@ speak() {
     rm -f "$TMP_AUDIO"
 }
 
+# Note: skip flag is checked between sentences. A currently-playing sentence
+# will finish before the skip takes effect. This is acceptable UX.
 speak_sentences() {
     local text="$1"
     local rate="${2:-200}"
@@ -97,16 +100,17 @@ speak_sentences() {
 }
 
 start_skip_listener() {
+    rm -f /tmp/claude-tts-skip-listener-stop
     pkill -f "skip-listener" 2>/dev/null
     "$PLUGIN_BIN/skip-listener" --timeout 300 &
     SKIP_LISTENER_PID=$!
-    disown $SKIP_LISTENER_PID 2>/dev/null
+    disown "$SKIP_LISTENER_PID" 2>/dev/null
 }
 
 stop_skip_listener() {
     touch "/tmp/claude-tts-skip-listener-stop" 2>/dev/null
     sleep 0.2
-    kill $SKIP_LISTENER_PID 2>/dev/null 2>&1
+    [ -n "$SKIP_LISTENER_PID" ] && kill "$SKIP_LISTENER_PID" 2>/dev/null
 }
 
 if has_config; then
@@ -114,6 +118,7 @@ if has_config; then
     MIC=$(read_config "mic" "off")
     CUE=$(read_config "cue" "off")
     SPEED=$(read_config "speed" "200")
+    [[ "$SPEED" =~ ^[0-9]+$ ]] || SPEED=200
     VOLUME=$(read_config "volume" "normal")
     SUMMARY=$(read_config "summary" "off")
     CODE=$(read_config "code" "silent")
@@ -132,7 +137,7 @@ if has_config; then
                 speak "$summary_text" "$SPEED" "$VOL_LEVEL"
             else
                 # Fallback: first sentence
-                first=$(echo "$msg" | sed 's/\..*/./' | head -c 200)
+                first=$(echo "$msg" | sed 's/\. [A-Z].*/\./' | head -c 200)
                 speak "$first" "$SPEED" "$VOL_LEVEL"
             fi
         else
@@ -165,11 +170,9 @@ if has_config; then
     fi
 else
     # --- DEFAULT MODE (no config) ---
-    if [ ${#msg} -ge 30 ]; then
-        start_skip_listener
-        summary=$(echo "$msg" | sed 's/\..*/./' | head -c 200)
-        speak "$summary" 200 1.0
-        stop_skip_listener
-        rm -f "$SKIP_FLAG"
-    fi
+    start_skip_listener
+    summary=$(echo "$msg" | sed 's/\. [A-Z].*/\./' | head -c 200)
+    speak "$summary" 200 1.0
+    stop_skip_listener
+    rm -f "$SKIP_FLAG"
 fi
