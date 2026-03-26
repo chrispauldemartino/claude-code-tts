@@ -42,7 +42,7 @@ These set multiple toggles at once.
 Full reset to defaults. Activates everything.
 
 ```bash
-cat > /tmp/claude-voice-config << 'EOF'
+cat > /tmp/claude-voice-config.tmp << 'EOF'
 voice=on
 mic=on
 speed=200
@@ -51,6 +51,7 @@ summary=off
 code=silent
 cue=on
 EOF
+mv /tmp/claude-voice-config.tmp /tmp/claude-voice-config
 ```
 
 Confirm: "Voice mode activated. I'll speak my replies and open the mic. Say send to submit."
@@ -70,18 +71,23 @@ Confirm: "Text mode. Back to normal."
 Claude speaks, user types. No mic, no cue.
 
 ```bash
-cat > /tmp/claude-voice-config << 'EOF'
+existing_speed=$(grep '^speed=' /tmp/claude-voice-config 2>/dev/null | cut -d= -f2)
+existing_volume=$(grep '^volume=' /tmp/claude-voice-config 2>/dev/null | cut -d= -f2)
+existing_summary=$(grep '^summary=' /tmp/claude-voice-config 2>/dev/null | cut -d= -f2)
+existing_code=$(grep '^code=' /tmp/claude-voice-config 2>/dev/null | cut -d= -f2)
+cat > /tmp/claude-voice-config.tmp << EOF
 voice=on
 mic=off
-speed=${EXISTING_SPEED:-200}
-volume=${EXISTING_VOLUME:-normal}
-summary=${EXISTING_SUMMARY:-off}
-code=${EXISTING_CODE:-silent}
+speed=${existing_speed:-200}
+volume=${existing_volume:-normal}
+summary=${existing_summary:-off}
+code=${existing_code:-silent}
 cue=off
 EOF
+mv /tmp/claude-voice-config.tmp /tmp/claude-voice-config
 ```
 
-To preserve existing values, first read the current config if it exists, then write the file keeping speed/volume/summary/code from the existing config (or defaults if no config exists). Set voice=on, mic=off, cue=off.
+Preserves existing speed/volume/summary/code values (or defaults if no config exists). Sets voice=on, mic=off, cue=off.
 
 Confirm: "Listen mode. I'll speak, you type."
 
@@ -90,18 +96,23 @@ Confirm: "Listen mode. I'll speak, you type."
 User speaks, Claude replies in text. No voice output, no cue.
 
 ```bash
-cat > /tmp/claude-voice-config << 'EOF'
+existing_speed=$(grep '^speed=' /tmp/claude-voice-config 2>/dev/null | cut -d= -f2)
+existing_volume=$(grep '^volume=' /tmp/claude-voice-config 2>/dev/null | cut -d= -f2)
+existing_summary=$(grep '^summary=' /tmp/claude-voice-config 2>/dev/null | cut -d= -f2)
+existing_code=$(grep '^code=' /tmp/claude-voice-config 2>/dev/null | cut -d= -f2)
+cat > /tmp/claude-voice-config.tmp << EOF
 voice=off
 mic=on
-speed=${EXISTING_SPEED:-200}
-volume=${EXISTING_VOLUME:-normal}
-summary=${EXISTING_SUMMARY:-off}
-code=${EXISTING_CODE:-silent}
+speed=${existing_speed:-200}
+volume=${existing_volume:-normal}
+summary=${existing_summary:-off}
+code=${existing_code:-silent}
 cue=off
 EOF
+mv /tmp/claude-voice-config.tmp /tmp/claude-voice-config
 ```
 
-Same approach: preserve existing speed/volume/summary/code values, set voice=off, mic=on, cue=off.
+Preserves existing speed/volume/summary/code values (or defaults if no config exists). Sets voice=off, mic=on, cue=off.
 
 Confirm: "Dictation mode. You speak, I'll reply in text."
 
@@ -109,7 +120,19 @@ Confirm: "Dictation mode. You speak, I'll reply in text."
 
 Lower volume and faster speech. Keeps other values.
 
+If no config file exists, create one with all defaults first, then apply quiet mode changes.
+
 ```bash
+[ ! -f /tmp/claude-voice-config ] && cat > /tmp/claude-voice-config.tmp << 'EOF'
+voice=on
+mic=on
+speed=200
+volume=normal
+summary=off
+code=silent
+cue=on
+EOF
+mv /tmp/claude-voice-config.tmp /tmp/claude-voice-config
 sed -i '' "s/^volume=.*/volume=quiet/" /tmp/claude-voice-config
 sed -i '' "s/^speed=.*/speed=250/" /tmp/claude-voice-config
 ```
@@ -126,9 +149,21 @@ These update a single setting in the existing config file.
 sed -i '' "s/^voice=.*/voice=on/" /tmp/claude-voice-config
 ```
 
+or
+
+```bash
+sed -i '' "s/^voice=.*/voice=off/" /tmp/claude-voice-config
+```
+
 Confirm: "Voice on." or "Voice off."
 
 ### "mic on" / "mic off"
+
+```bash
+sed -i '' "s/^mic=.*/mic=on/" /tmp/claude-voice-config
+```
+
+or
 
 ```bash
 sed -i '' "s/^mic=.*/mic=off/" /tmp/claude-voice-config
@@ -140,6 +175,12 @@ Confirm: "Mic on." or "Mic off."
 
 ```bash
 sed -i '' "s/^cue=.*/cue=on/" /tmp/claude-voice-config
+```
+
+or
+
+```bash
+sed -i '' "s/^cue=.*/cue=off/" /tmp/claude-voice-config
 ```
 
 Confirm: "Cue on." or "Cue off."
@@ -227,6 +268,8 @@ Adapt output based on the current config values. Read `/tmp/claude-voice-config`
 
 - Normal text output. No style adaptation needed.
 - Standard markdown, full detail, code blocks as usual.
+
+When summary=on, the hook speaks only the summary regardless of the code toggle. Code narration applies only when summary=off.
 
 ## Controls
 
