@@ -15,6 +15,7 @@ let debugLogPath = "/tmp/claude-voice-input-debug.log"
 let backspaceKeyCode: CGKeyCode = 51
 let enterKeyCode: CGKeyCode = 36
 let sendStabilityDelay: TimeInterval = 1.5
+let sendingFlag = "/tmp/claude-voice-input-sending"
 
 let hallucinationTokens: Set<String> = [
     "[BLANK_AUDIO]", "[MUSIC PLAYING]", "[MUSIC]", "[END PLAYBACK]",
@@ -255,6 +256,7 @@ class SendDetector {
 // Clean up old flags
 unlink(stopFlag)
 unlink(skipFlag)
+unlink(sendingFlag)
 
 let parser = WhisperStreamParser()
 let typer = TextTyper()
@@ -264,6 +266,7 @@ var exiting = false
 
 func shutdown(deletingText: Bool = false) {
     guard !exiting else { return }
+    try? FileManager.default.removeItem(atPath: sendingFlag)
     exiting = true
     detector.cancel()
 
@@ -317,7 +320,12 @@ func triggerSend() {
         typer.previouslyTyped.dropLast(deleteCount))
     usleep(100_000)
 
+    // Flag that WE are pressing Enter (so skip-listener ignores it)
+    FileManager.default.createFile(atPath: sendingFlag, contents: nil)
     typer.pressEnter()
+    usleep(100_000)
+    try? FileManager.default.removeItem(atPath: sendingFlag)
+
     debugLog("Send complete, exiting")
     usleep(200_000)
     exit(0)
