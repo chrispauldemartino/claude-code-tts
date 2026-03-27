@@ -9,10 +9,19 @@ PAUSE_FLAG="/tmp/claude-tts-pause"
 TTS_PLAYING_FLAG="/tmp/claude-tts-playing"
 MIC_LISTENING_FLAG="/tmp/claude-voice-listening"
 TMP_AUDIO="/tmp/claude-tts-$$.aiff"
-trap 'rm -f "$TMP_AUDIO"' EXIT
+PENDING_FILE="/tmp/claude-tts-pending"
+FORWARD_FLAG="/tmp/claude-tts-forward"
+REWIND_FLAG="/tmp/claude-tts-rewind"
+LAST_TEXT="/tmp/claude-tts-last-text"
+LAST_SPEED="/tmp/claude-tts-last-speed"
+LAST_VOLUME="/tmp/claude-tts-last-volume"
+HISTORY_DIR="/tmp/claude-tts-history-$PPID"
 LISTEN_SOUND="/System/Library/Sounds/Tink.aiff"
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_BIN="$PLUGIN_DIR/bin"
+INVOCATION_ID="$$-$(date +%s)"
+
+trap 'rm -f "$TMP_AUDIO"' EXIT
 
 read_config() {
     local key="$1"
@@ -87,19 +96,77 @@ speak() {
     rm -f "$TMP_AUDIO"
 }
 
-# Note: skip flag is checked between sentences. A currently-playing sentence
-# will finish before the skip takes effect. This is acceptable UX.
+# Sentence-indexed playback with forward/rewind support
 speak_sentences() {
     local text="$1"
     local rate="${2:-200}"
     local vol="${3:-1.0}"
-    echo "$text" | sed -E 's/([.!?]) /\1\n/g' | while IFS= read -r sentence; do
+
+    # Split into sentence file for indexed access
+    local sentences_file="/tmp/claude-tts-sentences-$$"
+    echo "$text" | sed -E 's/([.!?]) /\1\n/g' | grep -v '^[[:space:]]*$' > "$sentences_file"
+    local total
+    total=$(wc -l < "$sentences_file" | tr -d ' ')
+    local idx=1
+
+    while [ "$idx" -le "$total" ]; do
         [ -f "$SKIP_FLAG" ] && break
-        [ -z "$sentence" ] && continue
+
+        # Check forward flag (+3 sentences)
+        if [ -f "$FORWARD_FLAG" ]; then
+            rm -f "$FORWARD_FLAG"
+            pkill say 2>/dev/null; pkill afplay 2>/dev/null
+            idx=$((idx + 3))
+            [ "$idx" -gt "$total" ] && idx=$total
+            continue
+        fi
+
+        # Check rewind flag (-3 sentences)
+        if [ -f "$REWIND_FLAG" ]; then
+            rm -f "$REWIND_FLAG"
+            pkill say 2>/dev/null; pkill afplay 2>/dev/null
+            idx=$((idx - 3))
+            [ "$idx" -lt 1 ] && idx=1
+            continue
+        fi
+
+        local sentence
+        sentence=$(sed -n "${idx}p" "$sentences_file")
+        [ -z "$sentence" ] && { idx=$((idx + 1)); continue; }
+
         echo "$sentence" | say -r "$rate" -o "$TMP_AUDIO" 2>/dev/null \
             && afplay --volume "$vol" "$TMP_AUDIO" 2>/dev/null
         rm -f "$TMP_AUDIO"
+        idx=$((idx + 1))
     done
+
+    rm -f "$sentences_file"
+}
+
+# Save text for repeat (cmd+shift) and session history (opt+shift+arrow)
+save_for_repeat() {
+    local text="$1"
+    local speed="$2"
+    local volume="$3"
+
+    # Save for repeat
+    echo "$text" > "$LAST_TEXT"
+    echo "$speed" > "$LAST_SPEED"
+    echo "$volume" > "$LAST_VOLUME"
+
+    # Save to session history
+    mkdir -p "$HISTORY_DIR"
+    local current_total=0
+    [ -f "$HISTORY_DIR/total" ] && current_total=$(cat "$HISTORY_DIR/total")
+    local next=$((current_total + 1))
+    local padded
+    padded=$(printf "%03d" "$next")
+
+    echo "$text" > "$HISTORY_DIR/msg-${padded}.txt"
+    echo "$speed" > "$HISTORY_DIR/msg-${padded}.speed"
+    echo "$volume" > "$HISTORY_DIR/msg-${padded}.volume"
+    echo "$next" > "$HISTORY_DIR/total"
+    echo "$next" > "$HISTORY_DIR/current"
 }
 
 start_skip_listener() {
@@ -129,8 +196,21 @@ if has_config; then
     VOL_LEVEL="1.0"
     [ "$VOLUME" = "quiet" ] && VOL_LEVEL="0.3"
 
+    # --- DEDUPLICATION ---
+    # Only speak the last message when multiple Stop hooks fire in rapid succession.
+    # Write our ID, wait briefly, check if a newer invocation superseded us.
+    if [ "$VOICE" = "on" ]; then
+        echo "$INVOCATION_ID" > "$PENDING_FILE"
+        sleep 0.5
+        current_pending=$(cat "$PENDING_FILE" 2>/dev/null)
+        if [ "$current_pending" != "$INVOCATION_ID" ]; then
+            exit 0
+        fi
+    fi
+
     # Clean up stale flags from previous cycle
     rm -f "$PAUSE_FLAG" "$TTS_PLAYING_FLAG" "$MIC_LISTENING_FLAG" /tmp/claude-voice-input-stop
+    rm -f "$FORWARD_FLAG" "$REWIND_FLAG" /tmp/claude-tts-next-msg /tmp/claude-tts-prev-msg
 
     # Start skip/pause listener (covers BOTH TTS and mic phases)
     if [ "$VOICE" = "on" ] || [ "$MIC" = "on" ]; then
@@ -145,19 +225,21 @@ if has_config; then
             # Extract [SUMMARY: ...] marker
             summary_text=$(echo "$msg" | sed -n 's/.*\[SUMMARY: \(.*\)\].*/\1/p' | head -1)
             if [ -n "$summary_text" ]; then
-                speak "$summary_text" "$SPEED" "$VOL_LEVEL"
+                cleaned_text="$summary_text"
             else
                 # Fallback: first sentence
-                first=$(echo "$msg" | sed 's/\. [A-Z].*/\./' | head -c 200)
-                speak "$first" "$SPEED" "$VOL_LEVEL"
+                cleaned_text=$(echo "$msg" | sed 's/\. [A-Z].*/\./' | head -c 200)
             fi
+            save_for_repeat "$cleaned_text" "$SPEED" "$VOL_LEVEL"
+            speak "$cleaned_text" "$SPEED" "$VOL_LEVEL"
         else
             # Full response (markdown-stripped)
-            cleaned=$(strip_markdown "$msg" "$CODE")
-            speak_sentences "$cleaned" "$SPEED" "$VOL_LEVEL"
+            cleaned_text=$(strip_markdown "$msg" "$CODE")
+            save_for_repeat "$cleaned_text" "$SPEED" "$VOL_LEVEL"
+            speak_sentences "$cleaned_text" "$SPEED" "$VOL_LEVEL"
         fi
 
-        rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG"
+        rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG" "$PENDING_FILE"
     fi
 
     # --- MIC ACTIVATION ---
