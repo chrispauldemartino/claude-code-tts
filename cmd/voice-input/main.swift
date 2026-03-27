@@ -26,7 +26,7 @@ let hallucinationTokens: Set<String> = [
 // MARK: - Arguments
 
 let binaryDir = (CommandLine.arguments[0] as NSString).deletingLastPathComponent
-var modelPath = "\(binaryDir)/../models/ggml-base.en.bin"
+var modelPath = "\(binaryDir)/../models/ggml-small.en.bin"
 var timeout: TimeInterval = 120
 var debug = false
 
@@ -339,9 +339,8 @@ process.executableURL = URL(fileURLWithPath: whisperStreamPath)
 process.arguments = [
     "-m", modelPath,
     "--step", "3000",
-    "--length", "10000",
-    "--keep-context",
-    "--keep", "200",
+    "--length", "8000",
+    "--vad-thold", "0.8",
 ]
 process.standardError = FileHandle.nullDevice
 

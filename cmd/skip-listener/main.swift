@@ -174,22 +174,23 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         return Unmanaged.passUnretained(event)
     }
 
-    // --- ENTER KEY: STOP MIC SESSION ---
+    // --- ENTER KEY: STOP VOICE SESSION (TTS + MIC) ---
     if type == .keyDown {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        if keyCode == enterKeyCode && isMicActive() {
+        if keyCode == enterKeyCode && isVoiceActive() {
             if !FileManager.default.fileExists(atPath: sendingFlag) {
-                debugPrint("Enter pressed during mic — stopping voice session")
+                debugPrint("Enter pressed during voice session — stopping everything")
                 DispatchQueue.main.async {
                     FileManager.default.createFile(atPath: voiceInputStopFlag, contents: nil)
-                    for name in ["voice-input", "whisper-stream"] {
+                    FileManager.default.createFile(atPath: skipFlag, contents: nil)
+                    for name in ["voice-input", "whisper-stream", "say", "afplay"] {
                         let proc = Process()
                         proc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
                         proc.arguments = ["-f", name]
                         try? proc.run()
                         proc.waitUntilExit()
                     }
-                    debugPrint("Voice session killed via Enter key")
+                    debugPrint("Voice session killed via Enter key (TTS + mic)")
                 }
             } else {
                 debugPrint("Enter pressed but sending flag present — ignoring (voice-input send)")

@@ -5,6 +5,9 @@
 
 CONFIG_FILE="/tmp/claude-voice-config"
 SKIP_FLAG="/tmp/claude-tts-skip"
+PAUSE_FLAG="/tmp/claude-tts-pause"
+TTS_PLAYING_FLAG="/tmp/claude-tts-playing"
+MIC_LISTENING_FLAG="/tmp/claude-voice-listening"
 TMP_AUDIO="/tmp/claude-tts-$$.aiff"
 trap 'rm -f "$TMP_AUDIO"' EXIT
 LISTEN_SOUND="/System/Library/Sounds/Tink.aiff"
@@ -31,7 +34,7 @@ has_config() {
 json=$(cat)
 msg=$(echo "$json" | jq -r '.last_assistant_message // .stop_hook_message // .message // .content // ""' 2>/dev/null)
 
-[ -z "$msg" ] || [ ${#msg} -lt 30 ] && exit 0
+[ -z "$msg" ] && exit 0
 
 rm -f "$SKIP_FLAG"
 
@@ -126,9 +129,17 @@ if has_config; then
     VOL_LEVEL="1.0"
     [ "$VOLUME" = "quiet" ] && VOL_LEVEL="0.3"
 
+    # Clean up stale flags from previous cycle
+    rm -f "$PAUSE_FLAG" "$TTS_PLAYING_FLAG" "$MIC_LISTENING_FLAG" /tmp/claude-voice-input-stop
+
+    # Start skip/pause listener (covers BOTH TTS and mic phases)
+    if [ "$VOICE" = "on" ] || [ "$MIC" = "on" ]; then
+        start_skip_listener
+    fi
+
     # --- VOICE OUTPUT ---
     if [ "$VOICE" = "on" ]; then
-        start_skip_listener
+        touch "$TTS_PLAYING_FLAG"
 
         if [ "$SUMMARY" = "on" ]; then
             # Extract [SUMMARY: ...] marker
@@ -146,27 +157,38 @@ if has_config; then
             speak_sentences "$cleaned" "$SPEED" "$VOL_LEVEL"
         fi
 
-        stop_skip_listener
-        rm -f "$SKIP_FLAG"
-    fi
-
-    # --- CUE ---
-    if [ "$CUE" = "on" ] && [ ! -f "$SKIP_FLAG" ]; then
-        speak "Your turn" "$SPEED" "$VOL_LEVEL"
+        rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG"
     fi
 
     # --- MIC ACTIVATION ---
-    if [ "$MIC" = "on" ]; then
+    # Skip mic if user already submitted (Enter during TTS creates stop flag)
+    if [ "$MIC" = "on" ] && [ ! -f /tmp/claude-voice-input-stop ]; then
         pkill -f "voice-input" 2>/dev/null
         pkill -f "whisper-stream" 2>/dev/null
         rm -f /tmp/claude-voice-input-stop
 
+        # Set preferred mic device if configured
+        MIC_DEVICE=$(read_config "mic_device" "")
+        if [ -n "$MIC_DEVICE" ] && command -v SwitchAudioSource >/dev/null 2>&1; then
+            SwitchAudioSource -s "$MIC_DEVICE" -t input 2>/dev/null
+        fi
+
+        PLAY_CUE="$CUE"
         (
             sleep 0.3
-            afplay "$LISTEN_SOUND" 2>/dev/null &
+            [ "$PLAY_CUE" = "on" ] && afplay "$LISTEN_SOUND" 2>/dev/null
+            touch "$MIC_LISTENING_FLAG"
             "$PLUGIN_BIN/voice-input" --timeout 60
+            rm -f "$MIC_LISTENING_FLAG" "$PAUSE_FLAG"
+            # Signal skip-listener to stop (mic phase done)
+            touch /tmp/claude-tts-skip-listener-stop
         ) &
         disown
+    else
+        # No mic phase — stop skip-listener now
+        if [ "$VOICE" = "on" ]; then
+            stop_skip_listener
+        fi
     fi
 else
     # --- DEFAULT MODE (no config) ---

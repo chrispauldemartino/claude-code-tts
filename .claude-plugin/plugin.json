@@ -1,0 +1,7 @@
+{
+  "name": "claude-code-tts",
+  "version": "1.3.0",
+  "description": "Text-to-Speech voice mode plugin for Claude Code — TTS output, mic input, keyboard controls",
+  "author": "Community",
+  "license": "MIT"
+}

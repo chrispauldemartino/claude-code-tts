@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# Auto-speak hook for Claude Code (VS Code)
+# Default: speaks first sentence only
+# Voice mode: speaks all responses, launches local Whisper for voice input
+# Skip speech: double-tap Command key (system-wide) or touch /tmp/claude-tts-skip
+
+VOICE_MODE_FLAG="/tmp/claude-voice-mode"
+SKIP_FLAG="/tmp/claude-tts-skip"
+LISTEN_SOUND="/System/Library/Sounds/Tink.aiff"
+PLUGIN_BIN="$(cd "$(dirname "$0")/.." && pwd)/bin"
+SKIP_LISTENER="$PLUGIN_BIN/skip-listener"
+SKIP_LISTENER_STOP="/tmp/claude-tts-skip-listener-stop"
+SPEAK_RATE=300
+VOICE_TIMEOUT=60
+
+rm -f "$SKIP_FLAG"
+
+# Start double-Command-tap listener (kills speech on double-tap)
+start_skip_listener() {
+    # Kill any existing listener first
+    pkill -f "skip-listener" 2>/dev/null
+    "$SKIP_LISTENER" --timeout 120 &
+    SKIP_LISTENER_PID=$!
+    disown $SKIP_LISTENER_PID 2>/dev/null
+}
+
+stop_skip_listener() {
+    touch "$SKIP_LISTENER_STOP" 2>/dev/null
+    # Give it a moment to exit gracefully, then force if needed
+    sleep 0.2
+    kill $SKIP_LISTENER_PID 2>/dev/null 2>&1
+}
+
+# Read JSON from stdin, extract message
+json=$(cat)
+msg=$(echo "$json" | jq -r '.last_assistant_message // ""' 2>/dev/null)
+
+if [ -z "$msg" ]; then exit 0; fi
+
+strip_markdown() {
+    echo "$1" | awk '
+        /^```/ {
+            if (in_code) {
+                in_code = 0
+                print "See code on screen."
+            } else {
+                in_code = 1
+            }
+            next
+        }
+        in_code { next }
+        { print }
+    ' | sed -E \
+        -e 's/^#{1,6} //' \
+        -e 's/\*\*([^*]*)\*\*/\1/g' \
+        -e 's/\*([^*]*)\*/\1/g' \
+        -e 's/__([^_]*)__/\1/g' \
+        -e 's/_([^_]*)_/\1/g' \
+        -e 's/`([^`]*)`/\1/g' \
+        -e 's/\[([^]]*)\]\([^)]*\)/\1/g' \
+        -e 's/^- //' \
+        -e 's/^\* //' \
+        -e 's/^[0-9]+\. //' \
+        -e '/^[[:space:]]*$/d'
+}
+
+# Speak text sentence by sentence (interruptible between sentences)
+speak() {
+    local text="$1"
+    # Split on sentence-ending punctuation, speak each chunk
+    echo "$text" | sed -E 's/([.!?]) /\1\n/g' | while IFS= read -r sentence; do
+        # Check for skip signal
+        [ -f "$SKIP_FLAG" ] && break
+        [ -z "$sentence" ] && continue
+        echo "$sentence" | say -r "$SPEAK_RATE" 2>/dev/null
+    done
+    rm -f "$SKIP_FLAG"
+}
+
+if [ -f "$VOICE_MODE_FLAG" ]; then
+    # === VOICE MODE: speak everything ===
+    cleaned=$(strip_markdown "$msg")
+    if [ -z "$cleaned" ]; then exit 0; fi
+
+    # Start double-Command-tap skip listener
+    start_skip_listener
+
+    speak "$cleaned"
+
+    # Stop skip listener after speech completes
+    stop_skip_listener
+
+    rm -f "$SKIP_FLAG"
+
+    # Voice mode = always pass the turn back (even after skip)
+    echo "Your turn" | say -r "$SPEAK_RATE" 2>/dev/null
+
+    # Kill any existing voice-input / whisper-stream
+    pkill -f "voice-input" 2>/dev/null
+    pkill -f "whisper-stream" 2>/dev/null
+    rm -f /tmp/claude-voice-input-stop
+
+    (
+        sleep 0.3
+
+        # Chime
+        afplay "$LISTEN_SOUND" 2>/dev/null &
+
+        # voice-input: launches whisper-stream, types text, watches for "send"
+        # On "send": kills whisper-stream → deletes "send" → presses Enter
+        # On double-Command (skip flag): kills whisper-stream → deletes typed text → exits
+        # On timeout: kills whisper-stream → exits (leaves text in place)
+        "$PLUGIN_BIN/voice-input" --timeout "$VOICE_TIMEOUT"
+    ) &
+    disown
+
+elif [ ${#msg} -ge 30 ]; then
+    # === DEFAULT MODE: first sentence only ===
+    # Also use skip listener for default mode
+    start_skip_listener
+    summary=$(echo "$msg" | sed 's/\..*/./' | head -c 200)
+    echo "$summary" | say -r 200 2>/dev/null
+    stop_skip_listener
+    rm -f "$SKIP_FLAG"
+fi
