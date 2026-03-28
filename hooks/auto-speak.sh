@@ -41,7 +41,42 @@ has_config() {
 
 # Read JSON from stdin, extract message
 json=$(cat)
-msg=$(echo "$json" | jq -r '.last_assistant_message // .stop_hook_message // .message // .content // ""' 2>/dev/null)
+
+# Try to get ALL assistant text blocks from the current turn via transcript
+transcript_path=$(echo "$json" | jq -r '.transcript_path // ""' 2>/dev/null)
+msg=""
+
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+    msg=$(python3 -c "
+import json, sys
+texts = []
+found = False
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+for line in reversed(lines):
+    line = line.strip()
+    if not line: continue
+    try: entry = json.loads(line)
+    except: continue
+    t = entry.get('type','')
+    if t == 'assistant':
+        content = entry.get('message',{}).get('content',[])
+        if isinstance(content, list):
+            for b in content:
+                if b.get('type') == 'text' and b.get('text','').strip():
+                    texts.append(b['text'])
+                    found = True
+    elif t == 'user' and found:
+        break
+texts.reverse()
+print('\n\n'.join(texts))
+" "$transcript_path" 2>/dev/null)
+fi
+
+# Fallback to last_assistant_message if transcript parsing failed
+if [ -z "$msg" ]; then
+    msg=$(echo "$json" | jq -r '.last_assistant_message // .stop_hook_message // .message // .content // ""' 2>/dev/null)
+fi
 
 [ -z "$msg" ] && exit 0
 
@@ -143,11 +178,26 @@ speak_sentences() {
     rm -f "$sentences_file"
 }
 
+# Check if message is VM status output (don't save these for repeat)
+is_vm_status() {
+    local text="$1"
+    case "$text" in
+        "Voice mode"*|"Listen mode"*|"Dictation mode"*|"Quiet mode"*|\
+        "Repeating last"*|"Nothing to repeat"*|"Done."*|\
+        "TTS:"*|"Mic:"*|"Cue:"*|"Usage: /vm"*)
+            return 0 ;;
+    esac
+    return 1
+}
+
 # Save text for repeat (cmd+shift) and session history (opt+shift+arrow)
 save_for_repeat() {
     local text="$1"
     local speed="$2"
     local volume="$3"
+
+    # Skip saving VM status messages — preserve actual response for repeat
+    is_vm_status "$text" && return
 
     # Save for repeat
     echo "$text" > "$LAST_TEXT"
@@ -195,18 +245,6 @@ if has_config; then
 
     VOL_LEVEL="1.0"
     [ "$VOLUME" = "quiet" ] && VOL_LEVEL="0.3"
-
-    # --- DEDUPLICATION ---
-    # Only speak the last message when multiple Stop hooks fire in rapid succession.
-    # Write our ID, wait briefly, check if a newer invocation superseded us.
-    if [ "$VOICE" = "on" ]; then
-        echo "$INVOCATION_ID" > "$PENDING_FILE"
-        sleep 0.5
-        current_pending=$(cat "$PENDING_FILE" 2>/dev/null)
-        if [ "$current_pending" != "$INVOCATION_ID" ]; then
-            exit 0
-        fi
-    fi
 
     # Clean up stale flags from previous cycle
     rm -f "$PAUSE_FLAG" "$TTS_PLAYING_FLAG" "$MIC_LISTENING_FLAG" /tmp/claude-voice-input-stop
