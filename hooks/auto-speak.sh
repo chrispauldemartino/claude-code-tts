@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Advanced Voice Mode Hook — reads /tmp/claude-voice-config for toggle state
-# No config file = default mode (speak first sentence only, no mic)
+# Voice Mode Stop Hook — reads /tmp/claude-voice-config for toggle state
+# No config file = silent exit. Daemon managed by vm-toggle.sh.
 
 CONFIG_FILE="/tmp/claude-voice-config"
 SKIP_FLAG="/tmp/claude-tts-skip"
@@ -10,6 +10,8 @@ TTS_PLAYING_FLAG="/tmp/claude-tts-playing"
 MIC_LISTENING_FLAG="/tmp/claude-voice-listening"
 TMP_AUDIO="/tmp/claude-tts-$$.aiff"
 PENDING_FILE="/tmp/claude-tts-pending"
+PENDING_TS="/tmp/claude-tts-pending-ts"
+PID_FILE="/tmp/claude-skip-listener.pid"
 FORWARD_FLAG="/tmp/claude-tts-forward"
 REWIND_FLAG="/tmp/claude-tts-rewind"
 LAST_TEXT="/tmp/claude-tts-last-text"
@@ -20,8 +22,31 @@ LISTEN_SOUND="/System/Library/Sounds/Tink.aiff"
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_BIN="$PLUGIN_DIR/bin"
 INVOCATION_ID="$$-$(date +%s)"
+TTS_LOCK="/tmp/claude-tts-speaking.lock"
 
-trap 'rm -f "$TMP_AUDIO"' EXIT
+# Audio mutex — wait for any other instance to finish speaking before we start
+acquire_tts_lock() {
+    while ! mkdir "$TTS_LOCK" 2>/dev/null; do
+        if [ -f "$TTS_LOCK/pid" ]; then
+            lock_pid=$(cat "$TTS_LOCK/pid" 2>/dev/null)
+            if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+                sleep 0.3
+            else
+                # Stale lock from a crashed instance — reclaim
+                rm -rf "$TTS_LOCK"
+            fi
+        else
+            rm -rf "$TTS_LOCK"
+        fi
+    done
+    echo $$ > "$TTS_LOCK/pid"
+}
+
+release_tts_lock() {
+    rm -rf "$TTS_LOCK"
+}
+
+trap 'rm -f "$TMP_AUDIO"; release_tts_lock' EXIT
 
 read_config() {
     local key="$1"
@@ -219,18 +244,80 @@ save_for_repeat() {
     echo "$next" > "$HISTORY_DIR/current"
 }
 
-start_skip_listener() {
-    rm -f /tmp/claude-tts-skip-listener-stop
-    pkill -f "skip-listener" 2>/dev/null
-    "$PLUGIN_BIN/skip-listener" --timeout 300 &
-    SKIP_LISTENER_PID=$!
-    disown "$SKIP_LISTENER_PID" 2>/dev/null
+# Safety net: restart daemon if voice mode is on but daemon crashed
+ensure_daemon() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0  # Running
+        fi
+    fi
+    # Daemon not running — restart it
+    nohup "$PLUGIN_BIN/skip-listener" >/dev/null 2>&1 &
+    echo $! > "$PID_FILE"
+    disown 2>/dev/null
 }
 
-stop_skip_listener() {
-    touch "/tmp/claude-tts-skip-listener-stop" 2>/dev/null
-    sleep 0.2
-    [ -n "$SKIP_LISTENER_PID" ] && kill "$SKIP_LISTENER_PID" 2>/dev/null
+# Debounce: write text to pending file, wait for more hooks, then speak
+debounce_and_speak() {
+    local text="$1"
+    local speed="$2"
+    local vol="$3"
+    local code_mode="$4"
+    local summary_mode="$5"
+
+    # Append text to pending file
+    echo "$text" >> "$PENDING_FILE"
+    # Write timestamp for debounce detection
+    date +%s%N > "$PENDING_TS"
+    local my_ts
+    my_ts=$(cat "$PENDING_TS")
+
+    # Debounce loop: wait 600ms, check if another hook updated the timestamp
+    local cycles=0
+    while [ "$cycles" -lt 3 ]; do
+        sleep 0.6
+        [ -f "$SKIP_FLAG" ] && { rm -f "$PENDING_FILE" "$PENDING_TS"; return; }
+        local current_ts
+        current_ts=$(cat "$PENDING_TS" 2>/dev/null)
+        if [ "$current_ts" = "$my_ts" ]; then
+            break  # No new hooks fired — we're the last writer
+        fi
+        my_ts="$current_ts"
+        cycles=$((cycles + 1))
+    done
+
+    # Try to acquire lock and speak
+    acquire_tts_lock
+
+    # Check if another hook already spoke (pending file cleared)
+    if [ ! -f "$PENDING_FILE" ]; then
+        release_tts_lock
+        return
+    fi
+
+    # Read all accumulated text
+    local all_text
+    all_text=$(cat "$PENDING_FILE")
+    rm -f "$PENDING_FILE" "$PENDING_TS"
+
+    [ -z "$all_text" ] && { release_tts_lock; return; }
+    [ -f "$SKIP_FLAG" ] && { release_tts_lock; return; }
+
+    # Strip markdown from accumulated text
+    local cleaned_text
+    cleaned_text=$(strip_markdown "$all_text" "$code_mode")
+
+    # Save for repeat and history
+    save_for_repeat "$cleaned_text" "$speed" "$vol"
+
+    # Speak
+    touch "$TTS_PLAYING_FLAG"
+    speak_sentences "$cleaned_text" "$speed" "$vol"
+    rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG"
+
+    release_tts_lock
 }
 
 if has_config; then
@@ -250,34 +337,30 @@ if has_config; then
     rm -f "$PAUSE_FLAG" "$TTS_PLAYING_FLAG" "$MIC_LISTENING_FLAG" /tmp/claude-voice-input-stop
     rm -f "$FORWARD_FLAG" "$REWIND_FLAG" /tmp/claude-tts-next-msg /tmp/claude-tts-prev-msg
 
-    # Start skip/pause listener (covers BOTH TTS and mic phases)
-    if [ "$VOICE" = "on" ] || [ "$MIC" = "on" ]; then
-        start_skip_listener
-    fi
+    # Safety net: ensure daemon is running
+    ensure_daemon
 
     # --- VOICE OUTPUT ---
     if [ "$VOICE" = "on" ]; then
-        touch "$TTS_PLAYING_FLAG"
-
         if [ "$SUMMARY" = "on" ]; then
             # Extract [SUMMARY: ...] marker
             summary_text=$(echo "$msg" | sed -n 's/.*\[SUMMARY: \(.*\)\].*/\1/p' | head -1)
             if [ -n "$summary_text" ]; then
                 cleaned_text="$summary_text"
             else
-                # Fallback: first sentence
                 cleaned_text=$(echo "$msg" | sed 's/\. [A-Z].*/\./' | head -c 200)
             fi
+            # Summary mode: speak directly (short text, no debounce needed)
+            acquire_tts_lock
             save_for_repeat "$cleaned_text" "$SPEED" "$VOL_LEVEL"
+            touch "$TTS_PLAYING_FLAG"
             speak "$cleaned_text" "$SPEED" "$VOL_LEVEL"
+            rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG"
+            release_tts_lock
         else
-            # Full response (markdown-stripped)
-            cleaned_text=$(strip_markdown "$msg" "$CODE")
-            save_for_repeat "$cleaned_text" "$SPEED" "$VOL_LEVEL"
-            speak_sentences "$cleaned_text" "$SPEED" "$VOL_LEVEL"
+            # Full response: debounce for multi-segment coalescing
+            debounce_and_speak "$msg" "$SPEED" "$VOL_LEVEL" "$CODE" "$SUMMARY"
         fi
-
-        rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG" "$PENDING_FILE"
     fi
 
     # --- MIC ACTIVATION ---
@@ -300,21 +383,10 @@ if has_config; then
             touch "$MIC_LISTENING_FLAG"
             "$PLUGIN_BIN/voice-input" --timeout 60
             rm -f "$MIC_LISTENING_FLAG" "$PAUSE_FLAG"
-            # Signal skip-listener to stop (mic phase done)
-            touch /tmp/claude-tts-skip-listener-stop
         ) &
         disown
-    else
-        # No mic phase — stop skip-listener now
-        if [ "$VOICE" = "on" ]; then
-            stop_skip_listener
-        fi
     fi
 else
-    # --- DEFAULT MODE (no config) ---
-    start_skip_listener
-    summary=$(echo "$msg" | sed 's/\. [A-Z].*/\./' | head -c 200)
-    speak "$summary" 200 1.0
-    stop_skip_listener
-    rm -f "$SKIP_FLAG"
+    # No config = text mode, no TTS
+    exit 0
 fi

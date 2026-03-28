@@ -9,12 +9,14 @@ import CoreGraphics
 // - Option+Shift+Arrow (keyDown): MESSAGE NAV — play prev/next history message
 // - Enter (keyDown): STOP — kills entire voice session
 //
-// Usage: skip-listener [--timeout 300] [--debug]
+// Usage: skip-listener [--debug]
+// Runs as persistent daemon. Exits when /tmp/claude-voice-config is removed.
 // Requires: Accessibility permission (System Settings > Privacy & Security > Accessibility)
 
 // MARK: - Constants
 
-let stopFlag = "/tmp/claude-tts-skip-listener-stop"
+let configFile = "/tmp/claude-voice-config"
+let pidFile = "/tmp/claude-skip-listener.pid"
 let skipFlag = "/tmp/claude-tts-skip"
 let pauseFlag = "/tmp/claude-tts-pause"
 let ttsPlayingFlag = "/tmp/claude-tts-playing"
@@ -43,14 +45,8 @@ let prevMsgFlag = "/tmp/claude-tts-prev-msg"
 
 // MARK: - Arguments
 
-var timeout: TimeInterval = 300
 var debug = false
 
-if let idx = CommandLine.arguments.firstIndex(of: "--timeout"),
-   idx + 1 < CommandLine.arguments.count,
-   let t = TimeInterval(CommandLine.arguments[idx + 1]) {
-    timeout = t
-}
 if CommandLine.arguments.contains("--debug") {
     debug = true
     try? "skip-listener started at \(Date())\n".write(
@@ -65,6 +61,17 @@ func debugPrint(_ msg: String) {
         handle.write(line.data(using: .utf8)!)
         handle.closeFile()
     }
+}
+
+func cleanupAndExit() {
+    // Remove PID file if it still points to us
+    if let pidStr = try? String(contentsOfFile: pidFile, encoding: .utf8),
+       let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+       pid == ProcessInfo.processInfo.processIdentifier {
+        try? FileManager.default.removeItem(atPath: pidFile)
+    }
+    debugPrint("Exiting cleanly")
+    exit(0)
 }
 
 // MARK: - State
@@ -92,8 +99,9 @@ let state = ControlState()
 var globalTap: CFMachPort?
 let statePtr = Unmanaged.passUnretained(state).toOpaque()
 
-// Remove stale flags
-unlink(stopFlag)
+// Write PID file for daemon management
+let myPid = ProcessInfo.processInfo.processIdentifier
+try? "\(myPid)".write(toFile: pidFile, atomically: true, encoding: .utf8)
 
 // MARK: - Helpers
 
@@ -130,6 +138,43 @@ func killTTSProcesses() {
         try? proc.run()
         proc.waitUntilExit()
     }
+}
+
+// Audio mutex — same lock as auto-speak.sh so repeat/nav don't overlap with hook TTS
+let ttsLockDir = "/tmp/claude-tts-speaking.lock"
+let ttsLockPidFile = "/tmp/claude-tts-speaking.lock/pid"
+
+func acquireTTSLock() {
+    let fm = FileManager.default
+    while true {
+        do {
+            try fm.createDirectory(atPath: ttsLockDir, withIntermediateDirectories: false)
+            try "\(ProcessInfo.processInfo.processIdentifier)".write(
+                toFile: ttsLockPidFile, atomically: true, encoding: .utf8)
+            debugPrint("TTS lock acquired")
+            return
+        } catch {
+            // Lock exists — check if holder is alive
+            if let pidStr = try? String(contentsOfFile: ttsLockPidFile, encoding: .utf8),
+               let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                if kill(pid, 0) == 0 {
+                    // Holder alive — wait
+                    usleep(300_000)
+                } else {
+                    // Stale lock — reclaim
+                    try? fm.removeItem(atPath: ttsLockDir)
+                    debugPrint("Removed stale TTS lock (pid \(pid) dead)")
+                }
+            } else {
+                try? fm.removeItem(atPath: ttsLockDir)
+            }
+        }
+    }
+}
+
+func releaseTTSLock() {
+    try? FileManager.default.removeItem(atPath: ttsLockDir)
+    debugPrint("TTS lock released")
 }
 
 // Find the most recently active history directory
@@ -221,8 +266,13 @@ func triggerSkip() {
 func triggerRepeat() {
     debugPrint("REPEAT — replaying last TTS response")
 
-    // Kill any active TTS (original or previous repeat)
+    // Stop any active auto-speak.sh loop via skip flag, then kill audio
+    FileManager.default.createFile(atPath: skipFlag, contents: nil)
     killTTSProcesses()
+    usleep(300_000) // let auto-speak.sh break its loop and release lock
+
+    // Acquire mutex so no new auto-speak.sh starts while we replay
+    acquireTTSLock()
     try? FileManager.default.removeItem(atPath: skipFlag)
 
     // Read saved state
@@ -298,6 +348,7 @@ func triggerRepeat() {
         try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
         try? FileManager.default.removeItem(atPath: pauseFlag)
         try? FileManager.default.removeItem(atPath: skipFlag)
+        releaseTTSLock()
     }
 }
 
@@ -306,8 +357,12 @@ func triggerRepeat() {
 func triggerMessageNav(direction: String) {
     debugPrint("MESSAGE NAV — \(direction)")
 
-    // Kill any active TTS
+    // Stop any active auto-speak.sh loop, then kill audio
+    FileManager.default.createFile(atPath: skipFlag, contents: nil)
     killTTSProcesses()
+    usleep(300_000)
+
+    acquireTTSLock()
     try? FileManager.default.removeItem(atPath: skipFlag)
 
     // Find history directory
@@ -415,6 +470,7 @@ func triggerMessageNav(direction: String) {
         try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
         try? FileManager.default.removeItem(atPath: pauseFlag)
         try? FileManager.default.removeItem(atPath: skipFlag)
+        releaseTTSLock()
     }
 }
 
@@ -644,18 +700,19 @@ CGEvent.tapEnable(tap: tap, enable: true)
 
 debugPrint("Event tap created (listenOnly), listening for all voice controls")
 
-// MARK: - Poll Timer
+// MARK: - Config File Poll (daemon keepalive)
 
-let startTime = Date()
-let timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-    if Date().timeIntervalSince(startTime) >= timeout {
-        debugPrint("Timeout reached (\(timeout)s), exiting")
-        exit(0)
-    }
-    if FileManager.default.fileExists(atPath: stopFlag) {
-        try? FileManager.default.removeItem(atPath: stopFlag)
-        debugPrint("Stop flag detected, exiting")
-        exit(0)
+var configMissCount = 0
+let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+    if FileManager.default.fileExists(atPath: configFile) {
+        configMissCount = 0
+    } else {
+        configMissCount += 1
+        debugPrint("Config file missing (count: \(configMissCount)/3)")
+        if configMissCount >= 3 {
+            debugPrint("Config file gone for 6s — self-terminating")
+            cleanupAndExit()
+        }
     }
 }
 
