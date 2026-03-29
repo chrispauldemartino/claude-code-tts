@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import ApplicationServices
 
 // Monitors modifier keys and key combos for voice mode controls:
 // - Double-Command tap (cmd+cmd): SKIP — kills audio + mic
@@ -11,7 +12,8 @@ import CoreGraphics
 //
 // Usage: skip-listener [--debug]
 // Runs as persistent daemon. Exits when /tmp/claude-voice-config is removed.
-// Requires: Accessibility permission (System Settings > Privacy & Security > Accessibility)
+// Requires: Accessibility + Input Monitoring permission
+//           (System Settings > Privacy & Security > Accessibility AND Input Monitoring)
 
 // MARK: - Constants
 
@@ -39,9 +41,15 @@ let lastVolumeFile = "/tmp/claude-tts-last-volume"
 let forwardFlag = "/tmp/claude-tts-forward"
 let rewindFlag = "/tmp/claude-tts-rewind"
 
-// Message navigation flags
-let nextMsgFlag = "/tmp/claude-tts-next-msg"
-let prevMsgFlag = "/tmp/claude-tts-prev-msg"
+// Message navigation — reads from transcript JSONL
+let transcriptPathFile = "/tmp/claude-tts-transcript-path"
+let navIndexFile = "/tmp/claude-tts-nav-index"
+
+// Drill-down cache for structured data (tables/lists)
+let detailCacheDir = "/tmp/claude-tts-detail-cache"
+let detailIndexFile = "/tmp/claude-tts-detail-cache/index.txt"
+let drillDownFlag = "/tmp/claude-tts-drill-down"
+let drillDownIndexFile = "/tmp/claude-tts-detail-cache/drill-index"
 
 // MARK: - Arguments
 
@@ -77,17 +85,23 @@ func cleanupAndExit() {
 // MARK: - State
 
 class ControlState {
-    // Command double-tap (skip)
+    // Command double-tap (skip segment)
     var lastCommandUp: Date?
     var commandIsDown = false
     // Option double-tap (pause)
     var lastOptionUp: Date?
     var optionIsDown = false
     var isPaused = false
+    // Shift double-tap (stop all)
+    var lastShiftUp: Date?
+    var shiftIsDown = false
     // Command+Shift (repeat)
     var cmdShiftTriggered = false
     // Track if a regular key was pressed while cmd+shift held (prevents false triggers)
     var regularKeyDuringCmdShift = false
+    // Option+Shift double-tap (drill-down)
+    var optShiftTriggered = false
+    var lastOptShiftUp: Date?
     // Voice active cache
     var voiceActive = false
     var lastVoiceCheck: Date = .distantPast
@@ -123,11 +137,27 @@ func isMicActive() -> Bool {
     return FileManager.default.fileExists(atPath: micListeningFlag)
 }
 
+let chimeVolume = "0.3"  // 0.0–1.0, keeps chime subtle
+
 func playChime() {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-    proc.arguments = [chimeSound]
+    proc.arguments = ["--volume", chimeVolume, chimeSound]
     try? proc.run()
+}
+
+func playDoubleTink() {
+    let proc1 = Process()
+    proc1.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+    proc1.arguments = ["--volume", chimeVolume, chimeSound]
+    try? proc1.run()
+    proc1.waitUntilExit()
+    usleep(80_000)
+    let proc2 = Process()
+    proc2.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+    proc2.arguments = ["--volume", chimeVolume, chimeSound]
+    try? proc2.run()
+    proc2.waitUntilExit()
 }
 
 func killTTSProcesses() {
@@ -177,33 +207,9 @@ func releaseTTSLock() {
     debugPrint("TTS lock released")
 }
 
-// Find the most recently active history directory
-func findHistoryDir() -> String? {
-    let fm = FileManager.default
-    let tmpDir = "/tmp"
-    guard let contents = try? fm.contentsOfDirectory(atPath: tmpDir) else { return nil }
-
-    var bestDir: String?
-    var bestDate: Date = .distantPast
-
-    for name in contents where name.hasPrefix("claude-tts-history-") {
-        let path = "\(tmpDir)/\(name)"
-        let currentFile = "\(path)/current"
-        if let attrs = try? fm.attributesOfItem(atPath: currentFile),
-           let modDate = attrs[.modificationDate] as? Date,
-           modDate > bestDate {
-            bestDate = modDate
-            bestDir = path
-        }
-    }
-    return bestDir
-}
-
 // MARK: - Pause/Resume
 
 func togglePause() {
-    let micActive = isMicActive()
-
     if state.isPaused {
         debugPrint("RESUME — sending SIGCONT")
         try? FileManager.default.removeItem(atPath: pauseFlag)
@@ -216,11 +222,7 @@ func togglePause() {
             proc.waitUntilExit()
         }
         state.isPaused = false
-
-        // Chime on mic resume so user knows mic is listening again
-        if micActive {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { playChime() }
-        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { playChime() }
     } else {
         debugPrint("PAUSE — sending SIGSTOP")
         FileManager.default.createFile(atPath: pauseFlag, contents: nil)
@@ -233,6 +235,7 @@ func togglePause() {
             proc.waitUntilExit()
         }
         state.isPaused = true
+        playChime()
     }
 }
 
@@ -257,14 +260,43 @@ func triggerSkip() {
     try? FileManager.default.removeItem(atPath: pauseFlag)
 
     killTTSProcesses()
+    playChime()
 
     debugPrint("Killed say + afplay, created skip flag")
+}
+
+// MARK: - Stop All (shift+shift)
+
+func triggerStopAll() {
+    debugPrint("STOP ALL — killing everything")
+    FileManager.default.createFile(atPath: skipFlag, contents: nil)
+    try? FileManager.default.removeItem(atPath: pauseFlag)
+    state.isPaused = false
+
+    for name in ["say", "afplay", "voice-input", "whisper-stream"] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        proc.arguments = ["-f", name]
+        try? proc.run()
+        proc.waitUntilExit()
+    }
+    try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
+    try? FileManager.default.removeItem(atPath: micListeningFlag)
+
+    // Force-release TTS lock in case something is stuck
+    try? FileManager.default.removeItem(atPath: ttsLockDir)
+
+    // Chime AFTER cleanup so pkill doesn't kill it
+    usleep(100_000)
+    playChime()
+    debugPrint("STOP ALL — everything killed, lock cleared")
 }
 
 // MARK: - Repeat (cmd+shift)
 
 func triggerRepeat() {
     debugPrint("REPEAT — replaying last TTS response")
+    playChime()
 
     // Stop any active auto-speak.sh loop via skip flag, then kill audio
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
@@ -279,6 +311,7 @@ func triggerRepeat() {
     guard let text = try? String(contentsOfFile: lastTextFile, encoding: .utf8),
           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         debugPrint("REPEAT — no saved text, ignoring")
+        releaseTTSLock()
         return
     }
 
@@ -352,12 +385,56 @@ func triggerRepeat() {
     }
 }
 
-// MARK: - Message Navigation (opt+shift+arrow)
+// MARK: - Drill-Down (opt+shift double-tap or voice keyword)
 
-func triggerMessageNav(direction: String) {
-    debugPrint("MESSAGE NAV — \(direction)")
+func triggerDrillDown(target: String? = nil) {
+    debugPrint("DRILL-DOWN — target: \(target ?? "cycle")")
 
-    // Stop any active auto-speak.sh loop, then kill audio
+    // Read available cache entries from index
+    guard let indexContent = try? String(contentsOfFile: detailIndexFile, encoding: .utf8) else {
+        debugPrint("DRILL-DOWN — no index file, ignoring")
+        playChime()
+        return
+    }
+
+    let entries = indexContent.components(separatedBy: "\n")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+
+    guard !entries.isEmpty else {
+        debugPrint("DRILL-DOWN — index empty, ignoring")
+        playChime()
+        return
+    }
+
+    // Determine which entry to play
+    var entryFile: String
+    if let t = target {
+        if t == "all" {
+            // Play all entries sequentially — use first for now, loop handled below
+            entryFile = entries[0]
+        } else {
+            // Find first entry matching target keyword (table/list/etc.)
+            if let match = entries.first(where: { $0.lowercased().contains(t.lowercased()) }) {
+                entryFile = match
+            } else {
+                debugPrint("DRILL-DOWN — no entry matching '\(t)', ignoring")
+                playChime()
+                return
+            }
+        }
+    } else {
+        // Cycle mode — read current drill index, advance
+        let currentStr = (try? String(contentsOfFile: drillDownIndexFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "-1"
+        var current = Int(currentStr) ?? -1
+        current = (current + 1) % entries.count
+        try? "\(current)".write(toFile: drillDownIndexFile, atomically: true, encoding: .utf8)
+        entryFile = entries[current]
+        debugPrint("DRILL-DOWN — cycling to entry \(current + 1)/\(entries.count): \(entryFile)")
+    }
+
+    // Stop any active audio
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
     killTTSProcesses()
     usleep(300_000)
@@ -365,106 +442,292 @@ func triggerMessageNav(direction: String) {
     acquireTTSLock()
     try? FileManager.default.removeItem(atPath: skipFlag)
 
-    // Find history directory
-    guard let histDir = findHistoryDir() else {
-        debugPrint("MESSAGE NAV — no history directory found")
+    // Read speed/volume from voice config
+    let speed = (try? String(contentsOfFile: configFile, encoding: .utf8)
+        .components(separatedBy: "\n")
+        .first(where: { $0.hasPrefix("speed=") })?
+        .replacingOccurrences(of: "speed=", with: "")) ?? "300"
+    let volLine = (try? String(contentsOfFile: configFile, encoding: .utf8)
+        .components(separatedBy: "\n")
+        .first(where: { $0.hasPrefix("volume=") })?
+        .replacingOccurrences(of: "volume=", with: "")) ?? "normal"
+    let volume = volLine == "quiet" ? "0.3" : "1.0"
+
+    // Determine entries to play
+    let entriesToPlay: [String]
+    if let t = target, t == "all" {
+        entriesToPlay = entries
+    } else {
+        entriesToPlay = [entryFile]
+    }
+
+    // Mark TTS as playing and chime
+    FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
+    playDoubleTink()
+
+    // Play in background
+    DispatchQueue.global(qos: .userInitiated).async {
+        for entry in entriesToPlay {
+            let filePath = "\(detailCacheDir)/\(entry)"
+            guard let text = try? String(contentsOfFile: filePath, encoding: .utf8),
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                debugPrint("DRILL-DOWN — empty or missing file: \(filePath)")
+                continue
+            }
+
+            // Save for repeat
+            try? text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
+            try? speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+            try? volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
+
+            let sentences = text.components(separatedBy: CharacterSet(charactersIn: ".!?"))
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+
+            var skipped = false
+            var idx = 0
+            while idx < sentences.count {
+                if FileManager.default.fileExists(atPath: skipFlag) { skipped = true; break }
+
+                // Check forward/rewind
+                if FileManager.default.fileExists(atPath: forwardFlag) {
+                    try? FileManager.default.removeItem(atPath: forwardFlag)
+                    killTTSProcesses()
+                    idx = min(idx + 3, sentences.count - 1)
+                    continue
+                }
+                if FileManager.default.fileExists(atPath: rewindFlag) {
+                    try? FileManager.default.removeItem(atPath: rewindFlag)
+                    killTTSProcesses()
+                    idx = max(idx - 3, 0)
+                    continue
+                }
+
+                let sentence = sentences[idx]
+                let tmpFile = "/tmp/claude-tts-drill-\(ProcessInfo.processInfo.processIdentifier).aiff"
+
+                // Generate audio
+                let sayProc = Process()
+                sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+                sayProc.arguments = ["-r", speed, "-o", tmpFile]
+                sayProc.standardInput = Pipe()
+                let pipe = sayProc.standardInput as! Pipe
+                pipe.fileHandleForWriting.write(sentence.data(using: .utf8)!)
+                pipe.fileHandleForWriting.closeFile()
+                try? sayProc.run()
+                sayProc.waitUntilExit()
+
+                if FileManager.default.fileExists(atPath: skipFlag) {
+                    try? FileManager.default.removeItem(atPath: tmpFile)
+                    skipped = true
+                    break
+                }
+
+                // Play audio
+                let playProc = Process()
+                playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+                playProc.arguments = ["--volume", volume, tmpFile]
+                try? playProc.run()
+                playProc.waitUntilExit()
+
+                try? FileManager.default.removeItem(atPath: tmpFile)
+                idx += 1
+            }
+
+            if skipped { break }
+        }
+
+        // Cleanup
+        try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
+        try? FileManager.default.removeItem(atPath: pauseFlag)
+        try? FileManager.default.removeItem(atPath: skipFlag)
+        releaseTTSLock()
+    }
+}
+
+// MARK: - Message Navigation (opt+shift+arrow)
+
+// Extract all assistant text blocks from the transcript using python3.
+// Each individual text block is a separate navigable message.
+func extractMessagesFromTranscript() -> [String] {
+    guard let tPath = try? String(contentsOfFile: transcriptPathFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          FileManager.default.fileExists(atPath: tPath) else {
+        debugPrint("MESSAGE NAV — no transcript path")
+        return []
+    }
+
+    let script = """
+    import json, sys
+    messages = []
+    with open(sys.argv[1]) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try: entry = json.loads(line)
+            except: continue
+            if entry.get('type','') == 'assistant':
+                content = entry.get('message',{}).get('content',[])
+                if isinstance(content, list):
+                    for b in content:
+                        if b.get('type') == 'text' and b.get('text','').strip():
+                            messages.append(b['text'])
+    # Output messages separated by null byte
+    for msg in messages:
+        sys.stdout.write(msg + '\\0')
+    """
+
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+    proc.arguments = ["-c", script, tPath]
+    let outPipe = Pipe()
+    proc.standardOutput = outPipe
+    proc.standardError = FileHandle.nullDevice
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+    } catch {
+        debugPrint("MESSAGE NAV — python3 failed: \(error)")
+        return []
+    }
+
+    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+    guard let output = String(data: data, encoding: .utf8), !output.isEmpty else { return [] }
+
+    return output.components(separatedBy: "\0").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+}
+
+func triggerMessageNav(direction: String) {
+    debugPrint("MESSAGE NAV — \(direction)")
+
+    // Stop any active audio
+    FileManager.default.createFile(atPath: skipFlag, contents: nil)
+    killTTSProcesses()
+    usleep(300_000)
+
+    acquireTTSLock()
+    try? FileManager.default.removeItem(atPath: skipFlag)
+
+    // Extract all assistant messages from transcript
+    let messages = extractMessagesFromTranscript()
+    let total = messages.count
+
+    guard total > 0 else {
+        debugPrint("MESSAGE NAV — no messages in transcript")
+        playChime()
+        releaseTTSLock()
         return
     }
 
-    // Read current pointer and total
-    guard let totalStr = try? String(contentsOfFile: "\(histDir)/total", encoding: .utf8),
-          let total = Int(totalStr.trimmingCharacters(in: .whitespacesAndNewlines)),
-          total > 0 else {
-        debugPrint("MESSAGE NAV — no messages in history")
-        return
-    }
-
-    let currentStr = (try? String(contentsOfFile: "\(histDir)/current", encoding: .utf8)
-        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "\(total)"
-    var current = Int(currentStr) ?? total
+    // Read current nav index (defaults to last message)
+    let currentStr = (try? String(contentsOfFile: navIndexFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "\(total - 1)"
+    var current = Int(currentStr) ?? (total - 1)
+    // Clamp to valid range
+    current = min(current, total - 1)
 
     // Navigate
     if direction == "next" {
-        if current >= total { debugPrint("MESSAGE NAV — already at last message"); return }
+        if current >= total - 1 {
+            debugPrint("MESSAGE NAV — already at last message (\(current + 1)/\(total))")
+            playChime()
+            releaseTTSLock()
+            return
+        }
         current += 1
     } else {
-        if current <= 1 { debugPrint("MESSAGE NAV — already at first message"); return }
+        if current <= 0 {
+            debugPrint("MESSAGE NAV — already at first message (1/\(total))")
+            playChime()
+            releaseTTSLock()
+            return
+        }
         current -= 1
     }
 
-    let padded = String(format: "%03d", current)
-    let msgFile = "\(histDir)/msg-\(padded).txt"
+    // Read speed from voice config
+    let speed = (try? String(contentsOfFile: configFile, encoding: .utf8)
+        .components(separatedBy: "\n")
+        .first(where: { $0.hasPrefix("speed=") })?
+        .replacingOccurrences(of: "speed=", with: "")) ?? "300"
+    let volLine = (try? String(contentsOfFile: configFile, encoding: .utf8)
+        .components(separatedBy: "\n")
+        .first(where: { $0.hasPrefix("volume=") })?
+        .replacingOccurrences(of: "volume=", with: "")) ?? "normal"
+    let volume = volLine == "quiet" ? "0.3" : "1.0"
 
-    guard let text = try? String(contentsOfFile: msgFile, encoding: .utf8),
-          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        debugPrint("MESSAGE NAV — message file not found: \(msgFile)")
-        return
-    }
-
-    let speed = (try? String(contentsOfFile: "\(histDir)/msg-\(padded).speed", encoding: .utf8)
-        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "300"
-    let volume = (try? String(contentsOfFile: "\(histDir)/msg-\(padded).volume", encoding: .utf8)
-        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
-
-    // Update current pointer
-    try? "\(current)".write(toFile: "\(histDir)/current", atomically: true, encoding: .utf8)
-
-    // Also update last-text files so repeat plays this message
-    try? text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
-    try? speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
-    try? volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
-
-    // Mark TTS as playing and play
+    // Play from selected message through the end (auto-continue)
     FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
+    playChime()
 
     DispatchQueue.global(qos: .userInitiated).async {
-        let sentences = text.components(separatedBy: CharacterSet(charactersIn: ".!?"))
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        var msgIdx = current
 
-        var idx = 0
-        while idx < sentences.count {
-            if FileManager.default.fileExists(atPath: skipFlag) { break }
+        while msgIdx < total {
+            let text = messages[msgIdx]
+            debugPrint("MESSAGE NAV — playing message \(msgIdx + 1)/\(total) (\(text.count) chars)")
 
-            if FileManager.default.fileExists(atPath: forwardFlag) {
-                try? FileManager.default.removeItem(atPath: forwardFlag)
-                killTTSProcesses()
-                idx = min(idx + 3, sentences.count - 1)
-                continue
-            }
-            if FileManager.default.fileExists(atPath: rewindFlag) {
-                try? FileManager.default.removeItem(atPath: rewindFlag)
-                killTTSProcesses()
-                idx = max(idx - 3, 0)
-                continue
-            }
+            // Save nav index and last-text for repeat
+            try? "\(msgIdx)".write(toFile: navIndexFile, atomically: true, encoding: .utf8)
+            try? text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
+            try? speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+            try? volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
 
-            let sentence = sentences[idx]
-            let tmpFile = "/tmp/claude-tts-nav-\(ProcessInfo.processInfo.processIdentifier).aiff"
+            let sentences = text.components(separatedBy: CharacterSet(charactersIn: ".!?"))
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
 
-            let sayProc = Process()
-            sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-            sayProc.arguments = ["-r", speed, "-o", tmpFile]
-            sayProc.standardInput = Pipe()
-            let pipe = sayProc.standardInput as! Pipe
-            pipe.fileHandleForWriting.write(sentence.data(using: .utf8)!)
-            pipe.fileHandleForWriting.closeFile()
-            try? sayProc.run()
-            sayProc.waitUntilExit()
+            var skipped = false
+            var idx = 0
+            while idx < sentences.count {
+                if FileManager.default.fileExists(atPath: skipFlag) { skipped = true; break }
 
-            if FileManager.default.fileExists(atPath: skipFlag) {
+                if FileManager.default.fileExists(atPath: forwardFlag) {
+                    try? FileManager.default.removeItem(atPath: forwardFlag)
+                    killTTSProcesses()
+                    idx = min(idx + 3, sentences.count - 1)
+                    continue
+                }
+                if FileManager.default.fileExists(atPath: rewindFlag) {
+                    try? FileManager.default.removeItem(atPath: rewindFlag)
+                    killTTSProcesses()
+                    idx = max(idx - 3, 0)
+                    continue
+                }
+
+                let sentence = sentences[idx]
+                let tmpFile = "/tmp/claude-tts-nav-\(ProcessInfo.processInfo.processIdentifier).aiff"
+
+                let sayProc = Process()
+                sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+                sayProc.arguments = ["-r", speed, "-o", tmpFile]
+                sayProc.standardInput = Pipe()
+                let pipe = sayProc.standardInput as! Pipe
+                pipe.fileHandleForWriting.write(sentence.data(using: .utf8)!)
+                pipe.fileHandleForWriting.closeFile()
+                try? sayProc.run()
+                sayProc.waitUntilExit()
+
+                if FileManager.default.fileExists(atPath: skipFlag) {
+                    try? FileManager.default.removeItem(atPath: tmpFile)
+                    skipped = true
+                    break
+                }
+
+                let playProc = Process()
+                playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+                playProc.arguments = ["--volume", volume, tmpFile]
+                try? playProc.run()
+                playProc.waitUntilExit()
+
                 try? FileManager.default.removeItem(atPath: tmpFile)
-                break
+                idx += 1
             }
 
-            let playProc = Process()
-            playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-            playProc.arguments = ["--volume", volume, tmpFile]
-            try? playProc.run()
-            playProc.waitUntilExit()
+            // If skipped (cmd+cmd or shift+shift), stop auto-continue
+            if skipped { break }
 
-            try? FileManager.default.removeItem(atPath: tmpFile)
-            idx += 1
+            msgIdx += 1
         }
 
         try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
@@ -573,6 +836,43 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         return Unmanaged.passUnretained(event)
     }
 
+    // --- OPT+SHIFT DOUBLE-TAP: DRILL-DOWN ---
+    // Detect opt+shift held together then released twice. Does NOT interfere
+    // with opt+shift+arrow (that's a keyDown event, this is flagsChanged).
+    if isOptionKey || isShiftKey {
+        let hasOption = flags.contains(.maskAlternate)
+        let hasShift = flags.contains(.maskShift)
+        let hasCommand = flags.contains(.maskCommand)
+        let hasControl = flags.contains(.maskControl)
+
+        // When both opt+shift are pressed (and no cmd/ctrl)
+        if hasOption && hasShift && !hasCommand && !hasControl {
+            if !state.optShiftTriggered {
+                state.optShiftTriggered = true
+                debugPrint("OPT+SHIFT down — armed for drill-down")
+            }
+        }
+
+        // When both released with no modifiers
+        if state.optShiftTriggered && !hasOption && !hasShift && !hasCommand && !hasControl {
+            state.optShiftTriggered = false
+            let now = Date()
+
+            if let last = state.lastOptShiftUp, now.timeIntervalSince(last) < doubleTapWindow {
+                state.lastOptShiftUp = nil
+                debugPrint("OPT+SHIFT DOUBLE TAP — triggering drill-down")
+                DispatchQueue.main.async { triggerDrillDown() }
+            } else {
+                state.lastOptShiftUp = now
+            }
+        }
+
+        // If one released while other held, disarm but keep double-tap timer
+        if state.optShiftTriggered && ((!hasOption && hasShift) || (hasOption && !hasShift)) {
+            state.optShiftTriggered = false
+        }
+    }
+
     // --- COMMAND+SHIFT: REPEAT ---
     // Detect cmd+shift held together then released. Single tap, no double-tap needed.
     if isCommandKey || isShiftKey {
@@ -670,7 +970,55 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         }
     }
 
+    // --- SHIFT DOUBLE-TAP: STOP ALL ---
+    if isShiftKey {
+        let hasShift = flags.contains(.maskShift)
+
+        // Only trigger when shift alone (no cmd, opt, ctrl)
+        if !flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty {
+            state.shiftIsDown = false
+            state.lastShiftUp = nil
+            return Unmanaged.passUnretained(event)
+        }
+
+        // Don't trigger if cmd+shift repeat is armed
+        if state.cmdShiftTriggered {
+            return Unmanaged.passUnretained(event)
+        }
+
+        if hasShift && !state.shiftIsDown {
+            state.shiftIsDown = true
+        } else if !hasShift && state.shiftIsDown {
+            state.shiftIsDown = false
+            let now = Date()
+
+            if let last = state.lastShiftUp, now.timeIntervalSince(last) < doubleTapWindow {
+                state.lastShiftUp = nil
+                debugPrint("SHIFT DOUBLE TAP — stop all")
+                DispatchQueue.main.async { triggerStopAll() }
+            } else {
+                state.lastShiftUp = now
+            }
+        }
+    }
+
     return Unmanaged.passUnretained(event)
+}
+
+// MARK: - Permission Check
+
+let trusted = AXIsProcessTrusted()
+debugPrint("AXIsProcessTrusted: \(trusted)")
+
+if !trusted {
+    // Prompt the user to grant Accessibility permission
+    let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+    let _ = AXIsProcessTrustedWithOptions(options)
+    fputs("⚠ Accessibility permission not granted. A system dialog should appear.\n", stderr)
+    fputs("  Add this binary: \(CommandLine.arguments[0])\n", stderr)
+    fputs("  System Settings > Privacy & Security > Accessibility\n", stderr)
+    debugPrint("Accessibility not granted — prompted user")
+    // Continue anyway — the tap may still create but not receive events
 }
 
 // MARK: - Event Tap Setup
@@ -687,8 +1035,11 @@ guard let tap = CGEvent.tapCreate(
     callback: callback,
     userInfo: statePtr
 ) else {
-    let msg = "Error: Could not create event tap. Grant Accessibility permission: System Settings > Privacy & Security > Accessibility"
+    let msg = "Error: Could not create event tap."
     fputs("\(msg)\n", stderr)
+    fputs("  Grant BOTH permissions to: \(CommandLine.arguments[0])\n", stderr)
+    fputs("  1. System Settings > Privacy & Security > Accessibility\n", stderr)
+    fputs("  2. System Settings > Privacy & Security > Input Monitoring\n", stderr)
     debugPrint("FATAL: \(msg)")
     exit(1)
 }
@@ -698,7 +1049,53 @@ let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
 CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
 CGEvent.tapEnable(tap: tap, enable: true)
 
-debugPrint("Event tap created (listenOnly), listening for all voice controls")
+let tapEnabled = CGEvent.tapIsEnabled(tap: tap)
+debugPrint("Event tap created (listenOnly), enabled=\(tapEnabled), listening for all voice controls")
+
+// MARK: - Self-Test (verify events actually flow)
+
+var selfTestPassed = false
+
+// Post a synthetic flagsChanged event and check if the callback receives it
+let selfTestBefore = state.lastCommandUp  // snapshot state before test
+
+if let source = CGEventSource(stateID: .hidSystemState) {
+    // Synthesize a left-shift keyDown then keyUp (harmless modifier)
+    if let shiftDown = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: true),
+       let shiftUp = CGEvent(keyboardEventSource: source, virtualKey: 56, keyDown: false) {
+        // Post as flagsChanged with shift flag
+        shiftDown.type = .flagsChanged
+        shiftDown.flags = .maskShift
+        shiftDown.post(tap: .cgSessionEventTap)
+
+        shiftUp.type = .flagsChanged
+        shiftUp.flags = []
+        shiftUp.post(tap: .cgSessionEventTap)
+
+        debugPrint("Self-test: posted synthetic shift events")
+    }
+}
+
+// Check after a short delay if the callback was invoked
+DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+    // The callback doesn't track shift specifically, but the tap-disabled handler
+    // would have fired if the tap was disabled. Check the debug log for evidence.
+    // We check tapIsEnabled as a proxy — if macOS silently disabled the tap, it'll be false.
+    if let t = globalTap {
+        let stillEnabled = CGEvent.tapIsEnabled(tap: t)
+        debugPrint("Self-test result: tap still enabled=\(stillEnabled)")
+        if !stillEnabled {
+            fputs("⚠ Event tap was disabled by macOS. Events will NOT be received.\n", stderr)
+            fputs("  Add this binary to BOTH:\n", stderr)
+            fputs("  1. System Settings > Privacy & Security > Accessibility\n", stderr)
+            fputs("  2. System Settings > Privacy & Security > Input Monitoring\n", stderr)
+            fputs("  Binary: \(CommandLine.arguments[0])\n", stderr)
+            debugPrint("SELF-TEST FAILED: tap disabled by OS")
+            // Re-enable and keep trying — permission might be granted while running
+            CGEvent.tapEnable(tap: t, enable: true)
+        }
+    }
+}
 
 // MARK: - Config File Poll (daemon keepalive)
 
@@ -706,6 +1103,16 @@ var configMissCount = 0
 let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
     if FileManager.default.fileExists(atPath: configFile) {
         configMissCount = 0
+
+        // Check drill-down flag (set by voice-input keyword detection)
+        if FileManager.default.fileExists(atPath: drillDownFlag) {
+            if let target = try? String(contentsOfFile: drillDownFlag, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines) {
+                try? FileManager.default.removeItem(atPath: drillDownFlag)
+                debugPrint("DRILL-DOWN FLAG — target: \(target)")
+                DispatchQueue.main.async { triggerDrillDown(target: target.isEmpty ? nil : target) }
+            }
+        }
     } else {
         configMissCount += 1
         debugPrint("Config file missing (count: \(configMissCount)/3)")
