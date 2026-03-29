@@ -23,6 +23,8 @@ PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_BIN="$PLUGIN_DIR/bin"
 INVOCATION_ID="$$-$(date +%s)"
 TTS_LOCK="/tmp/claude-tts-speaking.lock"
+DETAIL_CACHE="/tmp/claude-tts-detail-cache"
+DRILL_DOWN_FLAG="/tmp/claude-tts-drill-down"
 
 # Audio mutex — wait for any other instance to finish speaking before we start
 acquire_tts_lock() {
@@ -67,17 +69,36 @@ has_config() {
 # Read JSON from stdin, extract message
 json=$(cat)
 
-# Try to get ALL assistant text blocks from the current turn via transcript
+# Save transcript path and reset nav index so navigation starts from latest message
 transcript_path=$(echo "$json" | jq -r '.transcript_path // ""' 2>/dev/null)
-msg=""
+[ -n "$transcript_path" ] && echo "$transcript_path" > /tmp/claude-tts-transcript-path
+rm -f /tmp/claude-tts-nav-index
 
+# Primary: get last_assistant_message from hook JSON (always current)
+last_msg=$(echo "$json" | jq -r '.last_assistant_message // ""' 2>/dev/null)
+
+# Debug log for TTS pipeline diagnostics
+DEBUG_LOG="/tmp/claude-tts-debug.log"
+echo "$(date '+%Y-%m-%d %H:%M:%S') [$$] === Stop hook fired ===" >> "$DEBUG_LOG"
+echo "  last_msg length: ${#last_msg}, preview: ${last_msg:0:80}" >> "$DEBUG_LOG"
+
+# Secondary: try transcript parser for multi-block responses (text before AND after tool calls)
+msg=""
 if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
     msg=$(python3 -c "
 import json, sys
+
+debug_log = '/tmp/claude-tts-debug.log'
+def dbg(msg):
+    with open(debug_log, 'a') as f:
+        f.write(f'  [parser] {msg}\n')
+
+last = sys.argv[2] if len(sys.argv) > 2 else ''
 texts = []
 found = False
 with open(sys.argv[1]) as f:
     lines = f.readlines()
+dbg(f'transcript lines: {len(lines)}')
 for line in reversed(lines):
     line = line.strip()
     if not line: continue
@@ -92,16 +113,51 @@ for line in reversed(lines):
                     texts.append(b['text'])
                     found = True
     elif t == 'user' and found:
-        break
+        content = entry.get('message',{}).get('content',[])
+        has_text = False
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get('type') == 'text' and b.get('text','').strip():
+                    has_text = True
+                    break
+        elif isinstance(content, str) and content.strip():
+            has_text = True
+        if has_text:
+            break
 texts.reverse()
-print('\n\n'.join(texts))
-" "$transcript_path" 2>/dev/null)
+result = '\n<<MSG_BREAK>>\n'.join(texts)
+dbg(f'collected {len(texts)} text blocks')
+# Prefer transcript parser result (multiple blocks) over single last_assistant_message.
+# Only fall back to last_msg if parser found nothing.
+if len(texts) > 1:
+    dbg(f'using transcript result ({len(texts)} blocks)')
+    print(result)
+elif len(texts) == 1:
+    # Single block: verify it looks right, otherwise use last_msg
+    if last and last.strip() and last.strip()[:50] not in result:
+        dbg(f'single block mismatch — using last_msg')
+        print(last)
+    else:
+        dbg(f'single block matches — using transcript')
+        print(result)
+else:
+    dbg(f'no blocks found — using last_msg')
+    print(last)
+" "$transcript_path" "$last_msg" 2>>"$DEBUG_LOG")
 fi
 
-# Fallback to last_assistant_message if transcript parsing failed
+# Fallback if transcript parsing failed entirely
 if [ -z "$msg" ]; then
-    msg=$(echo "$json" | jq -r '.last_assistant_message // .stop_hook_message // .message // .content // ""' 2>/dev/null)
+    echo "  transcript parser returned empty — falling back to last_msg" >> "$DEBUG_LOG"
+    msg="$last_msg"
 fi
+if [ -z "$msg" ]; then
+    msg=$(echo "$json" | jq -r '.stop_hook_message // .message // .content // ""' 2>/dev/null)
+fi
+
+# Log final msg stats
+msg_breaks=$(echo "$msg" | grep -c '<<MSG_BREAK>>' || true)
+echo "  final msg: ${#msg} chars, $msg_breaks breaks, preview: ${msg:0:80}" >> "$DEBUG_LOG"
 
 [ -z "$msg" ] && exit 0
 
@@ -302,19 +358,77 @@ debounce_and_speak() {
     all_text=$(cat "$PENDING_FILE")
     rm -f "$PENDING_FILE" "$PENDING_TS"
 
-    [ -z "$all_text" ] && { release_tts_lock; return; }
-    [ -f "$SKIP_FLAG" ] && { release_tts_lock; return; }
+    if [ -z "$all_text" ]; then release_tts_lock; return; fi
+    if [ -f "$SKIP_FLAG" ]; then release_tts_lock; return; fi
 
-    # Strip markdown from accumulated text
-    local cleaned_text
-    cleaned_text=$(strip_markdown "$all_text" "$code_mode")
+    # Split into message segments (separated by <<MSG_BREAK>>)
+    local seg_dir="/tmp/claude-tts-segments-$$"
+    rm -rf "$seg_dir"
+    mkdir -p "$seg_dir"
 
-    # Save for repeat and history
-    save_for_repeat "$cleaned_text" "$speed" "$vol"
+    # Write each segment to its own file
+    python3 -c "
+import sys
+text = sys.stdin.read()
+parts = text.split('\n<<MSG_BREAK>>\n')
+for i, p in enumerate(parts):
+    p = p.strip()
+    if p:
+        with open(f'$seg_dir/seg-{i:03d}', 'w') as f:
+            f.write(p)
+" <<< "$all_text"
 
-    # Speak
+    local segment_count
+    segment_count=$(ls "$seg_dir"/seg-* 2>/dev/null | wc -l | tr -d ' ')
+    [ "$segment_count" -eq 0 ] && segment_count=1
+
+
+    # If no segments were created, write the whole text as one
+    if [ ! -f "$seg_dir/seg-000" ]; then
+        echo "$all_text" > "$seg_dir/seg-000"
+    fi
+
+    # Strip markdown from full text for repeat/history
+    local full_cleaned
+    full_cleaned=$(strip_markdown "$all_text" "$code_mode" | sed 's/<<MSG_BREAK>>//g')
+    save_for_repeat "$full_cleaned" "$speed" "$vol"
+
+    # Speak each segment — skip (cmd+cmd) advances to next segment
+
     touch "$TTS_PLAYING_FLAG"
-    speak_sentences "$cleaned_text" "$speed" "$vol"
+    local seg_idx=0
+    for seg_file in "$seg_dir"/seg-*; do
+        [ -f "$seg_file" ] || continue
+        seg_idx=$((seg_idx + 1))
+
+
+        # Check skip flag — if set, clear it and advance to next segment
+        if [ -f "$SKIP_FLAG" ]; then
+            rm -f "$SKIP_FLAG"
+            pkill say 2>/dev/null; pkill afplay 2>/dev/null
+            continue
+        fi
+
+        local segment transformed_seg cleaned_seg
+        segment=$(cat "$seg_file")
+        # Transform structured data (tables/lists) before markdown stripping
+        transformed_seg=$(echo "$segment" | python3 "$PLUGIN_BIN/transform-for-speech.py" 2>/dev/null)
+        [ -z "$transformed_seg" ] && transformed_seg="$segment"
+        cleaned_seg=$(strip_markdown "$transformed_seg" "$code_mode")
+        if [ -z "$cleaned_seg" ]; then
+            continue
+        fi
+
+        speak_sentences "$cleaned_seg" "$speed" "$vol"
+
+        # After speaking, check if skip was hit during this segment
+        if [ -f "$SKIP_FLAG" ] && [ "$seg_idx" -lt "$segment_count" ]; then
+            rm -f "$SKIP_FLAG"
+            pkill say 2>/dev/null; pkill afplay 2>/dev/null
+            continue
+        fi
+    done
+    rm -rf "$seg_dir"
     rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG"
 
     release_tts_lock
@@ -333,9 +447,36 @@ if has_config; then
     VOL_LEVEL="1.0"
     [ "$VOLUME" = "quiet" ] && VOL_LEVEL="0.3"
 
-    # Clean up stale flags from previous cycle
-    rm -f "$PAUSE_FLAG" "$TTS_PLAYING_FLAG" "$MIC_LISTENING_FLAG" /tmp/claude-voice-input-stop
+    # Takeover: if a PREVIOUS hook from THIS session is still speaking, kill it.
+    # Cross-session TTS is left alone — the lock serializes between sessions.
+    if [ -d "$TTS_LOCK" ] && [ -f "$TTS_LOCK/pid" ]; then
+        old_pid=$(cat "$TTS_LOCK/pid" 2>/dev/null)
+        if [ -n "$old_pid" ]; then
+            # Check if lock holder is from same session (same PPID = same Claude instance)
+            old_ppid=$(ps -p "$old_pid" -o ppid= 2>/dev/null | tr -d ' ')
+            my_ppid="$PPID"
+            if [ "$old_ppid" = "$my_ppid" ] || ! kill -0 "$old_pid" 2>/dev/null; then
+                # Same session or dead process — take over
+                touch "$SKIP_FLAG"
+                # Kill only our session's say/afplay by targeting children of the lock holder
+                kill "$old_pid" 2>/dev/null
+                pkill -P "$old_pid" 2>/dev/null
+                sleep 0.3
+                # Clean up if still held
+                if [ -d "$TTS_LOCK" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+                    rm -rf "$TTS_LOCK"
+                fi
+            fi
+            # Different session, still alive — let the lock serialize (don't kill)
+        fi
+    fi
+
+    # Clean up flags for fresh start
+    rm -f "$SKIP_FLAG" "$PAUSE_FLAG" "$TTS_PLAYING_FLAG" "$MIC_LISTENING_FLAG" /tmp/claude-voice-input-stop
     rm -f "$FORWARD_FLAG" "$REWIND_FLAG" /tmp/claude-tts-next-msg /tmp/claude-tts-prev-msg
+    rm -f "$PENDING_FILE" "$PENDING_TS"
+    rm -rf "$DETAIL_CACHE"
+    rm -f "$DRILL_DOWN_FLAG"
 
     # Safety net: ensure daemon is running
     ensure_daemon
