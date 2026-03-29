@@ -50,6 +50,7 @@ let detailCacheDir = "/tmp/claude-tts-detail-cache"
 let detailIndexFile = "/tmp/claude-tts-detail-cache/index.txt"
 let drillDownFlag = "/tmp/claude-tts-drill-down"
 let drillDownIndexFile = "/tmp/claude-tts-detail-cache/drill-index"
+let activeSegmentFile = "/tmp/claude-tts-active-segment"
 
 // MARK: - Arguments
 
@@ -107,6 +108,7 @@ class ControlState {
     var lastVoiceCheck: Date = .distantPast
     // Repeat playback state
     var repeatProcess: Process?
+    var lastStatusLine = ""
 }
 
 let state = ControlState()
@@ -158,6 +160,73 @@ func playDoubleTink() {
     proc2.arguments = ["--volume", chimeVolume, chimeSound]
     try? proc2.run()
     proc2.waitUntilExit()
+}
+
+// MARK: - Status Line
+
+func readActiveSegment() -> (segment: Int, total: Int, preview: String, status: String)? {
+    guard let content = try? String(contentsOfFile: activeSegmentFile, encoding: .utf8) else {
+        return nil
+    }
+    var seg = 0, total = 0, preview = "", status = ""
+    for line in content.components(separatedBy: "\n") {
+        let parts = line.split(separator: "=", maxSplits: 1)
+        guard parts.count == 2 else { continue }
+        let key = String(parts[0])
+        let val = String(parts[1])
+        switch key {
+        case "segment": seg = Int(val) ?? 0
+        case "total": total = Int(val) ?? 0
+        case "preview": preview = val
+        case "status": status = val
+        default: break
+        }
+    }
+    guard seg > 0 && !status.isEmpty else { return nil }
+    return (seg, total, preview, status)
+}
+
+func updateStatusLine() {
+    if let info = readActiveSegment() {
+        let line: String
+        switch info.status {
+        case "speaking":
+            line = "▶ Speaking [\(info.segment)/\(info.total)]: \(info.preview)"
+        case "drill-down":
+            line = "▶ Drill-down: \(info.preview)"
+        case "repeat":
+            line = "▶ Repeat: \(info.preview)"
+        default:
+            clearStatusLine()
+            return
+        }
+        let truncated = String(line.prefix(80))
+        if truncated != state.lastStatusLine {
+            let clearStr = "\r" + String(repeating: " ", count: state.lastStatusLine.count) + "\r"
+            fputs(clearStr + truncated, stderr)
+            state.lastStatusLine = truncated
+        }
+    } else if !state.lastStatusLine.isEmpty {
+        clearStatusLine()
+    }
+}
+
+func clearStatusLine() {
+    if !state.lastStatusLine.isEmpty {
+        let clearStr = "\r" + String(repeating: " ", count: state.lastStatusLine.count) + "\r"
+        fputs(clearStr, stderr)
+        state.lastStatusLine = ""
+    }
+}
+
+func writeActiveSegment(segment: Int = 1, total: Int = 1, preview: String, status: String) {
+    let truncPreview = String(preview.prefix(60))
+    let content = "segment=\(segment)\ntotal=\(total)\npreview=\(truncPreview)\nstatus=\(status)\n"
+    try? content.write(toFile: activeSegmentFile, atomically: true, encoding: .utf8)
+}
+
+func clearActiveSegment() {
+    try? FileManager.default.removeItem(atPath: activeSegmentFile)
 }
 
 func killTTSProcesses() {
@@ -285,6 +354,7 @@ func triggerStopAll() {
 
     // Force-release TTS lock in case something is stuck
     try? FileManager.default.removeItem(atPath: ttsLockDir)
+    clearActiveSegment()
 
     // Chime AFTER cleanup so pkill doesn't kill it
     usleep(100_000)
@@ -322,6 +392,8 @@ func triggerRepeat() {
 
     // Mark TTS as playing
     FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
+    let previewText = String(text.prefix(60))
+    writeActiveSegment(preview: previewText, status: "repeat")
 
     // Play sentence by sentence in background
     DispatchQueue.global(qos: .userInitiated).async {
@@ -381,6 +453,7 @@ func triggerRepeat() {
         try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
         try? FileManager.default.removeItem(atPath: pauseFlag)
         try? FileManager.default.removeItem(atPath: skipFlag)
+        clearActiveSegment()
         releaseTTSLock()
     }
 }
@@ -463,6 +536,8 @@ func triggerDrillDown(target: String? = nil) {
 
     // Mark TTS as playing and chime
     FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
+    let previewText = String((try? String(contentsOfFile: "\(detailCacheDir)/\(entriesToPlay[0])", encoding: .utf8))?.prefix(60) ?? "")
+    writeActiveSegment(preview: previewText, status: "drill-down")
     playDoubleTink()
 
     // Play in background
@@ -541,6 +616,7 @@ func triggerDrillDown(target: String? = nil) {
         try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
         try? FileManager.default.removeItem(atPath: pauseFlag)
         try? FileManager.default.removeItem(atPath: skipFlag)
+        clearActiveSegment()
         releaseTTSLock()
     }
 }
@@ -853,7 +929,8 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
             }
         }
 
-        // When both released with no modifiers
+        // When all modifiers released (keys release one at a time, so this fires
+        // on the SECOND release — e.g., opt releases, then shift releases)
         if state.optShiftTriggered && !hasOption && !hasShift && !hasCommand && !hasControl {
             state.optShiftTriggered = false
             let now = Date()
@@ -861,16 +938,15 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
             if let last = state.lastOptShiftUp, now.timeIntervalSince(last) < doubleTapWindow {
                 state.lastOptShiftUp = nil
                 debugPrint("OPT+SHIFT DOUBLE TAP — triggering drill-down")
+                playChime()
                 DispatchQueue.main.async { triggerDrillDown() }
             } else {
                 state.lastOptShiftUp = now
             }
         }
 
-        // If one released while other held, disarm but keep double-tap timer
-        if state.optShiftTriggered && ((!hasOption && hasShift) || (hasOption && !hasShift)) {
-            state.optShiftTriggered = false
-        }
+        // If one released while other held, keep armed — don't disarm.
+        // The "all released" check above handles the full release.
     }
 
     // --- COMMAND+SHIFT: REPEAT ---
@@ -981,8 +1057,8 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
             return Unmanaged.passUnretained(event)
         }
 
-        // Don't trigger if cmd+shift repeat is armed
-        if state.cmdShiftTriggered {
+        // Don't trigger if cmd+shift repeat or opt+shift drill-down is armed
+        if state.cmdShiftTriggered || state.optShiftTriggered {
             return Unmanaged.passUnretained(event)
         }
 
@@ -1112,6 +1188,13 @@ let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
                 debugPrint("DRILL-DOWN FLAG — target: \(target)")
                 DispatchQueue.main.async { triggerDrillDown(target: target.isEmpty ? nil : target) }
             }
+        }
+
+        // Update status line when TTS is active
+        if FileManager.default.fileExists(atPath: ttsPlayingFlag) {
+            updateStatusLine()
+        } else {
+            clearStatusLine()
         }
     } else {
         configMissCount += 1
