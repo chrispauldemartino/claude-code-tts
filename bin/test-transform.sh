@@ -52,29 +52,6 @@ assert_file_exists() {
     fi
 }
 
-run_test() {
-    local name="$1"
-    local input="$2"
-    shift 2
-    # Remaining args are assertion triples: (func label needle) or file checks
-    local output
-    output=$(echo "$input" | python3 "$TRANSFORMER" 2>/dev/null)
-    local exit_code=$?
-    local test_passed=true
-
-    echo "--- Test: $name ---"
-
-    if [ $exit_code -ne 0 ]; then
-        echo "  FAIL: transformer exited with code $exit_code"
-        FAIL=$((FAIL + 1))
-        return
-    fi
-
-    # Return output for callers to check
-    echo "$output"
-    TEST_OUTPUT="$output"
-}
-
 # ============================================================
 # Test 1: Small table (3 rows) — read all rows, no summary count
 # ============================================================

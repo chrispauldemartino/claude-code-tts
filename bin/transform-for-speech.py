@@ -33,16 +33,25 @@ def ensure_cache_dir():
     os.makedirs(CACHE_DIR, exist_ok=True)
 
 
+def clear_cache():
+    """Remove all files from the cache directory."""
+    if os.path.isdir(CACHE_DIR):
+        for f in os.listdir(CACHE_DIR):
+            os.remove(os.path.join(CACHE_DIR, f))
+
+
 def next_cache_id(prefix):
     """Get next sequential ID for cache files (table-001, list-001, etc.)."""
     ensure_cache_dir()
     current_file = os.path.join(CACHE_DIR, "current")
     try:
-        current = int(open(current_file).read().strip())
+        with open(current_file) as f:
+            current = int(f.read().strip())
     except (FileNotFoundError, ValueError):
         current = 0
     next_id = current + 1
-    open(current_file, "w").write(str(next_id))
+    with open(current_file, "w") as f:
+        f.write(str(next_id))
     return f"{prefix}-{next_id:03d}"
 
 
