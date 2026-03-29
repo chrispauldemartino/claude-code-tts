@@ -142,8 +142,12 @@ def transform_table(headers, rows):
         col_names = ", ".join(headers)
         summary_parts = [f"Table with {num_rows} rows. Columns: {col_names}."]
 
+        # Narrate first row fully (spec requirement)
+        summary_parts.append(narrate_row(1, headers, rows[0]))
+
         outliers = find_outliers(headers, rows)
-        if outliers:
+        # Skip outliers if they exceed 50% of rows (no meaningful pattern)
+        if outliers and len(outliers) <= num_rows // 2:
             for row_label, col_name, value in outliers:
                 summary_parts.append(f"{row_label} has {col_name} {value}.")
 

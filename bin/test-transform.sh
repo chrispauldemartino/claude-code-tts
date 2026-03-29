@@ -138,6 +138,7 @@ fi
 if $ok; then
     assert_contains "count" "$TEST_OUTPUT" "5 rows" || ok=false
     assert_contains "columns" "$TEST_OUTPUT" "Service" || ok=false
+    assert_contains "row1" "$TEST_OUTPUT" "Row 1" || ok=false
     assert_contains "outlier" "$TEST_OUTPUT" "Down" || ok=false
     assert_file_exists "cache" "$CACHE_DIR/table-001.txt" || ok=false
 fi
@@ -314,6 +315,45 @@ if $ok; then
     # Should pass through unchanged (including pipes) since it's not a valid table
     assert_contains "passthrough" "$TEST_OUTPUT" "|" || ok=false
     assert_not_contains "no-row" "$TEST_OUTPUT" "Row 1" || ok=false
+fi
+
+if $ok; then
+    echo "  PASS"
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1))
+fi
+
+# ============================================================
+# Test 8: Degenerate outliers (all unique values) — no outlier callouts
+# ============================================================
+echo ""
+echo "=== Test 8: Degenerate outliers (all unique values) ==="
+clean_cache
+
+INPUT='| Student | Score |
+|---------|-------|
+| Alice | 95 |
+| Bob | 87 |
+| Carol | 91 |
+| Dave | 73 |
+| Eve | 88 |'
+
+TEST_OUTPUT=$(echo "$INPUT" | python3 "$TRANSFORMER" 2>/dev/null)
+EXIT=$?
+ok=true
+
+if [ $EXIT -ne 0 ]; then
+    echo "  FAIL: transformer exited with code $EXIT"
+    ok=false
+fi
+
+if $ok; then
+    assert_contains "count" "$TEST_OUTPUT" "5 rows" || ok=false
+    assert_contains "row1" "$TEST_OUTPUT" "Row 1" || ok=false
+    # All scores are unique, so every row would be an "outlier" (5/5 > 50%)
+    # The fix should suppress outlier callouts entirely
+    assert_not_contains "no-outlier-95" "$TEST_OUTPUT" "has Score" || ok=false
 fi
 
 if $ok; then
