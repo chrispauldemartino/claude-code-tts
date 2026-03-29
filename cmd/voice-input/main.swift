@@ -210,21 +210,57 @@ class TextTyper {
     }
 }
 
-// MARK: - SendDetector
+// MARK: - KeywordDetector
 
-class SendDetector {
+class KeywordDetector {
     var onSend: (() -> Void)?
+    var onDrillDown: ((String) -> Void)?
     private var pendingWork: DispatchWorkItem?
     private var detected = false
+    private var detectedKeyword: String?
+
+    let drillDownKeywords: [(phrase: String, target: String)] = [
+        ("read all", "all"),
+        ("read rows", "table"),
+        ("read table", "table"),
+        ("read list", "list"),
+        ("read items", "list"),
+    ]
 
     func check(_ text: String) {
         let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Check drill-down keywords first (higher priority than send)
+        for kw in drillDownKeywords {
+            if lower.hasSuffix(kw.phrase) || lower.hasSuffix(kw.phrase + ".")
+                || lower.hasSuffix(kw.phrase + ",") || lower.hasSuffix(kw.phrase + "!") {
+                if !detected || detectedKeyword != kw.phrase {
+                    pendingWork?.cancel()
+                    detected = true
+                    detectedKeyword = kw.phrase
+                    let target = kw.target
+                    debugLog("'\(kw.phrase)' detected, starting \(sendStabilityDelay)s timer")
+                    let work = DispatchWorkItem { [weak self] in
+                        debugLog("'\(kw.phrase)' stable — triggering drill-down(\(target))")
+                        self?.onDrillDown?(target)
+                    }
+                    pendingWork = work
+                    DispatchQueue.main.asyncAfter(
+                        deadline: .now() + sendStabilityDelay, execute: work)
+                }
+                return
+            }
+        }
+
+        // Fall back to send detection
         let endsSend = lower.hasSuffix("send") || lower.hasSuffix("send.")
             || lower.hasSuffix("send,") || lower.hasSuffix("send!")
 
         if endsSend {
-            if !detected {
+            if !detected || detectedKeyword != "send" {
+                pendingWork?.cancel()
                 detected = true
+                detectedKeyword = "send"
                 debugLog("'send' detected, starting \(sendStabilityDelay)s timer")
                 let work = DispatchWorkItem { [weak self] in
                     debugLog("'send' stable — triggering send")
@@ -236,10 +272,11 @@ class SendDetector {
             }
         } else {
             if detected {
-                debugLog("'send' no longer at end, cancelling timer")
+                debugLog("'\(detectedKeyword ?? "keyword")' no longer at end, cancelling timer")
                 pendingWork?.cancel()
                 pendingWork = nil
                 detected = false
+                detectedKeyword = nil
             }
         }
     }
@@ -248,6 +285,7 @@ class SendDetector {
         pendingWork?.cancel()
         pendingWork = nil
         detected = false
+        detectedKeyword = nil
     }
 }
 
@@ -260,7 +298,7 @@ unlink(sendingFlag)
 
 let parser = WhisperStreamParser()
 let typer = TextTyper()
-let detector = SendDetector()
+let detector = KeywordDetector()
 var whisperProcess: Process?
 var exiting = false
 
@@ -331,7 +369,32 @@ func triggerSend() {
     exit(0)
 }
 
+func triggerDrillDown(_ target: String) {
+    guard !exiting else { return }
+    debugLog("TRIGGER DRILL-DOWN: \(target)")
+
+    // Kill whisper-stream
+    if let proc = whisperProcess, proc.isRunning {
+        proc.terminate()
+        proc.waitUntilExit()
+    }
+    usleep(200_000)
+
+    // Delete all typed text (keyword consumed, not sent to Claude)
+    typer.deleteAll()
+    usleep(100_000)
+
+    // Write drill-down flag for skip-listener to pick up
+    let flagPath = "/tmp/claude-tts-drill-down"
+    try? target.write(toFile: flagPath, atomically: true, encoding: .utf8)
+
+    debugLog("Drill-down flag written, exiting")
+    usleep(200_000)
+    exit(0)
+}
+
 detector.onSend = triggerSend
+detector.onDrillDown = triggerDrillDown
 
 // Launch whisper-stream
 let process = Process()
