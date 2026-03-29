@@ -25,6 +25,7 @@ INVOCATION_ID="$$-$(date +%s)"
 TTS_LOCK="/tmp/claude-tts-speaking.lock"
 DETAIL_CACHE="/tmp/claude-tts-detail-cache"
 DRILL_DOWN_FLAG="/tmp/claude-tts-drill-down"
+ACTIVE_SEGMENT="/tmp/claude-tts-active-segment"
 
 # Audio mutex — wait for any other instance to finish speaking before we start
 acquire_tts_lock() {
@@ -48,7 +49,25 @@ release_tts_lock() {
     rm -rf "$TTS_LOCK"
 }
 
-trap 'rm -f "$TMP_AUDIO"; release_tts_lock' EXIT
+write_active_segment() {
+    local seg="$1"
+    local total="$2"
+    local preview="$3"
+    local status="${4:-speaking}"
+    [ ${#preview} -gt 60 ] && preview="${preview:0:57}..."
+    cat > "$ACTIVE_SEGMENT" << SEGEOF
+segment=$seg
+total=$total
+preview=$preview
+status=$status
+SEGEOF
+}
+
+clear_active_segment() {
+    rm -f "$ACTIVE_SEGMENT"
+}
+
+trap 'rm -f "$TMP_AUDIO"; clear_active_segment; release_tts_lock' EXIT
 
 read_config() {
     local key="$1"
@@ -130,8 +149,13 @@ dbg(f'collected {len(texts)} text blocks')
 # Prefer transcript parser result (multiple blocks) over single last_assistant_message.
 # Only fall back to last_msg if parser found nothing.
 if len(texts) > 1:
-    dbg(f'using transcript result ({len(texts)} blocks)')
-    print(result)
+    # Verify result contains current response (not stale transcript)
+    if last and last.strip() and last.strip()[:50] not in result:
+        dbg(f'multi-block stale — using last_msg (transcript lagging)')
+        print(last)
+    else:
+        dbg(f'using transcript result ({len(texts)} blocks)')
+        print(result)
 elif len(texts) == 1:
     # Single block: verify it looks right, otherwise use last_msg
     if last and last.strip() and last.strip()[:50] not in result:
@@ -419,6 +443,7 @@ for i, p in enumerate(parts):
             continue
         fi
 
+        write_active_segment "$seg_idx" "$segment_count" "$cleaned_seg"
         speak_sentences "$cleaned_seg" "$speed" "$vol"
 
         # After speaking, check if skip was hit during this segment
@@ -428,6 +453,7 @@ for i, p in enumerate(parts):
             continue
         fi
     done
+    clear_active_segment
     rm -rf "$seg_dir"
     rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG"
 
@@ -477,6 +503,7 @@ if has_config; then
     rm -f "$PENDING_FILE" "$PENDING_TS"
     rm -rf "$DETAIL_CACHE"
     rm -f "$DRILL_DOWN_FLAG"
+    rm -f "$ACTIVE_SEGMENT"
 
     # Safety net: ensure daemon is running
     ensure_daemon
