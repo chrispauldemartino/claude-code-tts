@@ -67,7 +67,42 @@ clear_active_segment() {
     rm -f "$ACTIVE_SEGMENT"
 }
 
-trap 'rm -f "$TMP_AUDIO"; clear_active_segment; release_tts_lock' EXIT
+# Subtitle display — writes directly to terminal via /dev/tty
+# Detect terminal device from parent process (Claude Code)
+TTY_DEV=""
+_detect_tty() {
+    [ -n "$TTY_DEV" ] && return
+    local parent_tty
+    parent_tty=$(ps -o tty= -p $PPID 2>/dev/null | tr -d ' ')
+    if [ -n "$parent_tty" ] && [ "$parent_tty" != "??" ]; then
+        TTY_DEV="/dev/$parent_tty"
+        echo "$TTY_DEV" > /tmp/claude-tts-tty
+    fi
+}
+
+show_subtitle() {
+    [ "$SUBTITLE" != "on" ] && return
+    _detect_tty
+    [ -z "$TTY_DEV" ] && return
+    local preview="$1"
+    local cols=100
+    local tty_cols
+    tty_cols=$(stty size < "$TTY_DEV" 2>/dev/null | awk '{print $2}')
+    if [ -n "$tty_cols" ] && [ "$tty_cols" -gt 20 ] 2>/dev/null; then
+        cols=$((tty_cols - 10))
+    fi
+    [ ${#preview} -gt "$cols" ] && preview="${preview:0:$cols}"
+    printf '\r\033[K\033[90m▶ %s\033[0m' "$preview" > "$TTY_DEV" 2>/dev/null
+}
+
+clear_subtitle() {
+    [ "$SUBTITLE" != "on" ] && return
+    _detect_tty
+    [ -z "$TTY_DEV" ] && return
+    printf '\r\033[K' > "$TTY_DEV" 2>/dev/null
+}
+
+trap 'rm -f "$TMP_AUDIO"; clear_active_segment; clear_subtitle; release_tts_lock' EXIT
 
 read_config() {
     local key="$1"
@@ -274,6 +309,7 @@ speak_sentences() {
         sentence=$(sed -n "${idx}p" "$sentences_file")
         [ -z "$sentence" ] && { idx=$((idx + 1)); continue; }
 
+        show_subtitle "$sentence"
         echo "$sentence" | say -r "$rate" -o "$TMP_AUDIO" 2>/dev/null \
             && afplay --volume "$vol" "$TMP_AUDIO" 2>/dev/null
         rm -f "$TMP_AUDIO"
@@ -427,9 +463,11 @@ for i, p in enumerate(parts):
 
 
         # Check skip flag — if set, clear it and advance to next segment
+        # If TTS playing flag is gone, stop-all was triggered — break entirely
         if [ -f "$SKIP_FLAG" ]; then
             rm -f "$SKIP_FLAG"
             pkill say 2>/dev/null; pkill afplay 2>/dev/null
+            [ ! -f "$TTS_PLAYING_FLAG" ] && break
             continue
         fi
 
@@ -444,16 +482,19 @@ for i, p in enumerate(parts):
         fi
 
         write_active_segment "$seg_idx" "$segment_count" "$cleaned_seg"
+        show_subtitle "$cleaned_seg"
         speak_sentences "$cleaned_seg" "$speed" "$vol"
 
         # After speaking, check if skip was hit during this segment
-        if [ -f "$SKIP_FLAG" ] && [ "$seg_idx" -lt "$segment_count" ]; then
+        if [ -f "$SKIP_FLAG" ]; then
             rm -f "$SKIP_FLAG"
             pkill say 2>/dev/null; pkill afplay 2>/dev/null
-            continue
+            [ ! -f "$TTS_PLAYING_FLAG" ] && break
+            [ "$seg_idx" -lt "$segment_count" ] && continue
         fi
     done
     clear_active_segment
+    clear_subtitle
     rm -rf "$seg_dir"
     rm -f "$TTS_PLAYING_FLAG" "$PAUSE_FLAG" "$SKIP_FLAG"
 
@@ -464,6 +505,7 @@ if has_config; then
     VOICE=$(read_config "voice" "off")
     MIC=$(read_config "mic" "off")
     CUE=$(read_config "cue" "off")
+    SUBTITLE=$(read_config "subtitle" "off")
     SPEED=$(read_config "speed" "200")
     [[ "$SPEED" =~ ^[0-9]+$ ]] || SPEED=200
     VOLUME=$(read_config "volume" "normal")

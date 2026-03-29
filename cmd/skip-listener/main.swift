@@ -219,6 +219,49 @@ func clearStatusLine() {
     }
 }
 
+// MARK: - TTY Subtitle (direct terminal output)
+
+let ttyPathFile = "/tmp/claude-tts-tty"
+
+func readSubtitleEnabled() -> Bool {
+    guard let content = try? String(contentsOfFile: configFile, encoding: .utf8) else { return false }
+    for line in content.components(separatedBy: "\n") {
+        if line.hasPrefix("subtitle=") {
+            return line.replacingOccurrences(of: "subtitle=", with: "") == "on"
+        }
+    }
+    return false
+}
+
+func showTTYSubtitle(_ text: String) {
+    guard readSubtitleEnabled(),
+          let ttyPath = try? String(contentsOfFile: ttyPathFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          let fh = FileHandle(forWritingAtPath: ttyPath) else { return }
+    // Get terminal width from TTY
+    var ws = winsize()
+    let cols: Int
+    if ioctl(fh.fileDescriptor, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 {
+        cols = Int(ws.ws_col)
+    } else {
+        cols = 120
+    }
+    let maxLen = cols - 4
+    var preview = text
+    if preview.count > maxLen { preview = String(preview.prefix(maxLen)) }
+    let line = "\r\u{1B}[K\u{1B}[90m▶ \(preview)\u{1B}[0m"
+    if let data = line.data(using: .utf8) { fh.write(data) }
+    fh.closeFile()
+}
+
+func clearTTYSubtitle() {
+    guard let ttyPath = try? String(contentsOfFile: ttyPathFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          let fh = FileHandle(forWritingAtPath: ttyPath) else { return }
+    if let data = "\r\u{1B}[K".data(using: .utf8) { fh.write(data) }
+    fh.closeFile()
+}
+
 func writeActiveSegment(segment: Int = 1, total: Int = 1, preview: String, status: String) {
     let truncPreview = String(preview.prefix(60))
     let content = "segment=\(segment)\ntotal=\(total)\npreview=\(truncPreview)\nstatus=\(status)\n"
@@ -282,6 +325,7 @@ func togglePause() {
     if state.isPaused {
         debugPrint("RESUME — sending SIGCONT")
         try? FileManager.default.removeItem(atPath: pauseFlag)
+        showTTYSubtitle("▶ resumed")
 
         for name in ["afplay", "say", "whisper-stream"] {
             let proc = Process()
@@ -295,6 +339,7 @@ func togglePause() {
     } else {
         debugPrint("PAUSE — sending SIGSTOP")
         FileManager.default.createFile(atPath: pauseFlag, contents: nil)
+        showTTYSubtitle("⏸ paused")
 
         for name in ["afplay", "say", "whisper-stream"] {
             let proc = Process()
@@ -355,6 +400,8 @@ func triggerStopAll() {
     // Force-release TTS lock in case something is stuck
     try? FileManager.default.removeItem(atPath: ttsLockDir)
     clearActiveSegment()
+
+    clearTTYSubtitle()
 
     // Chime AFTER cleanup so pkill doesn't kill it
     usleep(100_000)
@@ -422,6 +469,8 @@ func triggerRepeat() {
             let sentence = sentences[idx]
             let tmpFile = "/tmp/claude-tts-repeat-\(ProcessInfo.processInfo.processIdentifier).aiff"
 
+            showTTYSubtitle(sentence)
+
             // Generate audio
             let sayProc = Process()
             sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
@@ -450,6 +499,7 @@ func triggerRepeat() {
         }
 
         // Cleanup
+        clearTTYSubtitle()
         try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
         try? FileManager.default.removeItem(atPath: pauseFlag)
         try? FileManager.default.removeItem(atPath: skipFlag)
@@ -774,6 +824,8 @@ func triggerMessageNav(direction: String) {
                 let sentence = sentences[idx]
                 let tmpFile = "/tmp/claude-tts-nav-\(ProcessInfo.processInfo.processIdentifier).aiff"
 
+                showTTYSubtitle(sentence)
+
                 let sayProc = Process()
                 sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
                 sayProc.arguments = ["-r", speed, "-o", tmpFile]
@@ -806,6 +858,7 @@ func triggerMessageNav(direction: String) {
             msgIdx += 1
         }
 
+        clearTTYSubtitle()
         try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
         try? FileManager.default.removeItem(atPath: pauseFlag)
         try? FileManager.default.removeItem(atPath: skipFlag)
