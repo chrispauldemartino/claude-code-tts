@@ -28,7 +28,7 @@ fi
 
 pkill -f "$EXE" 2>/dev/null || true
 sleep 1
-nohup /usr/bin/open -gj "$APP" >/dev/null 2>&1 &
+launchctl kickstart -k "$LABEL" 2>/dev/null || true
 
 for _ in 1 2 3 4 5; do
     PID="$(get_pid)"

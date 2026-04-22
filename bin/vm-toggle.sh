@@ -83,6 +83,62 @@ restart_remote_skip_listener() {
     "
 }
 
+remote_skip_listener_identity() {
+    ssh_mbp "codesign -dv --verbose=4 '$MBP_SKIP_LISTENER_APP' 2>&1 | awk -F= '/^Authority=Apple Development:/ {print \$2; exit}'" 2>/dev/null
+}
+
+trigger_remote_gui_rebuild() {
+    local signer="$1"
+
+    ssh_mbp "cat > /tmp/skip-listener-rebuild-gui.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+LOG=/tmp/skip-listener-rebuild-gui.log
+: > \"\$LOG\"
+status=0
+if [ -n \"$signer\" ]; then
+    export SKIP_LISTENER_CODESIGN_IDENTITY=\"$signer\"
+fi
+'$MBP_SKIP_LISTENER_BUILD' >> \"\$LOG\" 2>&1 || status=\$?
+if [ \"\$status\" -eq 0 ]; then
+    '$MBP_SKIP_LISTENER_INSTALL' >> \"\$LOG\" 2>&1 || status=\$?
+fi
+if [ \"\$status\" -eq 0 ]; then
+    '$MBP_SKIP_LISTENER_RESTART' >> \"\$LOG\" 2>&1 || status=\$?
+fi
+echo \"__EXIT__\${status}\" >> \"\$LOG\"
+EOF
+chmod +x /tmp/skip-listener-rebuild-gui.sh
+osascript -e 'tell application \"Terminal\" to activate' -e 'tell application \"Terminal\" to do script \"/tmp/skip-listener-rebuild-gui.sh\"'
+" || return 1
+}
+
+wait_for_remote_gui_rebuild() {
+    local timeout_s="${1:-90}"
+    local waited=0
+    local status_line=""
+
+    while [ "$waited" -lt "$timeout_s" ]; do
+        status_line="$(ssh_mbp "tail -n 1 /tmp/skip-listener-rebuild-gui.log 2>/dev/null || true" 2>/dev/null || true)"
+
+        case "$status_line" in
+            __EXIT__0)
+                return 0
+                ;;
+            __EXIT__*)
+                ssh_mbp "cat /tmp/skip-listener-rebuild-gui.log 2>/dev/null" 2>/dev/null || true
+                return 1
+                ;;
+        esac
+
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    echo "GUI rebuild did not finish within ${timeout_s}s. Check /tmp/skip-listener-rebuild-gui.log on the MBP." >&2
+    return 1
+}
+
 rebuild_remote_skip_listener() {
     local required_files=(
         "$LOCAL_SKIP_LISTENER_SRC"
@@ -92,6 +148,7 @@ rebuild_remote_skip_listener() {
         "$LOCAL_TTS_BRIDGE"
     )
     local file
+    local signer
 
     for file in "${required_files[@]}"; do
         if [ ! -f "$file" ]; then
@@ -110,13 +167,22 @@ rebuild_remote_skip_listener() {
     scp_mbp "$LOCAL_TTS_BRIDGE" "$MBP_HOST:$MBP_TTS_BRIDGE" || return 1
 
     kill_remote_tts_bridge || return 1
+    signer="$(remote_skip_listener_identity)"
 
-    ssh_mbp "
+    if ssh_mbp "
         chmod +x '$MBP_SKIP_LISTENER_BUILD' '$MBP_SKIP_LISTENER_INSTALL' '$MBP_SKIP_LISTENER_RESTART' '$MBP_TTS_BRIDGE' && \
         '$MBP_SKIP_LISTENER_BUILD' && \
         '$MBP_SKIP_LISTENER_INSTALL' && \
         nohup '$MBP_TTS_BRIDGE' mac-mini-ts </dev/null >/tmp/claude-tts-bridge.log 2>&1 &
-    " || return 1
+    "; then
+        return 0
+    fi
+
+    echo "Headless codesign failed on the MBP. Opening a local Terminal rebuild so macOS can use GUI keychain access..."
+    trigger_remote_gui_rebuild "$signer" || return 1
+    echo "Waiting for GUI rebuild to finish on the MBP..."
+    wait_for_remote_gui_rebuild 120 || return 1
+    start_remote_tts_bridge || return 1
 }
 
 read_config() {
@@ -229,9 +295,12 @@ start_daemon() {
 }
 
 stop_daemon() {
-    # Kill skip-listener, bridge, and say on MBP
+    # Unload the LaunchAgent on /vm off so KeepAlive cannot relaunch the listener
+    # into a permission-prompt loop while voice mode is disabled.
     ssh -o ConnectTimeout=3 -o BatchMode=yes "$MBP_HOST" "
-        pkill -f skip-listener 2>/dev/null
+        launchctl bootout gui/\$(id -u) \$HOME/Library/LaunchAgents/com.elle.skip-listener.plist 2>/dev/null || \
+            launchctl bootout gui/\$(id -u)/com.elle.skip-listener 2>/dev/null || \
+            pkill -f '$MBP_SKIP_LISTENER' 2>/dev/null || true
         screen -ls | grep tts-bridge | cut -d. -f1 | xargs -I{} screen -S {} -X quit 2>/dev/null
         pkill -f tts-bridge 2>/dev/null
         pkill say 2>/dev/null
@@ -240,8 +309,7 @@ stop_daemon() {
         rm -f /tmp/claude-tts-playing /tmp/claude-voice-listening
         rm -f /tmp/claude-voice-config /tmp/claude-tts-bridge-stop
         rm -rf /tmp/claude-tts-queue
-    " 2>/dev/null &
-    disown 2>/dev/null
+    " 2>/dev/null
     # Clean up local flag files
     rm -f /tmp/claude-tts-skip /tmp/claude-tts-pause
     rm -f /tmp/claude-tts-playing /tmp/claude-voice-listening
@@ -271,32 +339,139 @@ show_status() {
     fi
 }
 
+remote_skip() {
+    ssh_mbp "
+        preserve_pause=0
+        [ -f /tmp/claude-tts-pause ] && preserve_pause=1
+
+        for name in afplay say whisper-stream; do
+            pkill -CONT \$name 2>/dev/null || true
+        done
+
+        : > /tmp/claude-tts-skip
+        if [ \"\$preserve_pause\" -eq 0 ]; then
+            rm -f /tmp/claude-tts-pause
+        else
+            : > /tmp/claude-tts-pause
+        fi
+
+        pkill say 2>/dev/null || true
+        pkill afplay 2>/dev/null || true
+        pkill -f whisper-stream 2>/dev/null || true
+    "
+}
+
+remote_stop_all() {
+    ssh_mbp "
+        : > /tmp/claude-tts-skip
+        rm -f /tmp/claude-tts-pause /tmp/claude-tts-playing /tmp/claude-voice-listening
+        rm -f /tmp/claude-tts-active-segment /tmp/claude-voice-input-stop
+        rm -f /tmp/claude-tts-reading-file
+        rm -rf /tmp/claude-tts-speaking.lock
+        rm -f /tmp/claude-tts-nav-index
+
+        hist_dir=\$(cat /tmp/claude-tts-history-dir 2>/dev/null || true)
+        if [ -n \"\$hist_dir\" ] && [ -f \"\$hist_dir/total\" ]; then
+            cat \"\$hist_dir/total\" > /tmp/claude-tts-repeat-anchor
+        fi
+
+        pkill -f read-file.sh 2>/dev/null || true
+        pkill say 2>/dev/null || true
+        pkill afplay 2>/dev/null || true
+        pkill -f voice-input 2>/dev/null || true
+        pkill -f whisper-stream 2>/dev/null || true
+    "
+}
+
+remote_pause() {
+    ssh_mbp "
+        : > /tmp/claude-tts-pause
+        for name in afplay say whisper-stream; do
+            pkill -STOP \$name 2>/dev/null || true
+        done
+    "
+}
+
+remote_resume() {
+    ssh_mbp "
+        rm -f /tmp/claude-tts-pause
+        for name in afplay say whisper-stream; do
+            pkill -CONT \$name 2>/dev/null || true
+        done
+    "
+}
+
+remote_seek() {
+    local direction="$1"
+    local flag=""
+    local label=""
+
+    case "$direction" in
+        forward)
+            flag="/tmp/claude-tts-forward"
+            label="Forward"
+            ;;
+        rewind)
+            flag="/tmp/claude-tts-rewind"
+            label="Rewind"
+            ;;
+        *)
+            echo "Unknown seek direction: $direction" >&2
+            return 1
+            ;;
+    esac
+
+    if ! ssh_mbp "[ -f /tmp/claude-tts-playing ]"; then
+        echo "$label fallback only works during active playback right now."
+        return 0
+    fi
+
+    ssh_mbp "
+        : > '$flag'
+        pkill say 2>/dev/null || true
+        pkill afplay 2>/dev/null || true
+        pkill -f whisper-stream 2>/dev/null || true
+    "
+}
+
 do_repeat() {
-    local text_file="/tmp/claude-tts-last-text"
-    local speed_file="/tmp/claude-tts-last-speed"
-    local vol_file="/tmp/claude-tts-last-volume"
+    ssh_mbp "
+        history_dir_file=/tmp/claude-tts-history-dir
+        anchor_file=/tmp/claude-tts-repeat-anchor
+        text_file=/tmp/claude-tts-last-text
+        speed_file=/tmp/claude-tts-last-speed
+        vol_file=/tmp/claude-tts-last-volume
 
-    if [ ! -f "$text_file" ]; then
-        echo "Nothing to repeat — no previous TTS response saved."
-        return 1
-    fi
+        hist_dir=\$(cat \"\$history_dir_file\" 2>/dev/null || true)
+        anchor=\$(cat \"\$anchor_file\" 2>/dev/null | tr -d '[:space:]')
+        if [ -n \"\$hist_dir\" ] && [ -n \"\$anchor\" ]; then
+            padded=\$(printf '%03d' \"\$anchor\" 2>/dev/null || true)
+            if [ -f \"\$hist_dir/msg-\$padded.txt\" ]; then
+                text_file=\"\$hist_dir/msg-\$padded.txt\"
+                speed_file=\"\$hist_dir/msg-\$padded.speed\"
+                vol_file=\"\$hist_dir/msg-\$padded.volume\"
+            fi
+        fi
 
-    local speed; speed=$(cat "$speed_file" 2>/dev/null || echo "300")
-    local volume; volume=$(cat "$vol_file" 2>/dev/null || echo "1.0")
-    local text; text=$(cat "$text_file")
+        if [ ! -f \"\$text_file\" ]; then
+            echo 'Nothing to repeat — no previous TTS response saved.'
+            exit 1
+        fi
 
-    pkill -f "say.*claude-tts" 2>/dev/null
-    pkill -f "afplay.*claude-tts" 2>/dev/null
+        speed=\$(cat \"\$speed_file\" 2>/dev/null || echo '300')
+        volume=\$(cat \"\$vol_file\" 2>/dev/null || echo '1.0')
+        tmpfile=\"/tmp/claude-tts-repeat-\$\$.aiff\"
 
-    echo "Repeating last response (speed=${speed}, volume=${volume})..."
-
-    local tmpfile="/tmp/claude-tts-repeat-$$.aiff"
-    echo "$text" | say -r "$speed" -o "$tmpfile" 2>/dev/null
-    if [ -f "$tmpfile" ]; then
-        afplay --volume "$volume" "$tmpfile" 2>/dev/null
-        rm -f "$tmpfile"
-    fi
-    echo "Done."
+        echo \"Repeating saved response (speed=\$speed, volume=\$volume)...\"
+        pkill say 2>/dev/null || true
+        pkill afplay 2>/dev/null || true
+        say -r \"\$speed\" -o \"\$tmpfile\" < \"\$text_file\" 2>/dev/null
+        if [ -f \"\$tmpfile\" ]; then
+            afplay --volume \"\$volume\" \"\$tmpfile\" 2>/dev/null
+            rm -f \"\$tmpfile\"
+        fi
+        echo 'Done.'
+    "
 }
 
 case "${1:-status}" in
@@ -381,6 +556,30 @@ case "${1:-status}" in
     repeat)
         do_repeat
         ;;
+    skip)
+        remote_skip || exit 1
+        echo "Skip requested on the MBP."
+        ;;
+    stop)
+        remote_stop_all || exit 1
+        echo "Stop-all requested on the MBP."
+        ;;
+    pause)
+        remote_pause || exit 1
+        echo "Pause requested on the MBP."
+        ;;
+    resume)
+        remote_resume || exit 1
+        echo "Resume requested on the MBP."
+        ;;
+    forward)
+        remote_seek "forward" || exit 1
+        echo "Forward requested on the MBP."
+        ;;
+    rewind)
+        remote_seek "rewind" || exit 1
+        echo "Rewind requested on the MBP."
+        ;;
     rebuild)
         rebuild_remote_skip_listener || exit 1
         echo "skip-listener rebuilt on $MBP_HOST"
@@ -421,6 +620,6 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on|off|rebuild|mute|unmute|listen|test|dictation|quiet|repeat|status|voice|mic|cue|subtitle|summary]"
+        echo "Usage: /vm [on|off|rebuild|mute|unmute|listen|test|dictation|quiet|repeat|skip|stop|pause|resume|forward|rewind|status|voice|mic|cue|subtitle|summary]"
         ;;
 esac

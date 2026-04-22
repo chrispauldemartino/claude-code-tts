@@ -26,11 +26,15 @@ cat > "$PLIST" <<PLIST
     <string>com.elle.skip-listener</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/open</string>
-        <string>-gj</string>
-        <string>$APP</string>
+        <string>$EXE</string>
+    </array>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>com.elleai.skip-listener</string>
     </array>
     <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
     <string>/tmp/elle-skip-listener.log</string>

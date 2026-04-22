@@ -500,20 +500,20 @@ speak_sentences() {
     while [ "$idx" -le "$total" ]; do
         [ -f "$SKIP_FLAG" ] && break
 
-        # Check forward flag (+3 sentences)
+        # Check forward flag (+1 sentence)
         if [ -f "$FORWARD_FLAG" ]; then
             rm -f "$FORWARD_FLAG"
             pkill say 2>/dev/null; pkill afplay 2>/dev/null
-            idx=$((idx + 3))
+            idx=$((idx + 1))
             [ "$idx" -gt "$total" ] && idx=$total
             continue
         fi
 
-        # Check rewind flag (-3 sentences)
+        # Check rewind flag (-1 sentence)
         if [ -f "$REWIND_FLAG" ]; then
             rm -f "$REWIND_FLAG"
             pkill say 2>/dev/null; pkill afplay 2>/dev/null
-            idx=$((idx - 3))
+            idx=$((idx - 1))
             [ "$idx" -lt 1 ] && idx=1
             continue
         fi

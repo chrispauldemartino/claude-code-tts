@@ -325,6 +325,11 @@ def process_input(text):
 
 def speech_polish(text):
     """Final pass: fix pronunciation issues for macOS say."""
+    # Remove decorative bullets / box-drawing that macOS say can spell out or stall on.
+    text = re.sub(r'[\u2500-\u257F]+', ' ', text)
+    text = re.sub(r'[★☆•◦▪▫■□◆◇▶►▸▹]+', ' ', text)
+    text = re.sub(r'[_=~\-]{4,}', ' ', text)
+
     # Strip file extensions — say the name, not the type
     # Matches .sh, .json, .md, .ts, .tsx, .js, .jsx, .py, .yaml, .yml, .toml, .css, .html, .sql, .swift, .env, .txt, .cfg, .ini, .lock, .log, .csv, .xml, .plist
     text = re.sub(r'(\w)\.(?:sh|json|md|ts|tsx|js|jsx|py|yaml|yml|toml|css|html|sql|swift|env|txt|cfg|ini|lock|log|csv|xml|plist|aiff|wav|mp3|png|jpg|jpeg|gif|svg|pdf)\b', r'\1', text)

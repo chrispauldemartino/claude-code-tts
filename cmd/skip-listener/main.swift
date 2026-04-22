@@ -6,12 +6,12 @@ import ApplicationServices
 // - Double-Command tap (cmd+cmd): SKIP — kills audio + mic
 // - Double-Option tap (opt+opt): PAUSE/RESUME — SIGSTOP/SIGCONT
 // - Command+Shift (single tap): REPEAT — replay last TTS response
-// - Option+Arrow (keyDown): FORWARD/REWIND — skip ±3 sentences
+// - Option+Arrow (keyDown): FORWARD/REWIND — skip ±1 sentence
 // - Option+Shift+Arrow (keyDown): MESSAGE NAV — play prev/next history message
 // - Enter (keyDown): STOP — kills entire voice session
 //
 // Usage: skip-listener [--debug]
-// Runs as persistent daemon. Exits when /tmp/claude-voice-config is removed.
+// Runs as persistent daemon. Idles when /tmp/claude-voice-config is removed.
 // Requires: Accessibility + Input Monitoring permission
 //           (System Settings > Privacy & Security > Accessibility AND Input Monitoring)
 
@@ -29,8 +29,13 @@ let doubleTapWindow: TimeInterval = 0.4
 let enterKeyCode: Int64 = 36
 let leftArrowKeyCode: Int64 = 123
 let rightArrowKeyCode: Int64 = 124
+let downArrowKeyCode: Int64 = 125
+let upArrowKeyCode: Int64 = 126
 let sendingFlag = "/tmp/claude-voice-input-sending"
 let voiceInputStopFlag = "/tmp/claude-voice-input-stop"
+let minSpeechSpeed = 150
+let maxSpeechSpeed = 450
+let speechSpeedStep = 25
 
 // Repeat state files
 let lastTextFile = "/tmp/claude-tts-last-text"
@@ -38,6 +43,7 @@ let lastSpeedFile = "/tmp/claude-tts-last-speed"
 let lastVolumeFile = "/tmp/claude-tts-last-volume"
 let lastSourceFile = "/tmp/claude-tts-last-source"
 let lastSessionFile = "/tmp/claude-tts-last-session"
+let playbackCursorFile = "/tmp/claude-tts-playback-cursor"
 
 // Forward/rewind flags
 let forwardFlag = "/tmp/claude-tts-forward"
@@ -107,6 +113,7 @@ class ControlState {
     // Option double-tap (pause)
     var lastOptionUp: Date?
     var optionIsDown = false
+    var lastOptionComboUse: Date?
     var isPaused = false
     // Shift double-tap (stop all)
     var lastShiftUp: Date?
@@ -160,6 +167,10 @@ func isReadingFile() -> Bool {
 
 func isMicActive() -> Bool {
     return FileManager.default.fileExists(atPath: micListeningFlag)
+}
+
+func hasVoiceConfig() -> Bool {
+    return FileManager.default.fileExists(atPath: configFile)
 }
 
 let chimeVolume = "0.3"  // 0.0–1.0, keeps chime subtle
@@ -247,13 +258,7 @@ func clearStatusLine() {
 let ttyPathFile = "/tmp/claude-tts-tty"
 
 func readSubtitleEnabled() -> Bool {
-    guard let content = try? String(contentsOfFile: configFile, encoding: .utf8) else { return false }
-    for line in content.components(separatedBy: "\n") {
-        if line.hasPrefix("subtitle=") {
-            return line.replacingOccurrences(of: "subtitle=", with: "") == "on"
-        }
-    }
-    return false
+    readConfigValue("subtitle") == "on"
 }
 
 func showTTYSubtitle(_ text: String) {
@@ -321,6 +326,82 @@ func clearActiveSegment() {
     try? FileManager.default.removeItem(atPath: activeSegmentFile)
 }
 
+func readConfigValue(_ key: String) -> String {
+    guard let content = try? String(contentsOfFile: configFile, encoding: .utf8) else { return "" }
+    for line in content.components(separatedBy: "\n") {
+        if line.hasPrefix("\(key)=") {
+            return String(line.dropFirst(key.count + 1))
+        }
+    }
+    return ""
+}
+
+func writeConfigValue(_ key: String, value: String) {
+    let content = (try? String(contentsOfFile: configFile, encoding: .utf8)) ?? ""
+    var lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
+    var updated = false
+
+    for idx in lines.indices {
+        if lines[idx].hasPrefix("\(key)=") {
+            lines[idx] = "\(key)=\(value)"
+            updated = true
+            break
+        }
+    }
+
+    if !updated {
+        lines.append("\(key)=\(value)")
+    }
+
+    let serialized = lines.joined(separator: "\n") + "\n"
+    try? serialized.write(toFile: configFile, atomically: true, encoding: .utf8)
+}
+
+func currentSpeechSpeed(fallback: String = "300") -> String {
+    let value = readConfigValue("speed")
+    return value.isEmpty ? fallback : value
+}
+
+typealias PlaybackContext = (
+    text: String,
+    speed: String,
+    volume: String,
+    sourceLabel: String?,
+    sessionID: String?
+)
+
+func splitSentences(_ text: String) -> [String] {
+    text.components(separatedBy: CharacterSet(charactersIn: ".!?"))
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+}
+
+func writePlaybackCursor(_ index: Int) {
+    try? "\(index)".write(toFile: playbackCursorFile, atomically: true, encoding: .utf8)
+}
+
+func readPlaybackCursor() -> Int {
+    if let raw = try? String(contentsOfFile: playbackCursorFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+       let cursor = Int(raw), cursor >= 0 {
+        return cursor
+    }
+    return 0
+}
+
+func markOptionComboUse() {
+    state.lastOptionComboUse = Date()
+    state.lastOptionUp = nil
+}
+
+func playbackPreview(_ context: PlaybackContext) -> String {
+    let previewBase = String(context.text.prefix(60))
+    if let source = context.sourceLabel {
+        return "[\(source)] \(previewBase)"
+    }
+    return previewBase
+}
+
 func killTTSProcesses() {
     for name in ["say", "afplay"] {
         let proc = Process()
@@ -329,6 +410,70 @@ func killTTSProcesses() {
         try? proc.run()
         proc.waitUntilExit()
     }
+}
+
+func runProcessWithTimeout(_ process: Process, timeout: TimeInterval) -> Bool {
+    let semaphore = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in
+        semaphore.signal()
+    }
+
+    do {
+        try process.run()
+    } catch {
+        debugPrint("PROCESS — failed to launch: \(error)")
+        return false
+    }
+
+    if semaphore.wait(timeout: .now() + timeout) == .success {
+        return process.terminationStatus == 0
+    }
+
+    debugPrint("PROCESS — timed out after \(timeout)s: \(process.executableURL?.path ?? "unknown")")
+    process.terminate()
+    usleep(200_000)
+    if process.isRunning {
+        kill(process.processIdentifier, SIGKILL)
+    }
+    _ = semaphore.wait(timeout: .now() + 1)
+    return false
+}
+
+func waitWhilePaused() -> Bool {
+    while FileManager.default.fileExists(atPath: pauseFlag) {
+        state.isPaused = true
+        if FileManager.default.fileExists(atPath: skipFlag) {
+            return false
+        }
+        usleep(150_000)
+    }
+    state.isPaused = false
+    return true
+}
+
+func synthesizeSpeechAudio(_ spokenText: String, speed: String, outputFile: String) -> Bool {
+    let textFile = "/tmp/claude-tts-say-\(ProcessInfo.processInfo.processIdentifier).txt"
+    try? spokenText.write(toFile: textFile, atomically: true, encoding: .utf8)
+
+    let sayProc = Process()
+    sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+    sayProc.arguments = ["-r", currentSpeechSpeed(fallback: speed), "-f", textFile, "-o", outputFile]
+    let success = runProcessWithTimeout(sayProc, timeout: 15)
+    try? FileManager.default.removeItem(atPath: textFile)
+
+    if !success {
+        try? FileManager.default.removeItem(atPath: outputFile)
+        return false
+    }
+
+    return FileManager.default.fileExists(atPath: outputFile)
+}
+
+func playAudioFile(_ path: String, volume: String) -> Bool {
+    let playProc = Process()
+    playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+    playProc.arguments = ["--volume", volume, path]
+    return runProcessWithTimeout(playProc, timeout: 20)
 }
 
 // Audio mutex — same lock as auto-speak.sh so repeat/nav don't overlap with hook TTS
@@ -406,6 +551,7 @@ func togglePause() {
 
 func triggerSkip() {
     debugPrint("SKIP — killing audio, creating skip flag")
+    let preservePause = FileManager.default.fileExists(atPath: pauseFlag) || state.isPaused
 
     // If paused, resume first so processes can be killed cleanly
     if state.isPaused {
@@ -416,11 +562,16 @@ func triggerSkip() {
             try? proc.run()
             proc.waitUntilExit()
         }
-        state.isPaused = false
     }
 
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
-    try? FileManager.default.removeItem(atPath: pauseFlag)
+    if !preservePause {
+        try? FileManager.default.removeItem(atPath: pauseFlag)
+        state.isPaused = false
+    } else {
+        FileManager.default.createFile(atPath: pauseFlag, contents: nil)
+        state.isPaused = true
+    }
 
     killTTSProcesses()
     playChime()
@@ -505,6 +656,42 @@ func readHistoryMessages(from startIndex: Int) -> [(text: String, speed: String,
     return messages
 }
 
+func readHistoryMessage(at index: Int) -> PlaybackContext? {
+    guard index > 0 else { return nil }
+    guard let histDir = try? String(contentsOfFile: historyDirFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          !histDir.isEmpty else {
+        return nil
+    }
+
+    let padded = String(format: "%03d", index)
+    guard let text = try? String(contentsOfFile: "\(histDir)/msg-\(padded).txt", encoding: .utf8),
+          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+
+    let speed = (try? String(contentsOfFile: "\(histDir)/msg-\(padded).speed", encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "300"
+    let volume = (try? String(contentsOfFile: "\(histDir)/msg-\(padded).volume", encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
+    let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(histDir)/msg-\(padded).source", encoding: .utf8))
+
+    return (text: text, speed: speed, volume: volume, sourceLabel: sourceLabel, sessionID: nil)
+}
+
+func historyMessageTotal() -> Int {
+    guard let histDir = try? String(contentsOfFile: historyDirFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          !histDir.isEmpty,
+          let totalStr = try? String(contentsOfFile: "\(histDir)/total", encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          let total = Int(totalStr), total > 0 else {
+        return 0
+    }
+
+    return total
+}
+
 // Get the repeat anchor index — where repeat should start from
 func getRepeatAnchor() -> Int {
     if let anchorStr = try? String(contentsOfFile: repeatAnchorFile, encoding: .utf8)
@@ -529,97 +716,136 @@ func resetRepeatAnchor() {
     debugPrint("RESET ANCHOR — set to last message \(total)")
 }
 
-func triggerRepeat() {
-    debugPrint("REPEAT — replaying from anchor")
-
-    // Signal stop and kill audio from main thread
-    FileManager.default.createFile(atPath: skipFlag, contents: nil)
-    killTTSProcesses()
-
-    // Move lock acquisition to background thread so main thread stays free for CGEvent
-    DispatchQueue.global(qos: .userInitiated).async {
-    usleep(300_000)
-
-    // Chime AFTER kill so it doesn't get killed
-    playChime()
-
-    // Acquire mutex — waits for other sessions to finish speaking
-    acquireTTSLock()
-    try? FileManager.default.removeItem(atPath: skipFlag)
-
+func loadReplayContext() -> PlaybackContext? {
     let anchor = getRepeatAnchor()
-    let messages = readHistoryMessages(from: anchor)
+    if let historyMessage = readHistoryMessage(at: anchor) {
+        return historyMessage
+    }
 
-    guard !messages.isEmpty else {
-        // Fallback to lastTextFile for backwards compatibility (e.g., drill-down)
-        if let text = try? String(contentsOfFile: lastTextFile, encoding: .utf8),
-           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            debugPrint("REPEAT — no history, falling back to lastTextFile")
-            let speed = (try? String(contentsOfFile: lastSpeedFile, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "300"
-            let volume = (try? String(contentsOfFile: lastVolumeFile, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
+    guard let text = try? String(contentsOfFile: lastTextFile, encoding: .utf8),
+          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
 
-            FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
-            writeActiveSegment(preview: String(text.prefix(60)), status: "repeat")
+    let speed = (try? String(contentsOfFile: lastSpeedFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "300"
+    let volume = (try? String(contentsOfFile: lastVolumeFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
+    let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: lastSourceFile, encoding: .utf8))
+    let sessionID = normalizeSessionID(try? String(contentsOfFile: lastSessionFile, encoding: .utf8))
 
-            speakText(text, speed: speed, volume: volume)
+    return (text: text, speed: speed, volume: volume, sourceLabel: sourceLabel, sessionID: sessionID)
+}
 
-            clearTTYSubtitle()
-            try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
-            try? FileManager.default.removeItem(atPath: skipFlag)
-            clearActiveSegment()
-            releaseTTSLock()
-            return
-        }
-
-        debugPrint("REPEAT — no saved text at all, ignoring")
-        releaseTTSLock()
+func playContext(_ context: PlaybackContext, startIndex: Int, status: String) {
+    let sentences = splitSentences(context.text)
+    guard !sentences.isEmpty else {
+        debugPrint("PLAYBACK — no sentences available for \(status)")
+        playChime()
         return
     }
 
-    debugPrint("REPEAT — playing \(messages.count) messages from anchor \(anchor)")
+    let clampedStart = min(max(startIndex, 0), max(sentences.count - 1, 0))
 
-    FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
-    let firstPreview = String(messages[0].text.prefix(60))
-    writeActiveSegment(preview: firstPreview, status: "repeat")
+    FileManager.default.createFile(atPath: skipFlag, contents: nil)
+    killTTSProcesses()
 
-    // Play each message in sequence
-    for (msgIdx, msg) in messages.enumerated() {
-        if FileManager.default.fileExists(atPath: skipFlag) { break }
+    DispatchQueue.global(qos: .userInitiated).async {
+        usleep(300_000)
+        playChime()
 
-        if msgIdx > 0 {
-            writeActiveSegment(segment: msgIdx + 1, total: messages.count,
-                             preview: String(msg.text.prefix(60)), status: "repeat")
+        acquireTTSLock()
+        try? FileManager.default.removeItem(atPath: skipFlag)
+
+        try? context.text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
+        try? context.speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+        try? context.volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
+        if let source = context.sourceLabel {
+            try? source.write(toFile: lastSourceFile, atomically: true, encoding: .utf8)
+        } else {
+            try? FileManager.default.removeItem(atPath: lastSourceFile)
+        }
+        if let session = context.sessionID {
+            try? session.write(toFile: lastSessionFile, atomically: true, encoding: .utf8)
+        } else {
+            try? FileManager.default.removeItem(atPath: lastSessionFile)
         }
 
-        // Update lastTextFile so nav index stays in sync
-        try? msg.text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
-        try? msg.speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
-        try? msg.volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
+        writePlaybackCursor(clampedStart)
+        FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
+        writeActiveSegment(preview: playbackPreview(context), status: status)
 
-        speakText(msg.text, speed: msg.speed, volume: msg.volume)
+        speakText(
+            context.text,
+            speed: context.speed,
+            volume: context.volume,
+            sourceLabel: context.sourceLabel,
+            sessionID: context.sessionID,
+            startIndex: clampedStart
+        )
+
+        clearTTYSubtitle()
+        try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
+        try? FileManager.default.removeItem(atPath: skipFlag)
+        clearActiveSegment()
+        releaseTTSLock()
+    }
+}
+
+func triggerSentenceSeek(delta: Int) {
+    guard let context = loadReplayContext() else {
+        debugPrint("SEEK — no replay context")
+        playChime()
+        return
     }
 
-    // After playback, anchor stays at the last message played
-    // (getRepeatAnchor returns current anchor, which is correct — if user
-    // hits repeat again, it replays from the same point)
+    let sentences = splitSentences(context.text)
+    guard !sentences.isEmpty else {
+        debugPrint("SEEK — replay context has no sentences")
+        playChime()
+        return
+    }
 
-    // Cleanup
-    clearTTYSubtitle()
-    try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
-    try? FileManager.default.removeItem(atPath: pauseFlag)
-    try? FileManager.default.removeItem(atPath: skipFlag)
-    clearActiveSegment()
-    releaseTTSLock()
-    } // end DispatchQueue.global for repeat
+    let currentCursor = min(max(readPlaybackCursor(), 0), sentences.count)
+    let target: Int
+
+    if delta > 0 {
+        guard currentCursor < sentences.count else {
+            debugPrint("SEEK — already at end of message")
+            playChime()
+            return
+        }
+        target = min(currentCursor + delta, max(sentences.count - 1, 0))
+    } else {
+        let rewindBase = currentCursor >= sentences.count ? max(sentences.count - 1, 0) : currentCursor
+        target = max(rewindBase + delta, 0)
+        if target == rewindBase && rewindBase == 0 {
+            debugPrint("SEEK — already at start of message")
+            playChime()
+            return
+        }
+    }
+
+    debugPrint("SEEK — replaying from sentence \(target + 1)/\(sentences.count)")
+    playContext(context, startIndex: target, status: "seek")
+}
+
+func triggerRepeat() {
+    debugPrint("REPEAT — replaying current message from start")
+
+    guard let context = loadReplayContext() else {
+        debugPrint("REPEAT — no saved text at all, ignoring")
+        playChime()
+        return
+    }
+
+    playContext(context, startIndex: 0, status: "repeat")
 }
 
 // Shared text-to-speech function — speaks sentence by sentence with skip/forward/rewind support
-func speakText(_ text: String, speed: String, volume: String, sourceLabel: String? = nil, sessionID: String? = nil) {
-    let sentences = text.components(separatedBy: CharacterSet(charactersIn: ".!?"))
-        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        .filter { !$0.isEmpty }
+func speakText(_ text: String, speed: String, volume: String, sourceLabel: String? = nil, sessionID: String? = nil, startIndex: Int = 0) {
+    let sentences = splitSentences(text)
+    guard !sentences.isEmpty else { return }
 
     let normalizedSource = normalizeSourceLabel(sourceLabel)
     let normalizedSession = normalizeSessionID(sessionID)
@@ -629,21 +855,22 @@ func speakText(_ text: String, speed: String, volume: String, sourceLabel: Strin
         normalizedSource != nil &&
         (normalizedSource != lastSpokenSource || normalizedSession != nil && normalizedSession != lastSpokenSession)
 
-    var idx = 0
+    var idx = min(max(startIndex, 0), max(sentences.count - 1, 0))
     while idx < sentences.count {
         if FileManager.default.fileExists(atPath: skipFlag) { break }
+        if !waitWhilePaused() { break }
 
         // Check forward/rewind
         if FileManager.default.fileExists(atPath: forwardFlag) {
             try? FileManager.default.removeItem(atPath: forwardFlag)
             killTTSProcesses()
-            idx = min(idx + 3, sentences.count - 1)
+            idx = min(idx + 1, sentences.count - 1)
             continue
         }
         if FileManager.default.fileExists(atPath: rewindFlag) {
             try? FileManager.default.removeItem(atPath: rewindFlag)
             killTTSProcesses()
-            idx = max(idx - 3, 0)
+            idx = max(idx - 1, 0)
             continue
         }
 
@@ -666,31 +893,39 @@ func speakText(_ text: String, speed: String, volume: String, sourceLabel: Strin
         let tmpFile = "/tmp/claude-tts-repeat-\(ProcessInfo.processInfo.processIdentifier).aiff"
 
         showTTYSubtitle(subtitleText)
+        writePlaybackCursor(idx)
 
         // Generate audio
-        let sayProc = Process()
-        sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        sayProc.arguments = ["-r", speed, "-o", tmpFile]
-        sayProc.standardInput = Pipe()
-        let pipe = sayProc.standardInput as! Pipe
-        pipe.fileHandleForWriting.write(spokenText.data(using: .utf8)!)
-        pipe.fileHandleForWriting.closeFile()
-        try? sayProc.run()
-        sayProc.waitUntilExit()
+        let synthesized = synthesizeSpeechAudio(spokenText, speed: speed, outputFile: tmpFile)
+        if !synthesized {
+            debugPrint("TTS — say synthesis failed for sentence \(idx + 1)")
+            try? FileManager.default.removeItem(atPath: tmpFile)
+            idx += 1
+            continue
+        }
 
         if FileManager.default.fileExists(atPath: skipFlag) {
             try? FileManager.default.removeItem(atPath: tmpFile)
             break
         }
+        if !waitWhilePaused() {
+            try? FileManager.default.removeItem(atPath: tmpFile)
+            break
+        }
 
         // Play audio
-        let playProc = Process()
-        playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-        playProc.arguments = ["--volume", volume, tmpFile]
-        try? playProc.run()
-        playProc.waitUntilExit()
+        let played = playAudioFile(tmpFile, volume: volume)
 
         try? FileManager.default.removeItem(atPath: tmpFile)
+        if !played {
+            debugPrint("TTS — afplay failed for sentence \(idx + 1)")
+            idx += 1
+            continue
+        }
+        if FileManager.default.fileExists(atPath: skipFlag) { break }
+        if FileManager.default.fileExists(atPath: forwardFlag) || FileManager.default.fileExists(atPath: rewindFlag) {
+            continue
+        }
         if idx == 0, let source = normalizedSource {
             try? source.write(toFile: lastSourceFile, atomically: true, encoding: .utf8)
         }
@@ -701,8 +936,25 @@ func speakText(_ text: String, speed: String, volume: String, sourceLabel: Strin
                 try? FileManager.default.removeItem(atPath: lastSessionFile)
             }
         }
+        writePlaybackCursor(idx + 1)
         idx += 1
     }
+}
+
+func adjustSpeechSpeed(delta: Int) {
+    let current = Int(currentSpeechSpeed()) ?? 300
+    let updated = min(max(current + delta, minSpeechSpeed), maxSpeechSpeed)
+    if updated == current {
+        playChime()
+        debugPrint("SPEED — already at limit \(current)")
+        return
+    }
+
+    writeConfigValue("speed", value: "\(updated)")
+    try? "\(updated)".write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+    debugPrint("SPEED — updated from \(current) to \(updated)")
+    showTTYSubtitle("speed \(updated)")
+    playChime()
 }
 
 // MARK: - Drill-Down (opt+shift double-tap or voice keyword)
@@ -763,14 +1015,8 @@ func triggerDrillDown(target: String? = nil) {
     try? FileManager.default.removeItem(atPath: skipFlag)
 
     // Read speed/volume from voice config
-    let speed = (try? String(contentsOfFile: configFile, encoding: .utf8)
-        .components(separatedBy: "\n")
-        .first(where: { $0.hasPrefix("speed=") })?
-        .replacingOccurrences(of: "speed=", with: "")) ?? "300"
-    let volLine = (try? String(contentsOfFile: configFile, encoding: .utf8)
-        .components(separatedBy: "\n")
-        .first(where: { $0.hasPrefix("volume=") })?
-        .replacingOccurrences(of: "volume=", with: "")) ?? "normal"
+    let speed = currentSpeechSpeed()
+    let volLine = readConfigValue("volume").isEmpty ? "normal" : readConfigValue("volume")
     let volume = volLine == "quiet" ? "0.3" : "1.0"
 
     // Determine entries to play
@@ -861,7 +1107,6 @@ func triggerDrillDown(target: String? = nil) {
 
         // Cleanup
         try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
-        try? FileManager.default.removeItem(atPath: pauseFlag)
         try? FileManager.default.removeItem(atPath: skipFlag)
         clearActiveSegment()
         releaseTTSLock()
@@ -870,7 +1115,45 @@ func triggerDrillDown(target: String? = nil) {
 
 // MARK: - Message Navigation (opt+shift+arrow)
 
-// Extract all assistant text blocks from the transcript JSONL — native Swift, no python3.
+func extractAssistantTextBlocks(from message: [String: Any]) -> [String] {
+    if let role = message["role"] as? String, role != "assistant" {
+        return []
+    }
+
+    guard let content = message["content"] as? [[String: Any]] else {
+        return []
+    }
+
+    var blocks: [String] = []
+    for block in content {
+        let blockType = (block["type"] as? String) ?? ""
+        guard blockType == "text" || blockType == "output_text" || blockType == "input_text",
+              let text = block["text"] as? String,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            continue
+        }
+        blocks.append(text)
+    }
+
+    return blocks
+}
+
+func appendTranscriptMessages(from obj: [String: Any], to messages: inout [String]) {
+    if obj["type"] as? String == "assistant",
+       let message = obj["message"] as? [String: Any] {
+        messages.append(contentsOf: extractAssistantTextBlocks(from: message))
+    }
+
+    if obj["type"] as? String == "response_item",
+       let payload = obj["payload"] as? [String: Any],
+       payload["type"] as? String == "message",
+       payload["role"] as? String == "assistant" {
+        messages.append(contentsOf: extractAssistantTextBlocks(from: payload))
+    }
+}
+
+// Extract assistant text blocks from transcript JSONL — supports both legacy and
+// payload-wrapped transcript formats.
 func extractMessagesFromTranscript() -> [String] {
     guard let tPath = try? String(contentsOfFile: transcriptPathFile, encoding: .utf8)
         .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -890,17 +1173,8 @@ func extractMessagesFromTranscript() -> [String] {
                 let end = (i == len - 1 && base[i] != 0x0A) ? i + 1 : i
                 if end > start {
                     let lineData = Data(bytes: base + start, count: end - start)
-                    if let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                       obj["type"] as? String == "assistant",
-                       let message = obj["message"] as? [String: Any],
-                       let content = message["content"] as? [[String: Any]] {
-                        for block in content {
-                            if block["type"] as? String == "text",
-                               let text = block["text"] as? String,
-                               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                messages.append(text)
-                            }
-                        }
+                    if let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
+                        appendTranscriptMessages(from: obj, to: &messages)
                     }
                 }
                 start = i + 1
@@ -950,13 +1224,47 @@ func triggerMessageNav(direction: String) {
         try? killSay.run()
         killSay.waitUntilExit()
         try? FileManager.default.removeItem(atPath: skipFlag)
-        debugPrint("MESSAGE NAV — extracting messages...")
+        let totalHistory = historyMessageTotal()
+        if totalHistory > 0 {
+            debugPrint("MESSAGE NAV — using session history (\(totalHistory) messages)")
+
+            let defaultIndex = min(max(getRepeatAnchor() - 1, 0), totalHistory - 1)
+            let currentStr = (try? String(contentsOfFile: navIndexFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "\(defaultIndex)"
+            var current = Int(currentStr) ?? defaultIndex
+            current = min(max(current, 0), totalHistory - 1)
+
+            if direction == "next" {
+                guard current < totalHistory - 1 else { playChime(); return }
+                current += 1
+            } else {
+                guard current > 0 else { playChime(); return }
+                current -= 1
+            }
+
+            let historyIndex = current + 1
+            guard let context = readHistoryMessage(at: historyIndex) else {
+                debugPrint("MESSAGE NAV — missing history message \(historyIndex)")
+                playChime()
+                return
+            }
+
+            try? "\(current)".write(toFile: navIndexFile, atomically: true, encoding: .utf8)
+            try? "\(historyIndex)".write(toFile: repeatAnchorFile, atomically: true, encoding: .utf8)
+            debugPrint("MESSAGE NAV — updated repeat anchor to \(historyIndex)")
+            debugPrint("MESSAGE NAV — playing history \(historyIndex)/\(totalHistory)")
+
+            playContext(context, startIndex: 0, status: "nav")
+            return
+        }
+
+        debugPrint("MESSAGE NAV — no session history, falling back to transcript")
         let messages = extractMessagesFromTranscript()
         let total = messages.count
-        debugPrint("MESSAGE NAV — found \(total) messages")
+        debugPrint("MESSAGE NAV — found \(total) transcript messages")
 
         guard total > 0 else {
-            debugPrint("MESSAGE NAV — no messages, playing boundary chime")
+            debugPrint("MESSAGE NAV — no transcript messages, playing boundary chime")
             playChime()
             return
         }
@@ -964,7 +1272,7 @@ func triggerMessageNav(direction: String) {
         let currentStr = (try? String(contentsOfFile: navIndexFile, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "\(total - 1)"
         var current = Int(currentStr) ?? (total - 1)
-        current = min(current, total - 1)
+        current = min(max(current, 0), total - 1)
 
         if direction == "next" {
             guard current < total - 1 else { playChime(); return }
@@ -974,40 +1282,16 @@ func triggerMessageNav(direction: String) {
             current -= 1
         }
 
-        let speed = (try? String(contentsOfFile: configFile, encoding: .utf8)
-            .components(separatedBy: "\n")
-            .first(where: { $0.hasPrefix("speed=") })?
-            .replacingOccurrences(of: "speed=", with: "")) ?? "300"
-
         try? "\(current)".write(toFile: navIndexFile, atomically: true, encoding: .utf8)
-
-        // Update repeat anchor to current nav position
-        // Map transcript index to history index: history is 1-based, transcript is 0-based
-        // The anchor tracks where repeat starts, so navigating back updates it
-        let histAnchor = current + 1
-        try? "\(histAnchor)".write(toFile: repeatAnchorFile, atomically: true, encoding: .utf8)
-        debugPrint("MESSAGE NAV — updated repeat anchor to \(histAnchor)")
-
-        let text = messages[current]
-        try? text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
-        try? speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
-
-        debugPrint("MESSAGE NAV — playing \(current + 1)/\(total)")
-
-        FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
-
-        // Write text to temp file, speak with say, clean up
-        let navTmpFile = "/tmp/claude-tts-nav-msg.txt"
-        try? text.write(toFile: navTmpFile, atomically: true, encoding: .utf8)
-
-        let sayProc = Process()
-        sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        sayProc.arguments = ["-r", speed, "-f", navTmpFile]
-        try? sayProc.run()
-        sayProc.waitUntilExit()
-
-        try? FileManager.default.removeItem(atPath: navTmpFile)
-        try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
+        let context: PlaybackContext = (
+            text: messages[current],
+            speed: currentSpeechSpeed(),
+            volume: "1.0",
+            sourceLabel: nil,
+            sessionID: nil
+        )
+        debugPrint("MESSAGE NAV — playing transcript \(current + 1)/\(total)")
+        playContext(context, startIndex: 0, status: "nav")
     }
 }
 
@@ -1060,13 +1344,15 @@ func processQueue() {
                 .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
             let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(entryPath)/source", encoding: .utf8))
             let sessionID = normalizeSessionID(try? String(contentsOfFile: "\(entryPath)/session", encoding: .utf8))
+            let effectiveSpeed = currentSpeechSpeed(fallback: speed)
             let previewBase = String(text.prefix(60))
             let previewText = sourceLabel != nil ? "[\(sourceLabel!)] \(previewBase)" : previewBase
             writeActiveSegment(segment: idx + 1, total: queueEntries.count,
                              preview: previewText, status: "speaking")
             debugPrint("QUEUE — speaking entry \(idx + 1)/\(queueEntries.count)")
 
-            speakText(text, speed: speed, volume: volume, sourceLabel: sourceLabel, sessionID: sessionID)
+            try? effectiveSpeed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+            speakText(text, speed: effectiveSpeed, volume: volume, sourceLabel: sourceLabel, sessionID: sessionID)
 
             // Remove processed entry
             try? fm.removeItem(atPath: entryPath)
@@ -1075,7 +1361,6 @@ func processQueue() {
         // Cleanup
         clearTTYSubtitle()
         try? fm.removeItem(atPath: ttsPlayingFlag)
-        try? fm.removeItem(atPath: pauseFlag)
         try? fm.removeItem(atPath: skipFlag)
         clearActiveSegment()
         releaseTTSLock()
@@ -1093,6 +1378,12 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         if let tap = globalTap {
             CGEvent.tapEnable(tap: tap, enable: true)
         }
+        return Unmanaged.passUnretained(event)
+    }
+
+    // Stay resident under launchd, but ignore shortcut handling while voice mode
+    // is off unless playback/mic activity is still cleaning up.
+    if !hasVoiceConfig() && !isVoiceActive() {
         return Unmanaged.passUnretained(event)
     }
 
@@ -1124,15 +1415,28 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         }
 
         // Arrow keys with modifiers
-        let isArrowKey = (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode)
+        let isArrowKey = (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode || keyCode == upArrowKeyCode || keyCode == downArrowKeyCode)
         if isArrowKey {
             let hasOption = flags.contains(.maskAlternate)
             let hasShift = flags.contains(.maskShift)
             let hasCommand = flags.contains(.maskCommand)
             let hasControl = flags.contains(.maskControl)
 
+            if hasOption && !hasShift && !hasCommand && !hasControl && (keyCode == upArrowKeyCode || keyCode == downArrowKeyCode) {
+                markOptionComboUse()
+                if keyCode == upArrowKeyCode {
+                    debugPrint("OPT+UP — increase speed")
+                    DispatchQueue.main.async { adjustSpeechSpeed(delta: speechSpeedStep) }
+                } else {
+                    debugPrint("OPT+DOWN — decrease speed")
+                    DispatchQueue.main.async { adjustSpeechSpeed(delta: -speechSpeedStep) }
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
             // opt+shift+arrow: during file read = 20-line skip, otherwise = message nav
-            if hasOption && hasShift && !hasCommand && !hasControl {
+            if hasOption && hasShift && !hasCommand && !hasControl && (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode) {
+                markOptionComboUse()
                 if isReadingFile() {
                     // File read active — skip 20 lines forward/back
                     if keyCode == rightArrowKeyCode {
@@ -1154,20 +1458,32 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
                 return Unmanaged.passUnretained(event)
             }
 
-            // opt+arrow: forward/rewind (only during TTS playback)
-            if hasOption && !hasShift && !hasCommand && !hasControl && isTTSPlaying() {
+            // opt+arrow: forward/rewind. While speaking, seek within the active playback.
+            // When idle, replay the last message from a new sentence offset.
+            if hasOption && !hasShift && !hasCommand && !hasControl && (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode) {
+                markOptionComboUse()
                 if keyCode == rightArrowKeyCode {
-                    debugPrint("OPT+RIGHT — forward 3 sentences")
-                    FileManager.default.createFile(atPath: forwardFlag, contents: nil)
-                    killTTSProcesses()
-                    usleep(100_000)
-                    playChime()
+                    if isTTSPlaying() {
+                        debugPrint("OPT+RIGHT — forward 1 sentence")
+                        FileManager.default.createFile(atPath: forwardFlag, contents: nil)
+                        killTTSProcesses()
+                        usleep(100_000)
+                        playChime()
+                    } else {
+                        debugPrint("OPT+RIGHT — replay forward 1 sentence from saved message")
+                        DispatchQueue.main.async { triggerSentenceSeek(delta: 1) }
+                    }
                 } else {
-                    debugPrint("OPT+LEFT — rewind 3 sentences")
-                    FileManager.default.createFile(atPath: rewindFlag, contents: nil)
-                    killTTSProcesses()
-                    usleep(100_000)
-                    playChime()
+                    if isTTSPlaying() {
+                        debugPrint("OPT+LEFT — rewind 1 sentence")
+                        FileManager.default.createFile(atPath: rewindFlag, contents: nil)
+                        killTTSProcesses()
+                        usleep(100_000)
+                        playChime()
+                    } else {
+                        debugPrint("OPT+LEFT — replay backward 1 sentence from saved message")
+                        DispatchQueue.main.async { triggerSentenceSeek(delta: -1) }
+                    }
                 }
                 return Unmanaged.passUnretained(event)
             }
@@ -1223,6 +1539,7 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         if state.optShiftTriggered && !hasOption && !hasShift && !hasCommand && !hasControl {
             state.optShiftTriggered = false
             let now = Date()
+            state.lastOptionComboUse = now
 
             if let last = state.lastOptShiftUp, now.timeIntervalSince(last) < doubleTapWindow {
                 state.lastOptShiftUp = nil
@@ -1320,6 +1637,12 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         } else if !hasOption && state.optionIsDown {
             state.optionIsDown = false
             let now = Date()
+
+            if let lastCombo = state.lastOptionComboUse, now.timeIntervalSince(lastCombo) < doubleTapWindow {
+                debugPrint("OPTION DOUBLE TAP — suppressed after option-based combo")
+                state.lastOptionUp = nil
+                return Unmanaged.passUnretained(event)
+            }
 
             if let last = state.lastOptionUp, now.timeIntervalSince(last) < doubleTapWindow {
                 state.lastOptionUp = nil
@@ -1512,11 +1835,14 @@ let timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
             clearStatusLine()
         }
     } else {
-        configMissCount += 1
-        debugPrint("Config file missing (count: \(configMissCount)/3)")
-        if configMissCount >= 3 {
-            debugPrint("Config file gone for 6s — self-terminating")
-            cleanupAndExit()
+        if configMissCount < 3 {
+            configMissCount += 1
+            debugPrint("Config file missing (count: \(configMissCount)/3)")
+        }
+
+        if configMissCount == 3 {
+            debugPrint("Config file gone for 6s — entering idle mode until voice mode returns")
+            clearStatusLine()
         }
     }
 }
