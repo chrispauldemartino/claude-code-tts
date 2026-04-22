@@ -45,6 +45,10 @@ code=silent
 cue=off
 subtitle=off
 mic_device="
+SPEED_MIN=150
+SPEED_MAX=450
+SPEED_STEP=25
+SPEED_DEFAULT=300
 
 ssh_mbp() {
     ssh "${SSH_OPTS[@]}" "$MBP_HOST" "$@"
@@ -274,6 +278,70 @@ update_toggle() {
     # Sync config to MBP
     ssh -o ConnectTimeout=3 -o BatchMode=yes "$MBP_HOST" "cat > /tmp/claude-voice-config" < "$CONFIG" 2>/dev/null &
     disown 2>/dev/null
+}
+
+current_speed() {
+    local speed
+    speed="$(read_config "speed")"
+    if [[ "$speed" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$speed"
+    else
+        printf '%s\n' "$SPEED_DEFAULT"
+    fi
+}
+
+set_speed() {
+    local speed="$1"
+
+    if ! [[ "$speed" =~ ^[0-9]+$ ]]; then
+        echo "Speed must be an integer wpm value." >&2
+        return 1
+    fi
+
+    if [ "$speed" -lt "$SPEED_MIN" ] || [ "$speed" -gt "$SPEED_MAX" ]; then
+        echo "Speed must be between ${SPEED_MIN} and ${SPEED_MAX} wpm." >&2
+        return 1
+    fi
+
+    update_toggle "speed" "$speed"
+}
+
+handle_speed_command() {
+    local action="${1:-status}"
+    local speed
+
+    case "$action" in
+        status)
+            echo "Speed: $(current_speed) wpm"
+            ;;
+        up)
+            speed="$(current_speed)"
+            speed=$((speed + SPEED_STEP))
+            [ "$speed" -gt "$SPEED_MAX" ] && speed="$SPEED_MAX"
+            set_speed "$speed" || return 1
+            echo "Speed: ${speed} wpm"
+            ;;
+        down)
+            speed="$(current_speed)"
+            speed=$((speed - SPEED_STEP))
+            [ "$speed" -lt "$SPEED_MIN" ] && speed="$SPEED_MIN"
+            set_speed "$speed" || return 1
+            echo "Speed: ${speed} wpm"
+            ;;
+        default|reset)
+            set_speed "$SPEED_DEFAULT" || return 1
+            echo "Speed: ${SPEED_DEFAULT} wpm"
+            ;;
+        *)
+            if [[ "$action" =~ ^[0-9]+$ ]]; then
+                set_speed "$action" || return 1
+                echo "Speed: ${action} wpm"
+            else
+                echo "Usage: /vm speed [status|up|down|default|<wpm>]" >&2
+                return 1
+            fi
+            ;;
+    esac
 }
 
 arm_voice_session_claim() {
@@ -921,6 +989,9 @@ case "${1:-status}" in
                 ;;
         esac
         ;;
+    speed)
+        handle_speed_command "$2" || exit 1
+        ;;
     rebuild)
         rebuild_remote_skip_listener || exit 1
         echo "skip-listener rebuilt on $MBP_HOST"
@@ -961,6 +1032,6 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|status|doctor|voice|mic|cue|subtitle|summary]"
+        echo "Usage: /vm [on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|speed|status|doctor|voice|mic|cue|subtitle|summary]"
         ;;
 esac
