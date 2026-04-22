@@ -136,54 +136,96 @@ def narrate_row(idx, headers, row):
     return f"Row {idx}: {', '.join(parts)}."
 
 
+def is_summary_mode():
+    """Check if summary mode is on — reads from /tmp/claude-voice-config."""
+    try:
+        with open("/tmp/claude-voice-config") as f:
+            for line in f:
+                if line.strip().startswith("summary="):
+                    return line.strip().split("=", 1)[1] == "on"
+    except FileNotFoundError:
+        pass
+    return False
+
 def transform_table(headers, rows):
-    """Transform a parsed table into speech-friendly text."""
+    """Transform a parsed table into speech-friendly text.
+    Default: narrate all rows. With summary=on: summarize large tables."""
     num_rows = len(rows)
 
-    if num_rows <= 3:
-        # Small table: narrate all rows
+    if num_rows <= 3 or not is_summary_mode():
+        # Narrate all rows (default behavior)
         lines = []
+        if num_rows > 3:
+            lines.append(f"Table with {num_rows} rows.")
         for i, row in enumerate(rows, 1):
             lines.append(narrate_row(i, headers, row))
         return "\n".join(lines)
     else:
-        # Large table: summary with outlier analysis, cache full narration
+        # Summary mode: provide a real content summary + cache full narration
         col_names = ", ".join(headers)
-        summary_parts = [f"Table with {num_rows} rows. Columns: {col_names}."]
+        summary_parts = [f"Table with {num_rows} rows across {len(headers)} columns: {col_names}."]
 
-        # Narrate first row fully (spec requirement)
-        summary_parts.append(narrate_row(1, headers, rows[0]))
+        # Summarize key patterns in the data
+        # First and last row for range/scope
+        summary_parts.append(f"First entry: {narrate_row(1, headers, rows[0])}")
+        if num_rows > 2:
+            summary_parts.append(f"Last entry: {narrate_row(num_rows, headers, rows[-1])}")
 
+        # Outlier analysis
         outliers = find_outliers(headers, rows)
-        # Skip outliers if they exceed 50% of rows (no meaningful pattern)
         if outliers and len(outliers) <= num_rows // 2:
+            summary_parts.append("Notable entries:")
             for row_label, col_name, value in outliers:
                 summary_parts.append(f"{row_label} has {col_name} {value}.")
 
-        # Cache full narration
+        # Content digest — group by repeated values in key columns (skip if all unique)
+        if len(headers) >= 2:
+            for col_idx in range(min(len(headers), 3)):
+                col_values = [row[col_idx].strip() if col_idx < len(row) else "" for row in rows]
+                unique_vals = set(v for v in col_values if v)
+                # Only show distribution if there are repeated values (not all unique)
+                if 1 < len(unique_vals) <= 5 and len(unique_vals) < len(col_values):
+                    val_counts = {}
+                    for v in col_values:
+                        if v:
+                            val_counts[v] = val_counts.get(v, 0) + 1
+                    # Only include values that appear more than once
+                    repeated = {v: c for v, c in val_counts.items() if c > 1}
+                    if repeated:
+                        distribution = ", ".join(f"{v}: {c}" for v, c in sorted(repeated.items(), key=lambda x: -x[1])[:4])
+                        summary_parts.append(f"By {headers[col_idx]}: {distribution}.")
+                    break
+
+        # Summary conclusion
+        summary_parts.append(f"That covers the {num_rows} row summary.")
+
+        # Cache full narration for "read rows"
         cache_id = next_cache_id("table")
         full_lines = []
         for i, row in enumerate(rows, 1):
             full_lines.append(narrate_row(i, headers, row))
         write_cache(cache_id, "\n".join(full_lines))
 
-        summary_parts.append(f'Say "read rows" for full detail.')
-        return " ".join(summary_parts)
+        summary_parts.append(f'Say "read rows" to hear every row in detail.')
+        return "\n".join(summary_parts)
 
 
 def transform_list(items):
-    """Transform a list into speech-friendly text."""
+    """Transform a list into speech-friendly text.
+    Default: read all items. With summary=on: summarize long lists."""
     num_items = len(items)
 
-    if num_items < 5:
-        # Short list: read all with ordinals
+    if num_items < 5 or not is_summary_mode():
+        # Read all items (default behavior)
         lines = []
+        if num_items >= 5:
+            lines.append(f"List with {num_items} items.")
         for i, item in enumerate(items):
             ordinal = ORDINALS[i] if i < len(ORDINALS) else f"Item {i + 1}"
             lines.append(f"{ordinal}: {item}.")
         return " ".join(lines)
     else:
-        # Long list: summary with count and first three
+        # Summary mode: abbreviate long lists
         cache_id = next_cache_id("list")
 
         # Cache full narration
@@ -281,6 +323,29 @@ def process_input(text):
     return "\n".join(output)
 
 
+def speech_polish(text):
+    """Final pass: fix pronunciation issues for macOS say."""
+    # Strip file extensions — say the name, not the type
+    # Matches .sh, .json, .md, .ts, .tsx, .js, .jsx, .py, .yaml, .yml, .toml, .css, .html, .sql, .swift, .env, .txt, .cfg, .ini, .lock, .log, .csv, .xml, .plist
+    text = re.sub(r'(\w)\.(?:sh|json|md|ts|tsx|js|jsx|py|yaml|yml|toml|css|html|sql|swift|env|txt|cfg|ini|lock|log|csv|xml|plist|aiff|wav|mp3|png|jpg|jpeg|gif|svg|pdf)\b', r'\1', text)
+
+    # Humanize snake_case and file-like tokens so macOS say doesn't spell them out.
+    text = re.sub(r'(?<=[A-Za-z0-9])_(?=[A-Za-z0-9])', ' ', text)
+    text = re.sub(r'(?<=[A-Za-z])/(?=[A-Za-z])', ' slash ', text)
+    text = re.sub(r'\s+', ' ', text)
+
+    # Version numbers: "v2.5" → "version 2 dot 5", "1.8.2" → "1 dot 8 dot 2"
+    # Match v-prefixed versions
+    text = re.sub(r'\bv(\d+)\.(\d+)\.(\d+)\b', r'version \1 dot \2 dot \3', text)
+    text = re.sub(r'\bv(\d+)\.(\d+)\b', r'version \1 dot \2', text)
+    # Match standalone version-like numbers (digit.digit) not part of a sentence boundary
+    # Only when preceded by version-like context or between digits
+    text = re.sub(r'(?<=\s)(\d+)\.(\d+)\.(\d+)(?=[\s,;:\)]|$)', r'\1 dot \2 dot \3', text)
+    text = re.sub(r'(?<=\s)(\d+)\.(\d+)(?=[\s,;:\)]|$)', r'\1 dot \2', text)
+
+    return text.strip()
+
+
 def main():
     text = sys.stdin.read()
     if not text.strip():
@@ -288,6 +353,7 @@ def main():
         return
 
     result = process_input(text)
+    result = speech_polish(result)
     sys.stdout.write(result)
 
 
