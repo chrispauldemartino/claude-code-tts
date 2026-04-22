@@ -17,6 +17,7 @@ This note marks the working voice-mode baseline after the April 22, 2026 trust a
 - `cmd + shift` repeats from the current repeat anchor.
 - `opt + shift + arrow` message nav uses MBP session history first and only falls back to transcript parsing if that history is missing.
 - `/vm stop` and `/vm repeat` mirror the same repeat-anchor semantics as the keyboard controls.
+- `/vm doctor` is the quick preflight for signer, trust, LaunchAgent, listener, and bridge health.
 
 ## Files In Scope
 

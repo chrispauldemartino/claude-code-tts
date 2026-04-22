@@ -339,6 +339,124 @@ show_status() {
     fi
 }
 
+run_doctor() {
+    local overall=0
+    local config_present="no"
+    local voice_setting="off"
+    local mic_setting="off"
+    local speed_setting=""
+    local signer=""
+    local launch_snapshot=""
+    local skip_lines=""
+    local bridge_lines=""
+    local doctor_output=""
+    local doctor_status=0
+    local err_health=""
+
+    if [ -f "$CONFIG" ]; then
+        config_present="yes"
+        voice_setting="$(read_config "voice")"
+        mic_setting="$(read_config "mic")"
+        speed_setting="$(read_config "speed")"
+        [ -z "$voice_setting" ] && voice_setting="off"
+        [ -z "$mic_setting" ] && mic_setting="off"
+    fi
+
+    signer="$(remote_skip_listener_identity)"
+    [ -z "$signer" ] && overall=1
+
+    launch_snapshot="$(ssh_mbp "launchctl print gui/\$(id -u)/com.elle.skip-listener 2>/dev/null | egrep 'state =|pid =|runs =|forks =|path = ' || true")"
+    skip_lines="$(ssh_mbp "ps -axo pid=,comm=,args= | awk 'index(\$0, \"$MBP_SKIP_LISTENER\") && \$2 != \"zsh\" && \$2 != \"sshd\" && \$2 != \"awk\" {print}'")"
+    bridge_lines="$(ssh_mbp "ps -axo pid=,comm=,args= | awk 'index(\$0, \"$MBP_TTS_BRIDGE mac-mini-ts\") && (\$2 == \"login\" || \$2 == \"/bin/bash\" || \$2 == \"bash\") {print}'")"
+    doctor_output="$(ssh_mbp "'$MBP_SKIP_LISTENER' --doctor" 2>&1)"
+    doctor_status=$?
+
+    if [ "$doctor_status" -ne 0 ]; then
+        overall=1
+    fi
+
+    if [ "$voice_setting" = "on" ]; then
+        if ! printf '%s\n' "$launch_snapshot" | grep -q 'state = running'; then
+            overall=1
+        fi
+        [ -z "$skip_lines" ] && overall=1
+        [ -z "$bridge_lines" ] && overall=1
+    fi
+
+    err_health="$(ssh_mbp "grep -aiE 'Accessibility|Input Monitoring|Event tap|denied|fatal|error' /tmp/elle-skip-listener.err 2>/dev/null | tail -n 5 || true")"
+    if [ -n "$err_health" ]; then
+        overall=1
+    fi
+
+    echo "Voice mode doctor"
+    echo "---"
+    echo "  local_config_present=$config_present"
+    echo "  local_voice=$voice_setting"
+    echo "  local_mic=$mic_setting"
+    [ -n "$speed_setting" ] && echo "  local_speed=$speed_setting"
+    echo "  mbp_signer=${signer:-<missing>}"
+
+    echo
+    echo "SkipListener doctor:"
+    if [ -n "$doctor_output" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "  $line"
+        done <<< "$doctor_output"
+    else
+        echo "  <no output>"
+    fi
+
+    echo
+    echo "LaunchAgent:"
+    if [ -n "$launch_snapshot" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "  $line"
+        done <<< "$launch_snapshot"
+    else
+        echo "  <not loaded>"
+    fi
+
+    echo
+    echo "Processes:"
+    if [ -n "$skip_lines" ]; then
+        echo "  skip-listener:"
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "    $line"
+        done <<< "$skip_lines"
+    else
+        echo "  skip-listener: <not running>"
+    fi
+    if [ -n "$bridge_lines" ]; then
+        echo "  tts-bridge:"
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "    $line"
+        done <<< "$bridge_lines"
+    else
+        echo "  tts-bridge: <not running>"
+    fi
+
+    if [ -n "$err_health" ]; then
+        echo
+        echo "skip-listener health warnings:"
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "  $line"
+        done <<< "$err_health"
+    fi
+
+    echo
+    if [ "$overall" -eq 0 ]; then
+        echo "RESULT: PASS"
+        if [ "$config_present" = "no" ]; then
+            echo "  Voice mode is currently off, but the trusted shortcut path looks healthy."
+        fi
+        return 0
+    fi
+
+    echo "RESULT: ATTENTION"
+    echo "  One or more checks failed. If voice mode should be active, fix the failing section above before relying on shortcuts."
+    return 1
+}
+
 remote_skip() {
     ssh_mbp "
         preserve_pause=0
@@ -477,6 +595,9 @@ do_repeat() {
 case "${1:-status}" in
     status)
         show_status
+        ;;
+    doctor)
+        run_doctor
         ;;
     on)
         clear_voice_session_claim
@@ -620,6 +741,6 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on|off|rebuild|mute|unmute|listen|test|dictation|quiet|repeat|skip|stop|pause|resume|forward|rewind|status|voice|mic|cue|subtitle|summary]"
+        echo "Usage: /vm [on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|status|doctor|voice|mic|cue|subtitle|summary]"
         ;;
 esac

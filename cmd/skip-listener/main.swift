@@ -76,6 +76,7 @@ let activeSegmentFile = "/tmp/claude-tts-active-segment"
 // MARK: - Arguments
 
 var debug = false
+let doctorMode = CommandLine.arguments.contains("--doctor")
 
 if CommandLine.arguments.contains("--debug") {
     debug = true
@@ -314,6 +315,43 @@ func permissionTargetPath() -> String {
     }
 
     return exePath
+}
+
+let doctorTapCallback: CGEventTapCallBack = { _, _, event, _ in
+    Unmanaged.passUnretained(event)
+}
+
+func runDoctor() -> Never {
+    let permissionTarget = permissionTargetPath()
+    let trusted = AXIsProcessTrusted()
+    let listenGranted = CGPreflightListenEventAccess()
+    let eventMask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue)
+        | (1 << CGEventType.keyDown.rawValue)
+
+    var tapCreated = false
+    var tapEnabled = false
+    if let tap = CGEvent.tapCreate(
+        tap: .cgSessionEventTap,
+        place: .headInsertEventTap,
+        options: .listenOnly,
+        eventsOfInterest: eventMask,
+        callback: doctorTapCallback,
+        userInfo: nil
+    ) {
+        tapCreated = true
+        tapEnabled = CGEvent.tapIsEnabled(tap: tap)
+        CFMachPortInvalidate(tap)
+    }
+
+    print("permission_target=\(permissionTarget)")
+    print("accessibility_trusted=\(trusted)")
+    print("input_monitoring_granted=\(listenGranted)")
+    print("event_tap_created=\(tapCreated)")
+    print("event_tap_enabled=\(tapEnabled)")
+
+    let ok = trusted && listenGranted && tapCreated && tapEnabled
+    print("status=\(ok ? "ok" : "fail")")
+    exit(ok ? 0 : 1)
 }
 
 func writeActiveSegment(segment: Int = 1, total: Int = 1, preview: String, status: String) {
@@ -1700,6 +1738,10 @@ let listenGranted = CGPreflightListenEventAccess()
 debugPrint("CGPreflightListenEventAccess: \(listenGranted)")
 
 let permissionTarget = permissionTargetPath()
+
+if doctorMode {
+    runDoctor()
+}
 
 if !trusted {
     // Prompt the user to grant Accessibility permission
