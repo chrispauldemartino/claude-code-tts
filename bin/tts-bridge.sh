@@ -57,6 +57,7 @@ while [ ! -f "$STOP_FLAG" ]; do
             echo "$speed" > "$HISTORY_DIR/msg-${padded}.speed"
             echo "$volume" > "$HISTORY_DIR/msg-${padded}.volume"
             echo "$source" > "$HISTORY_DIR/msg-${padded}.source"
+            [ -n "$session" ] && echo "$session" > "$HISTORY_DIR/msg-${padded}.session"
             echo "$next" > "$HISTORY_DIR/total"
             echo "$next" > "$HISTORY_DIR/current"
             echo "$next" > /tmp/claude-tts-repeat-anchor

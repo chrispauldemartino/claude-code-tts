@@ -44,6 +44,8 @@ let lastVolumeFile = "/tmp/claude-tts-last-volume"
 let lastSourceFile = "/tmp/claude-tts-last-source"
 let lastSessionFile = "/tmp/claude-tts-last-session"
 let playbackCursorFile = "/tmp/claude-tts-playback-cursor"
+let focusedSessionFile = "/tmp/claude-tts-focused-session-id"
+let restartQueueFlag = "/tmp/claude-tts-restart-queue"
 
 // Forward/rewind flags
 let forwardFlag = "/tmp/claude-tts-forward"
@@ -427,6 +429,42 @@ func readPlaybackCursor() -> Int {
     return 0
 }
 
+func readFocusedSessionID() -> String? {
+    normalizeSessionID(try? String(contentsOfFile: focusedSessionFile, encoding: .utf8))
+}
+
+func queueEntrySessionID(_ entryPath: String) -> String? {
+    normalizeSessionID(try? String(contentsOfFile: "\(entryPath)/session", encoding: .utf8))
+}
+
+func prioritizeQueueEntries(_ entries: [String], in queueDir: String) -> [String] {
+    guard let focusedSession = readFocusedSessionID() else {
+        return entries
+    }
+
+    var matching: [String] = []
+    var remaining: [String] = []
+
+    for entry in entries {
+        let entryPath = "\(queueDir)/\(entry)"
+        if queueEntrySessionID(entryPath) == focusedSession {
+            matching.append(entry)
+        } else {
+            remaining.append(entry)
+        }
+    }
+
+    if !matching.isEmpty {
+        debugPrint("QUEUE — prioritizing \(matching.count) entries for focused session \(focusedSession)")
+    }
+
+    return matching + remaining
+}
+
+func shouldRestartQueuePlayback() -> Bool {
+    FileManager.default.fileExists(atPath: restartQueueFlag)
+}
+
 func markOptionComboUse() {
     state.lastOptionComboUse = Date()
     state.lastOptionUp = nil
@@ -603,6 +641,7 @@ func triggerSkip() {
     }
 
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
+    try? FileManager.default.removeItem(atPath: restartQueueFlag)
     if !preservePause {
         try? FileManager.default.removeItem(atPath: pauseFlag)
         state.isPaused = false
@@ -622,6 +661,7 @@ func triggerSkip() {
 func triggerStopAll() {
     debugPrint("STOP ALL — killing everything")
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
+    try? FileManager.default.removeItem(atPath: restartQueueFlag)
     try? FileManager.default.removeItem(atPath: pauseFlag)
     state.isPaused = false
 
@@ -713,8 +753,9 @@ func readHistoryMessage(at index: Int) -> PlaybackContext? {
     let volume = (try? String(contentsOfFile: "\(histDir)/msg-\(padded).volume", encoding: .utf8)
         .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
     let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(histDir)/msg-\(padded).source", encoding: .utf8))
+    let sessionID = normalizeSessionID(try? String(contentsOfFile: "\(histDir)/msg-\(padded).session", encoding: .utf8))
 
-    return (text: text, speed: speed, volume: volume, sourceLabel: sourceLabel, sessionID: nil)
+    return (text: text, speed: speed, volume: volume, sourceLabel: sourceLabel, sessionID: sessionID)
 }
 
 func historyMessageTotal() -> Int {
@@ -881,7 +922,15 @@ func triggerRepeat() {
 }
 
 // Shared text-to-speech function — speaks sentence by sentence with skip/forward/rewind support
-func speakText(_ text: String, speed: String, volume: String, sourceLabel: String? = nil, sessionID: String? = nil, startIndex: Int = 0) {
+func speakText(
+    _ text: String,
+    speed: String,
+    volume: String,
+    sourceLabel: String? = nil,
+    sessionID: String? = nil,
+    startIndex: Int = 0,
+    queueRestartAware: Bool = false
+) {
     let sentences = splitSentences(text)
     guard !sentences.isEmpty else { return }
 
@@ -896,6 +945,10 @@ func speakText(_ text: String, speed: String, volume: String, sourceLabel: Strin
     var idx = min(max(startIndex, 0), max(sentences.count - 1, 0))
     while idx < sentences.count {
         if FileManager.default.fileExists(atPath: skipFlag) { break }
+        if queueRestartAware && shouldRestartQueuePlayback() {
+            debugPrint("QUEUE — restart requested during active playback")
+            break
+        }
         if !waitWhilePaused() { break }
 
         // Check forward/rewind
@@ -938,11 +991,18 @@ func speakText(_ text: String, speed: String, volume: String, sourceLabel: Strin
         if !synthesized {
             debugPrint("TTS — say synthesis failed for sentence \(idx + 1)")
             try? FileManager.default.removeItem(atPath: tmpFile)
+            if queueRestartAware && shouldRestartQueuePlayback() {
+                break
+            }
             idx += 1
             continue
         }
 
         if FileManager.default.fileExists(atPath: skipFlag) {
+            try? FileManager.default.removeItem(atPath: tmpFile)
+            break
+        }
+        if queueRestartAware && shouldRestartQueuePlayback() {
             try? FileManager.default.removeItem(atPath: tmpFile)
             break
         }
@@ -957,10 +1017,16 @@ func speakText(_ text: String, speed: String, volume: String, sourceLabel: Strin
         try? FileManager.default.removeItem(atPath: tmpFile)
         if !played {
             debugPrint("TTS — afplay failed for sentence \(idx + 1)")
+            if queueRestartAware && shouldRestartQueuePlayback() {
+                break
+            }
             idx += 1
             continue
         }
         if FileManager.default.fileExists(atPath: skipFlag) { break }
+        if queueRestartAware && shouldRestartQueuePlayback() {
+            break
+        }
         if FileManager.default.fileExists(atPath: forwardFlag) || FileManager.default.fileExists(atPath: rewindFlag) {
             continue
         }
@@ -1345,24 +1411,25 @@ func processQueue() {
         let fm = FileManager.default
         guard fm.fileExists(atPath: queueDir) else { return }
 
-        // List queue entries sorted by name (timestamp-based, so chronological)
-        guard let entries = try? fm.contentsOfDirectory(atPath: queueDir).sorted() else { return }
-        let queueEntries = entries.filter { $0.hasPrefix("entry-") }
-
-        guard !queueEntries.isEmpty else { return }
-        debugPrint("QUEUE — found \(queueEntries.count) entries to speak")
-
         acquireTTSLock()
         fm.createFile(atPath: ttsPlayingFlag, contents: nil)
 
-        for (idx, entry) in queueEntries.enumerated() {
+        while true {
+            guard let entries = try? fm.contentsOfDirectory(atPath: queueDir).sorted() else { break }
+            let queueEntries = prioritizeQueueEntries(
+                entries.filter { $0.hasPrefix("entry-") },
+                in: queueDir
+            )
+
+            guard !queueEntries.isEmpty else { break }
+            let entry = queueEntries[0]
             let entryPath = "\(queueDir)/\(entry)"
 
             // Check skip flag — if set, clear remaining queue
             if fm.fileExists(atPath: skipFlag) {
                 debugPrint("QUEUE — skip flag detected, clearing remaining entries")
-                // Remove this and all remaining entries
-                for remaining in queueEntries[idx...] {
+                // Remove the currently prioritized entry plus anything still queued.
+                for remaining in queueEntries {
                     try? fm.removeItem(atPath: "\(queueDir)/\(remaining)")
                 }
                 try? fm.removeItem(atPath: skipFlag)
@@ -1385,12 +1452,25 @@ func processQueue() {
             let effectiveSpeed = currentSpeechSpeed(fallback: speed)
             let previewBase = String(text.prefix(60))
             let previewText = sourceLabel != nil ? "[\(sourceLabel!)] \(previewBase)" : previewBase
-            writeActiveSegment(segment: idx + 1, total: queueEntries.count,
+            writeActiveSegment(segment: 1, total: queueEntries.count,
                              preview: previewText, status: "speaking")
-            debugPrint("QUEUE — speaking entry \(idx + 1)/\(queueEntries.count)")
+            debugPrint("QUEUE — speaking next entry (remaining \(queueEntries.count))")
 
             try? effectiveSpeed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
-            speakText(text, speed: effectiveSpeed, volume: volume, sourceLabel: sourceLabel, sessionID: sessionID)
+            speakText(
+                text,
+                speed: effectiveSpeed,
+                volume: volume,
+                sourceLabel: sourceLabel,
+                sessionID: sessionID,
+                queueRestartAware: true
+            )
+
+            if fm.fileExists(atPath: restartQueueFlag) {
+                debugPrint("QUEUE — restart requested, keeping current entry and reprioritizing")
+                try? fm.removeItem(atPath: restartQueueFlag)
+                continue
+            }
 
             // Remove processed entry
             try? fm.removeItem(atPath: entryPath)
@@ -1400,6 +1480,7 @@ func processQueue() {
         clearTTYSubtitle()
         try? fm.removeItem(atPath: ttsPlayingFlag)
         try? fm.removeItem(atPath: skipFlag)
+        try? fm.removeItem(atPath: restartQueueFlag)
         clearActiveSegment()
         releaseTTSLock()
         debugPrint("QUEUE — done processing")

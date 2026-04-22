@@ -11,6 +11,9 @@ ACTIVE_SOURCE_LABEL_FILE="/tmp/claude-tts-active-source"
 CLAIM_NEXT_SESSION_FILE="/tmp/claude-tts-claim-next-session"
 LAST_SOURCE_FILE="/tmp/claude-tts-last-source"
 LAST_SESSION_FILE="/tmp/claude-tts-last-session"
+FOCUSED_SESSION_ID_FILE="/tmp/claude-tts-focused-session-id"
+FOCUSED_SOURCE_LABEL_FILE="/tmp/claude-tts-focused-source"
+RESTART_QUEUE_FLAG="/tmp/claude-tts-restart-queue"
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_BIN="$PLUGIN_DIR/bin"
 MBP_HOST="christopherdemartino@demo-m5-mbp"
@@ -49,6 +52,66 @@ ssh_mbp() {
 
 scp_mbp() {
     scp "${SSH_OPTS[@]}" "$@"
+}
+
+detect_current_session_id() {
+    local var value
+    for var in CODEX_THREAD_ID CLAUDE_SESSION_ID SESSION_ID CODEX_SESSION_ID CLAUDE_CONVERSATION_ID; do
+        value="${!var:-}"
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_current_source_label() {
+    if [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SESSION_ID:-}" ]; then
+        printf '%s\n' "Codex"
+        return 0
+    fi
+
+    if [ -n "${CLAUDE_SESSION_ID:-}" ] || [ -n "${CLAUDE_CONVERSATION_ID:-}" ]; then
+        printf '%s\n' "Claude Code"
+        return 0
+    fi
+
+    return 1
+}
+
+set_local_focus() {
+    local session_id="$1"
+    local source_label="$2"
+
+    if [ -n "$session_id" ]; then
+        printf '%s\n' "$session_id" > "$FOCUSED_SESSION_ID_FILE"
+    else
+        rm -f "$FOCUSED_SESSION_ID_FILE"
+    fi
+
+    if [ -n "$source_label" ]; then
+        printf '%s\n' "$source_label" > "$FOCUSED_SOURCE_LABEL_FILE"
+    else
+        rm -f "$FOCUSED_SOURCE_LABEL_FILE"
+    fi
+}
+
+clear_local_focus() {
+    rm -f "$FOCUSED_SESSION_ID_FILE" "$FOCUSED_SOURCE_LABEL_FILE"
+}
+
+parse_focus_field() {
+    local payload="$1"
+    local key="$2"
+
+    printf '%s\n' "$payload" | awk -F= -v key="$key" '
+        $1 == key {
+            sub(/^[^=]*=/, "", $0)
+            print
+            exit
+        }
+    '
 }
 
 kill_remote_tts_bridge() {
@@ -308,6 +371,7 @@ stop_daemon() {
         rm -f /tmp/claude-tts-skip /tmp/claude-tts-pause
         rm -f /tmp/claude-tts-playing /tmp/claude-voice-listening
         rm -f /tmp/claude-voice-config /tmp/claude-tts-bridge-stop
+        rm -f '$FOCUSED_SESSION_ID_FILE' '$FOCUSED_SOURCE_LABEL_FILE' '$RESTART_QUEUE_FLAG'
         rm -rf /tmp/claude-tts-queue
     " 2>/dev/null
     # Clean up local flag files
@@ -318,6 +382,7 @@ stop_daemon() {
     rm -f /tmp/claude-tts-pending /tmp/claude-tts-pending-ts
     rm -f /tmp/claude-tts-skip-listener-stop
     rm -f /tmp/claude-tts-spoken-hashes
+    clear_local_focus
 }
 
 show_status() {
@@ -336,6 +401,12 @@ show_status() {
     fi
     if [ -f "$ACTIVE_SOURCE_LABEL_FILE" ]; then
         echo "  last_source=$(cat "$ACTIVE_SOURCE_LABEL_FILE" 2>/dev/null)"
+    fi
+    if [ -f "$FOCUSED_SESSION_ID_FILE" ]; then
+        echo "  focused_session_id=$(cat "$FOCUSED_SESSION_ID_FILE" 2>/dev/null)"
+    fi
+    if [ -f "$FOCUSED_SOURCE_LABEL_FILE" ]; then
+        echo "  focused_source=$(cat "$FOCUSED_SOURCE_LABEL_FILE" 2>/dev/null)"
     fi
 }
 
@@ -552,6 +623,88 @@ remote_seek() {
     "
 }
 
+clear_remote_focus() {
+    ssh_mbp "
+        rm -f '$FOCUSED_SESSION_ID_FILE' '$FOCUSED_SOURCE_LABEL_FILE' '$RESTART_QUEUE_FLAG'
+    "
+}
+
+remote_focus_status() {
+    ssh_mbp "
+        setopt nonomatch 2>/dev/null || true
+        focus_session=\$(cat '$FOCUSED_SESSION_ID_FILE' 2>/dev/null | tr -d '[:space:]')
+        focus_source=\$(cat '$FOCUSED_SOURCE_LABEL_FILE' 2>/dev/null)
+        current_session=\$(cat '$LAST_SESSION_FILE' 2>/dev/null | tr -d '[:space:]')
+        match_count=0
+
+        if [ -n \"\$focus_session\" ]; then
+            for entry in /tmp/claude-tts-queue/entry-*; do
+                [ -d \"\$entry\" ] || continue
+                entry_session=\$(cat \"\$entry/session\" 2>/dev/null | tr -d '[:space:]')
+                [ \"\$entry_session\" = \"\$focus_session\" ] && match_count=\$((match_count + 1))
+            done
+        fi
+
+        printf 'focus_session=%s\n' \"\$focus_session\"
+        printf 'focus_source=%s\n' \"\$focus_source\"
+        printf 'match_count=%s\n' \"\$match_count\"
+        printf 'current_session=%s\n' \"\$current_session\"
+        if [ -f /tmp/claude-tts-playing ]; then
+            printf 'playing=1\n'
+        else
+            printf 'playing=0\n'
+        fi
+    "
+}
+
+remote_focus_session() {
+    local session_id="$1"
+    local source_label="$2"
+    local session_q source_q
+
+    session_q=$(printf '%q' "$session_id")
+    source_q=$(printf '%q' "$source_label")
+
+    ssh_mbp "
+        setopt nonomatch 2>/dev/null || true
+        session_id=$session_q
+        source_label=$source_q
+        current_session=\$(cat '$LAST_SESSION_FILE' 2>/dev/null | tr -d '[:space:]')
+        paused=0
+        [ -f /tmp/claude-tts-pause ] && paused=1
+        match_count=0
+
+        printf '%s\n' \"\$session_id\" > '$FOCUSED_SESSION_ID_FILE'
+        if [ -n \"\$source_label\" ]; then
+            printf '%s\n' \"\$source_label\" > '$FOCUSED_SOURCE_LABEL_FILE'
+        else
+            rm -f '$FOCUSED_SOURCE_LABEL_FILE'
+        fi
+
+        for entry in /tmp/claude-tts-queue/entry-*; do
+            [ -d \"\$entry\" ] || continue
+            entry_session=\$(cat \"\$entry/session\" 2>/dev/null | tr -d '[:space:]')
+            [ \"\$entry_session\" = \"\$session_id\" ] && match_count=\$((match_count + 1))
+        done
+
+        restarted=0
+        if [ \"\$paused\" -eq 0 ] && [ \"\$match_count\" -gt 0 ] && [ -f /tmp/claude-tts-playing ] && [ \"\$current_session\" != \"\$session_id\" ]; then
+            : > '$RESTART_QUEUE_FLAG'
+            pkill say 2>/dev/null || true
+            pkill afplay 2>/dev/null || true
+            pkill -f whisper-stream 2>/dev/null || true
+            restarted=1
+        fi
+
+        printf 'focus_session=%s\n' \"\$session_id\"
+        printf 'focus_source=%s\n' \"\$source_label\"
+        printf 'match_count=%s\n' \"\$match_count\"
+        printf 'current_session=%s\n' \"\$current_session\"
+        printf 'paused=%s\n' \"\$paused\"
+        printf 'restarted=%s\n' \"\$restarted\"
+    "
+}
+
 do_repeat() {
     ssh_mbp "
         history_dir_file=/tmp/claude-tts-history-dir
@@ -701,6 +854,73 @@ case "${1:-status}" in
         remote_seek "rewind" || exit 1
         echo "Rewind requested on the MBP."
         ;;
+    focus)
+        case "${2:-current}" in
+            off|clear)
+                clear_local_focus
+                clear_remote_focus || exit 1
+                echo "Focused playback cleared — queue order is back to normal FIFO."
+                ;;
+            status)
+                focus_status="$(remote_focus_status)" || exit 1
+                focus_session="$(parse_focus_field "$focus_status" "focus_session")"
+                focus_source="$(parse_focus_field "$focus_status" "focus_source")"
+                match_count="$(parse_focus_field "$focus_status" "match_count")"
+                current_session="$(parse_focus_field "$focus_status" "current_session")"
+                playing="$(parse_focus_field "$focus_status" "playing")"
+
+                if [ -z "$focus_session" ]; then
+                    echo "Focused playback: off"
+                    exit 0
+                fi
+
+                echo "Focused playback: ${focus_source:-Session}"
+                echo "  session_id=$focus_session"
+                echo "  queued_matches=${match_count:-0}"
+                echo "  playback_active=$([ "${playing:-0}" = "1" ] && echo yes || echo no)"
+                if [ -n "$current_session" ]; then
+                    if [ "${playing:-0}" = "1" ]; then
+                        echo "  current_playback_session=$current_session"
+                    else
+                        echo "  last_playback_session=$current_session"
+                    fi
+                fi
+                ;;
+            *)
+                focus_session="$2"
+                if [ -z "$focus_session" ] || [ "$focus_session" = "current" ]; then
+                    focus_session="$(detect_current_session_id)"
+                fi
+                focus_source="$(detect_current_source_label || true)"
+
+                if [ -z "$focus_session" ]; then
+                    echo "No current Claude/Codex session ID was found in this shell. Try /vm focus <session-id>."
+                    exit 1
+                fi
+
+                set_local_focus "$focus_session" "$focus_source"
+                focus_result="$(remote_focus_session "$focus_session" "$focus_source")" || exit 1
+                match_count="$(parse_focus_field "$focus_result" "match_count")"
+                current_session="$(parse_focus_field "$focus_result" "current_session")"
+                paused="$(parse_focus_field "$focus_result" "paused")"
+                restarted="$(parse_focus_field "$focus_result" "restarted")"
+
+                if [ "${restarted:-0}" = "1" ]; then
+                    echo "Focused playback on ${focus_source:-this} session — jumped ahead to queued audio from this thread."
+                elif [ "${match_count:-0}" -gt 0 ] 2>/dev/null; then
+                    if [ "${paused:-0}" = "1" ]; then
+                        echo "Focused playback armed for ${focus_source:-this} session — ${match_count} queued item(s) match, and they will take priority after resume."
+                    elif [ "$current_session" = "$focus_session" ]; then
+                        echo "Focused playback confirmed for ${focus_source:-this} session — this thread is already active and future queued items stay prioritized."
+                    else
+                        echo "Focused playback armed for ${focus_source:-this} session — ${match_count} queued item(s) will play next."
+                    fi
+                else
+                    echo "Focused playback armed for ${focus_source:-this} session — no queued audio from this thread yet, but new replies will jump the line."
+                fi
+                ;;
+        esac
+        ;;
     rebuild)
         rebuild_remote_skip_listener || exit 1
         echo "skip-listener rebuilt on $MBP_HOST"
@@ -741,6 +961,6 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|status|doctor|voice|mic|cue|subtitle|summary]"
+        echo "Usage: /vm [on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|status|doctor|voice|mic|cue|subtitle|summary]"
         ;;
 esac
