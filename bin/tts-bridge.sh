@@ -24,7 +24,10 @@ while [ ! -f "$STOP_FLAG" ]; do
             volume=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.volume' 2>/dev/null")
             source=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.source' 2>/dev/null")
             session=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.session' 2>/dev/null")
-            ssh -o BatchMode=yes "$HOST" "rm -f '$txt_file' '${base}.speed' '${base}.volume' '${base}.source' '${base}.session'" 2>/dev/null
+            block=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.block' 2>/dev/null")
+            raw=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.raw' 2>/dev/null")
+            normalized=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.normalized' 2>/dev/null")
+            ssh -o BatchMode=yes "$HOST" "rm -f '$txt_file' '${base}.speed' '${base}.volume' '${base}.source' '${base}.session' '${base}.block' '${base}.raw' '${base}.normalized'" 2>/dev/null
 
             [ -z "$speed" ] && speed="300"
             [ -z "$volume" ] && volume="1.0"
@@ -39,6 +42,9 @@ while [ ! -f "$STOP_FLAG" ]; do
             echo "$volume" > "$staging_entry/volume"
             echo "$source" > "$staging_entry/source"
             [ -n "$session" ] && echo "$session" > "$staging_entry/session"
+            [ -n "$block" ] && echo "$block" > "$staging_entry/block"
+            [ -n "$raw" ] && printf '%s' "$raw" > "$staging_entry/raw"
+            [ -n "$normalized" ] && printf '%s' "$normalized" > "$staging_entry/normalized"
             mv "$staging_entry" "$local_entry"
 
             # Save for repeat — skip-listener reads these for cmd+shift repeat

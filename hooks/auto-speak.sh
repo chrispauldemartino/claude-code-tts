@@ -29,6 +29,7 @@ DRILL_DOWN_FLAG="/tmp/claude-tts-drill-down"
 ACTIVE_SEGMENT="/tmp/claude-tts-active-segment"
 REPEAT_ANCHOR="/tmp/claude-tts-repeat-anchor"
 BLOCK_START="/tmp/claude-tts-block-start"
+BLOCK_ID_FILE="/tmp/claude-tts-current-block-id"
 LAST_QUEUED_HASH="/tmp/claude-tts-last-queued-hash"
 QUEUED_PREFIX="/tmp/claude-tts-queued-prefix"
 QUEUED_LENGTH="/tmp/claude-tts-queued-length"
@@ -870,6 +871,7 @@ if has_config; then
 
             current_len=${#cleaned}
             current_prefix="${cleaned:0:100}"
+            block_id=$(cat "$BLOCK_ID_FILE" 2>/dev/null || true)
 
             new_text=""
 
@@ -882,6 +884,12 @@ if has_config; then
             else
                 # Different response (new prefix) — queue everything
                 new_text="$cleaned"
+                block_id=""
+            fi
+
+            if [ -z "$block_id" ]; then
+                block_id="$(date +%s%N)-$$"
+                echo "$block_id" > "$BLOCK_ID_FILE"
             fi
 
             if [ -n "$new_text" ]; then
@@ -901,6 +909,9 @@ if has_config; then
                     echo "$VOL_LEVEL" > "$REMOTE_TTS_DIR/entry-${remote_ts}.volume"
                     echo "$SOURCE_LABEL" > "$REMOTE_TTS_DIR/entry-${remote_ts}.source"
                     [ -n "$SESSION_ID" ] && echo "$SESSION_ID" > "$REMOTE_TTS_DIR/entry-${remote_ts}.session"
+                    echo "$block_id" > "$REMOTE_TTS_DIR/entry-${remote_ts}.block"
+                    printf '%s' "$text_to_queue" > "$REMOTE_TTS_DIR/entry-${remote_ts}.raw"
+                    printf '%s' "$cleaned" > "$REMOTE_TTS_DIR/entry-${remote_ts}.normalized"
                     echo "$filtered_text" > "$REMOTE_TTS_DIR/entry-${remote_ts}.txt"
 
                     # Record what we just queued so future responses skip these sentences
@@ -930,6 +941,7 @@ if has_config; then
     # previous response was incorrectly skipped by the prefix-match dedup.
     if [ "$HOOK_EVENT" = "Stop" ]; then
         rm -f "$QUEUED_PREFIX" "$QUEUED_LENGTH"
+        rm -f "$BLOCK_ID_FILE"
         echo "  [dedup] cleared prefix/length tracking (Stop event)" >> "$DEBUG_LOG"
     fi
 

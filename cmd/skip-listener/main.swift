@@ -44,8 +44,15 @@ let lastVolumeFile = "/tmp/claude-tts-last-volume"
 let lastSourceFile = "/tmp/claude-tts-last-source"
 let lastSessionFile = "/tmp/claude-tts-last-session"
 let playbackCursorFile = "/tmp/claude-tts-playback-cursor"
+let currentPlaybackItemFile = "/tmp/claude-tts-current-item-id"
 let focusedSessionFile = "/tmp/claude-tts-focused-session-id"
 let restartQueueFlag = "/tmp/claude-tts-restart-queue"
+let playbackLogDir = "/tmp/claude-tts-playback-log"
+let playbackLogItemsDir = "\(playbackLogDir)/items"
+let playbackLogManifestFile = "\(playbackLogDir)/manifest.jsonl"
+let playbackLogCommandFile = "/tmp/claude-tts-log-command"
+let playbackLogRetentionSeconds: TimeInterval = 90 * 60
+let playbackLogMaxItems = 200
 
 // Forward/rewind flags
 let forwardFlag = "/tmp/claude-tts-forward"
@@ -407,11 +414,62 @@ typealias PlaybackContext = (
     speed: String,
     volume: String,
     sourceLabel: String?,
-    sessionID: String?
+    sessionID: String?,
+    itemID: String?
 )
 
+struct PlaybackSentence: Codable {
+    var index: Int
+    var text: String
+    var audioFile: String?
+}
+
+struct PlaybackLogItem: Codable {
+    var id: String
+    var timestamp: TimeInterval
+    var sourceLabel: String?
+    var sessionID: String?
+    var requestedEngine: String
+    var engine: String
+    var fallbackReason: String?
+    var speed: String
+    var volume: String
+    var blockID: String?
+    var itemDir: String
+    var rawTextPath: String
+    var normalizedTextPath: String
+    var sentenceMapPath: String
+
+    var preview: String {
+        let base = String((try? String(contentsOfFile: normalizedTextPath, encoding: .utf8))?.prefix(60) ?? "")
+        if let sourceLabel {
+            return "[\(sourceLabel)] \(base)"
+        }
+        return base
+    }
+}
+
 func splitSentences(_ text: String) -> [String] {
-    text.components(separatedBy: CharacterSet(charactersIn: ".!?"))
+    let nsText = text as NSString
+    var sentences: [String] = []
+
+    nsText.enumerateSubstrings(
+        in: NSRange(location: 0, length: nsText.length),
+        options: [.bySentences, .localized]
+    ) { _, range, _, _ in
+        guard range.location != NSNotFound else { return }
+        let sentence = nsText.substring(with: range)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !sentence.isEmpty {
+            sentences.append(sentence)
+        }
+    }
+
+    if !sentences.isEmpty {
+        return sentences
+    }
+
+    return text.components(separatedBy: CharacterSet(charactersIn: ".!?"))
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
 }
@@ -427,6 +485,275 @@ func readPlaybackCursor() -> Int {
         return cursor
     }
     return 0
+}
+
+func currentRequestedEngine() -> String {
+    let value = readConfigValue("engine")
+    return value == "openai" ? "openai" : "say"
+}
+
+func currentOpenAIVoice() -> String {
+    let value = readConfigValue("openai_voice")
+    return value.isEmpty ? "nova" : value
+}
+
+func playbackLogItemDirectory(id: String) -> String {
+    "\(playbackLogItemsDir)/\(id)"
+}
+
+func ensurePlaybackLogDirectories() {
+    let fm = FileManager.default
+    try? fm.createDirectory(
+        atPath: playbackLogItemsDir,
+        withIntermediateDirectories: true,
+        attributes: nil
+    )
+}
+
+func writeString(_ value: String, to path: String) {
+    try? value.write(toFile: path, atomically: true, encoding: .utf8)
+}
+
+func loadPlaybackLogItems() -> [PlaybackLogItem] {
+    guard let content = try? String(contentsOfFile: playbackLogManifestFile, encoding: .utf8) else {
+        return []
+    }
+
+    let decoder = JSONDecoder()
+    return content
+        .components(separatedBy: "\n")
+        .compactMap { line -> PlaybackLogItem? in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else {
+                return nil
+            }
+            return try? decoder.decode(PlaybackLogItem.self, from: data)
+        }
+        .sorted { $0.timestamp < $1.timestamp }
+}
+
+func savePlaybackLogItems(_ items: [PlaybackLogItem]) {
+    ensurePlaybackLogDirectories()
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let lines = items.compactMap { item -> String? in
+        guard let data = try? encoder.encode(item) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+    let content = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
+    writeString(content, to: playbackLogManifestFile)
+}
+
+@discardableResult
+func prunePlaybackLog() -> [PlaybackLogItem] {
+    ensurePlaybackLogDirectories()
+    let fm = FileManager.default
+    let cutoff = Date().timeIntervalSince1970 - playbackLogRetentionSeconds
+    var items = loadPlaybackLogItems()
+    items = items.filter { item in
+        if item.timestamp >= cutoff {
+            return true
+        }
+        try? fm.removeItem(atPath: item.itemDir)
+        return false
+    }
+
+    if items.count > playbackLogMaxItems {
+        let toRemove = items.count - playbackLogMaxItems
+        for item in items.prefix(toRemove) {
+            try? fm.removeItem(atPath: item.itemDir)
+        }
+        items = Array(items.suffix(playbackLogMaxItems))
+    }
+
+    savePlaybackLogItems(items)
+    return items
+}
+
+func loadSentenceMap(for item: PlaybackLogItem) -> [PlaybackSentence] {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: item.sentenceMapPath)) else {
+        return []
+    }
+    return (try? JSONDecoder().decode([PlaybackSentence].self, from: data)) ?? []
+}
+
+func saveSentenceMap(_ sentences: [PlaybackSentence], for item: PlaybackLogItem) {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    guard let data = try? encoder.encode(sentences) else { return }
+    try? data.write(to: URL(fileURLWithPath: item.sentenceMapPath), options: .atomic)
+}
+
+func updatePlaybackLogItem(_ updatedItem: PlaybackLogItem) {
+    var items = prunePlaybackLog()
+    guard let idx = items.firstIndex(where: { $0.id == updatedItem.id }) else { return }
+    items[idx] = updatedItem
+    savePlaybackLogItems(items)
+}
+
+func readCurrentPlaybackItemID() -> String? {
+    normalizeSessionID(try? String(contentsOfFile: currentPlaybackItemFile, encoding: .utf8))
+}
+
+func writeCurrentPlaybackItemID(_ id: String?) {
+    guard let id else {
+        try? FileManager.default.removeItem(atPath: currentPlaybackItemFile)
+        return
+    }
+    writeString(id, to: currentPlaybackItemFile)
+}
+
+func focusedPlaybackLogItems() -> [PlaybackLogItem] {
+    let items = prunePlaybackLog()
+    guard let focusedSession = readFocusedSessionID() else {
+        return items
+    }
+    return items.filter { $0.sessionID == focusedSession }
+}
+
+func findPlaybackLogItem(id: String) -> PlaybackLogItem? {
+    loadPlaybackLogItems().first { $0.id == id }
+}
+
+func currentPlaybackLogItem() -> PlaybackLogItem? {
+    let filtered = focusedPlaybackLogItems()
+    guard !filtered.isEmpty else { return nil }
+
+    if let currentID = readCurrentPlaybackItemID(),
+       let item = filtered.first(where: { $0.id == currentID }) {
+        return item
+    }
+
+    let latest = filtered.last
+    writeCurrentPlaybackItemID(latest?.id)
+    return latest
+}
+
+func resetPlaybackLogCursorToLatest() {
+    let latest = focusedPlaybackLogItems().last
+    writeCurrentPlaybackItemID(latest?.id)
+    writePlaybackCursor(0)
+}
+
+func rewritePlaybackTexts(rawText: String, normalizedText: String, item: PlaybackLogItem) {
+    writeString(rawText, to: item.rawTextPath)
+    writeString(normalizedText, to: item.normalizedTextPath)
+}
+
+func upsertPlaybackLogItem(
+    blockID: String?,
+    rawText: String,
+    normalizedText: String,
+    sourceLabel: String?,
+    sessionID: String?,
+    speed: String,
+    volume: String
+) -> (item: PlaybackLogItem, sentenceOffset: Int, newSentenceText: String?) {
+    ensurePlaybackLogDirectories()
+    var items = prunePlaybackLog()
+    let fm = FileManager.default
+
+    let normalizedSentences = splitSentences(normalizedText)
+    let requestedEngine = currentRequestedEngine()
+
+    if let blockID,
+       let idx = items.lastIndex(where: {
+           $0.blockID == blockID && $0.sessionID == sessionID && $0.sourceLabel == sourceLabel
+       }) {
+        var item = items[idx]
+        let oldSentences = loadSentenceMap(for: item)
+        let existingTexts = oldSentences.map(\.text)
+        var prefixCount = 0
+        while prefixCount < existingTexts.count &&
+            prefixCount < normalizedSentences.count &&
+            existingTexts[prefixCount] == normalizedSentences[prefixCount] {
+            prefixCount += 1
+        }
+
+        var updatedSentences = Array(oldSentences.prefix(prefixCount))
+        for (offset, sentenceText) in normalizedSentences.dropFirst(prefixCount).enumerated() {
+            updatedSentences.append(
+                PlaybackSentence(index: prefixCount + offset, text: sentenceText, audioFile: nil)
+            )
+        }
+        for idx in updatedSentences.indices {
+            updatedSentences[idx].index = idx
+        }
+
+        item.timestamp = Date().timeIntervalSince1970
+        item.speed = speed
+        item.volume = volume
+        item.requestedEngine = requestedEngine
+        rewritePlaybackTexts(rawText: rawText, normalizedText: normalizedText, item: item)
+        saveSentenceMap(updatedSentences, for: item)
+        items[idx] = item
+        savePlaybackLogItems(items)
+
+        let newSentenceText = prefixCount < normalizedSentences.count
+            ? normalizedSentences.dropFirst(prefixCount).joined(separator: " ")
+            : nil
+        return (item, prefixCount, newSentenceText)
+    }
+
+    let itemID = "item-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString)"
+    let itemDir = playbackLogItemDirectory(id: itemID)
+    try? fm.createDirectory(atPath: itemDir, withIntermediateDirectories: true, attributes: nil)
+    try? fm.createDirectory(atPath: "\(itemDir)/audio", withIntermediateDirectories: true, attributes: nil)
+
+    let item = PlaybackLogItem(
+        id: itemID,
+        timestamp: Date().timeIntervalSince1970,
+        sourceLabel: sourceLabel,
+        sessionID: sessionID,
+        requestedEngine: requestedEngine,
+        engine: requestedEngine,
+        fallbackReason: nil,
+        speed: speed,
+        volume: volume,
+        blockID: blockID,
+        itemDir: itemDir,
+        rawTextPath: "\(itemDir)/raw.txt",
+        normalizedTextPath: "\(itemDir)/normalized.txt",
+        sentenceMapPath: "\(itemDir)/sentence-map.json"
+    )
+    rewritePlaybackTexts(rawText: rawText, normalizedText: normalizedText, item: item)
+    let sentenceMap = normalizedSentences.enumerated().map { offset, sentenceText in
+        PlaybackSentence(index: offset, text: sentenceText, audioFile: nil)
+    }
+    saveSentenceMap(sentenceMap, for: item)
+    items.append(item)
+    savePlaybackLogItems(items)
+    return (item, 0, normalizedSentences.isEmpty ? nil : normalizedSentences.joined(separator: " "))
+}
+
+func cachedSentenceAudioPath(itemID: String, sentenceIndex: Int) -> String? {
+    guard let item = findPlaybackLogItem(id: itemID) else { return nil }
+    let sentenceMap = loadSentenceMap(for: item)
+    guard sentenceIndex >= 0, sentenceIndex < sentenceMap.count,
+          let audioFile = sentenceMap[sentenceIndex].audioFile,
+          FileManager.default.fileExists(atPath: audioFile) else {
+        return nil
+    }
+    return audioFile
+}
+
+func updatePlaybackLogAudioState(
+    itemID: String,
+    sentenceIndex: Int,
+    audioFile: String,
+    actualEngine: String,
+    fallbackReason: String?
+) {
+    guard var item = findPlaybackLogItem(id: itemID) else { return }
+    var sentenceMap = loadSentenceMap(for: item)
+    guard sentenceIndex >= 0, sentenceIndex < sentenceMap.count else { return }
+    sentenceMap[sentenceIndex].audioFile = audioFile
+    item.engine = actualEngine
+    if let fallbackReason {
+        item.fallbackReason = fallbackReason
+    }
+    saveSentenceMap(sentenceMap, for: item)
+    updatePlaybackLogItem(item)
 }
 
 func readFocusedSessionID() -> String? {
@@ -527,8 +854,33 @@ func waitWhilePaused() -> Bool {
     return true
 }
 
-func synthesizeSpeechAudio(_ spokenText: String, speed: String, outputFile: String) -> Bool {
+func pluginBinDirectory() -> String {
+    let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    if executableURL.path.contains(".app/Contents/MacOS/") {
+        return executableURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .path
+    }
+    return executableURL.deletingLastPathComponent().path
+}
+
+func speakTextBinaryPath() -> String {
+    "\(pluginBinDirectory())/speak-text"
+}
+
+struct SynthesisResult {
+    let success: Bool
+    let actualEngine: String
+    let fallbackReason: String?
+    let outputFile: String?
+}
+
+func synthesizeWithSay(_ spokenText: String, speed: String, outputBasePath: String) -> SynthesisResult {
     let textFile = "/tmp/claude-tts-say-\(ProcessInfo.processInfo.processIdentifier).txt"
+    let outputFile = "\(outputBasePath).aiff"
     try? spokenText.write(toFile: textFile, atomically: true, encoding: .utf8)
 
     let sayProc = Process()
@@ -539,10 +891,55 @@ func synthesizeSpeechAudio(_ spokenText: String, speed: String, outputFile: Stri
 
     if !success {
         try? FileManager.default.removeItem(atPath: outputFile)
-        return false
+        return SynthesisResult(success: false, actualEngine: "say", fallbackReason: nil, outputFile: nil)
     }
 
-    return FileManager.default.fileExists(atPath: outputFile)
+    return SynthesisResult(
+        success: FileManager.default.fileExists(atPath: outputFile),
+        actualEngine: "say",
+        fallbackReason: nil,
+        outputFile: outputFile
+    )
+}
+
+func synthesizeSpeechAudio(
+    _ spokenText: String,
+    speed: String,
+    requestedEngine: String,
+    openAIVoice: String,
+    outputBasePath: String
+) -> SynthesisResult {
+    if requestedEngine == "openai" {
+        let outputFile = "\(outputBasePath).mp3"
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: speakTextBinaryPath())
+        proc.arguments = [
+            "-voice", openAIVoice,
+            "-output", outputFile,
+            "-no-play",
+            spokenText,
+        ]
+        let success = runProcessWithTimeout(proc, timeout: 30)
+        if success && FileManager.default.fileExists(atPath: outputFile) {
+            return SynthesisResult(
+                success: true,
+                actualEngine: "openai",
+                fallbackReason: nil,
+                outputFile: outputFile
+            )
+        }
+
+        try? FileManager.default.removeItem(atPath: outputFile)
+        let fallback = synthesizeWithSay(spokenText, speed: speed, outputBasePath: outputBasePath)
+        return SynthesisResult(
+            success: fallback.success,
+            actualEngine: fallback.actualEngine,
+            fallbackReason: "openai_unavailable_or_failed",
+            outputFile: fallback.outputFile
+        )
+    }
+
+    return synthesizeWithSay(spokenText, speed: speed, outputBasePath: outputBasePath)
 }
 
 func playAudioFile(_ path: String, volume: String) -> Bool {
@@ -560,7 +957,11 @@ func acquireTTSLock() {
     let fm = FileManager.default
     while true {
         do {
-            try fm.createDirectory(atPath: ttsLockDir, withIntermediateDirectories: false)
+            try fm.createDirectory(
+                atPath: ttsLockDir,
+                withIntermediateDirectories: false,
+                attributes: nil
+            )
             try "\(ProcessInfo.processInfo.processIdentifier)".write(
                 toFile: ttsLockPidFile, atomically: true, encoding: .utf8)
             debugPrint("TTS lock acquired")
@@ -695,13 +1096,14 @@ func triggerStopAll() {
     // Reset repeat anchor — next repeat plays from latest terminal message,
     // NOT from where the file read or TTS was killed
     resetRepeatAnchor()
+    resetPlaybackLogCursorToLatest()
 
     clearTTYSubtitle()
 
     // Chime AFTER cleanup so pkill doesn't kill it
     usleep(100_000)
     playChime()
-    debugPrint("STOP ALL — everything killed, lock cleared, anchor reset to last terminal message")
+    debugPrint("STOP ALL — everything killed, lock cleared, cursor reset to latest playback item")
 }
 
 // MARK: - Repeat (cmd+shift)
@@ -755,7 +1157,14 @@ func readHistoryMessage(at index: Int) -> PlaybackContext? {
     let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(histDir)/msg-\(padded).source", encoding: .utf8))
     let sessionID = normalizeSessionID(try? String(contentsOfFile: "\(histDir)/msg-\(padded).session", encoding: .utf8))
 
-    return (text: text, speed: speed, volume: volume, sourceLabel: sourceLabel, sessionID: sessionID)
+    return (
+        text: text,
+        speed: speed,
+        volume: volume,
+        sourceLabel: sourceLabel,
+        sessionID: sessionID,
+        itemID: nil
+    )
 }
 
 func historyMessageTotal() -> Int {
@@ -795,7 +1204,48 @@ func resetRepeatAnchor() {
     debugPrint("RESET ANCHOR — set to last message \(total)")
 }
 
+func playbackContext(from item: PlaybackLogItem) -> PlaybackContext? {
+    guard let text = try? String(contentsOfFile: item.normalizedTextPath, encoding: .utf8),
+          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+
+    return (
+        text: text,
+        speed: item.speed,
+        volume: item.volume,
+        sourceLabel: item.sourceLabel,
+        sessionID: item.sessionID,
+        itemID: item.id
+    )
+}
+
+func persistPlaybackContext(_ context: PlaybackContext) {
+    try? context.text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
+    try? context.speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+    try? context.volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
+
+    if let source = context.sourceLabel {
+        try? source.write(toFile: lastSourceFile, atomically: true, encoding: .utf8)
+    } else {
+        try? FileManager.default.removeItem(atPath: lastSourceFile)
+    }
+
+    if let session = context.sessionID {
+        try? session.write(toFile: lastSessionFile, atomically: true, encoding: .utf8)
+    } else {
+        try? FileManager.default.removeItem(atPath: lastSessionFile)
+    }
+
+    writeCurrentPlaybackItemID(context.itemID)
+}
+
 func loadReplayContext() -> PlaybackContext? {
+    if let currentItem = currentPlaybackLogItem(),
+       let context = playbackContext(from: currentItem) {
+        return context
+    }
+
     let anchor = getRepeatAnchor()
     if let historyMessage = readHistoryMessage(at: anchor) {
         return historyMessage
@@ -813,7 +1263,14 @@ func loadReplayContext() -> PlaybackContext? {
     let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: lastSourceFile, encoding: .utf8))
     let sessionID = normalizeSessionID(try? String(contentsOfFile: lastSessionFile, encoding: .utf8))
 
-    return (text: text, speed: speed, volume: volume, sourceLabel: sourceLabel, sessionID: sessionID)
+    return (
+        text: text,
+        speed: speed,
+        volume: volume,
+        sourceLabel: sourceLabel,
+        sessionID: sessionID,
+        itemID: nil
+    )
 }
 
 func playContext(_ context: PlaybackContext, startIndex: Int, status: String) {
@@ -835,20 +1292,7 @@ func playContext(_ context: PlaybackContext, startIndex: Int, status: String) {
 
         acquireTTSLock()
         try? FileManager.default.removeItem(atPath: skipFlag)
-
-        try? context.text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
-        try? context.speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
-        try? context.volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
-        if let source = context.sourceLabel {
-            try? source.write(toFile: lastSourceFile, atomically: true, encoding: .utf8)
-        } else {
-            try? FileManager.default.removeItem(atPath: lastSourceFile)
-        }
-        if let session = context.sessionID {
-            try? session.write(toFile: lastSessionFile, atomically: true, encoding: .utf8)
-        } else {
-            try? FileManager.default.removeItem(atPath: lastSessionFile)
-        }
+        persistPlaybackContext(context)
 
         writePlaybackCursor(clampedStart)
         FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
@@ -860,7 +1304,8 @@ func playContext(_ context: PlaybackContext, startIndex: Int, status: String) {
             volume: context.volume,
             sourceLabel: context.sourceLabel,
             sessionID: context.sessionID,
-            startIndex: clampedStart
+            startIndex: clampedStart,
+            playbackItemID: context.itemID
         )
 
         clearTTYSubtitle()
@@ -929,7 +1374,9 @@ func speakText(
     sourceLabel: String? = nil,
     sessionID: String? = nil,
     startIndex: Int = 0,
-    queueRestartAware: Bool = false
+    queueRestartAware: Bool = false,
+    playbackItemID: String? = nil,
+    sentenceBaseIndex: Int = 0
 ) {
     let sentences = splitSentences(text)
     guard !sentences.isEmpty else { return }
@@ -981,40 +1428,81 @@ func speakText(
             spokenText = sentence
         }
 
-        let tmpFile = "/tmp/claude-tts-repeat-\(ProcessInfo.processInfo.processIdentifier).aiff"
-
+        let outputFile: String
+        let shouldRemoveAfterPlayback: Bool
+        let cacheSentenceIndex = sentenceBaseIndex + idx
         showTTYSubtitle(subtitleText)
-        writePlaybackCursor(idx)
-
-        // Generate audio
-        let synthesized = synthesizeSpeechAudio(spokenText, speed: speed, outputFile: tmpFile)
-        if !synthesized {
-            debugPrint("TTS — say synthesis failed for sentence \(idx + 1)")
-            try? FileManager.default.removeItem(atPath: tmpFile)
-            if queueRestartAware && shouldRestartQueuePlayback() {
-                break
+        writePlaybackCursor(cacheSentenceIndex)
+        if let playbackItemID,
+           let cachedPath = cachedSentenceAudioPath(itemID: playbackItemID, sentenceIndex: cacheSentenceIndex) {
+            outputFile = cachedPath
+            shouldRemoveAfterPlayback = false
+        } else {
+            let outputBasePath: String
+            let requestedEngine: String
+            if let playbackItemID,
+               let item = findPlaybackLogItem(id: playbackItemID) {
+                outputBasePath = "\(item.itemDir)/audio/\(String(format: "%03d", cacheSentenceIndex + 1))"
+                requestedEngine = item.engine
+            } else {
+                outputBasePath = "/tmp/claude-tts-repeat-\(ProcessInfo.processInfo.processIdentifier)-\(idx + 1)"
+                requestedEngine = currentRequestedEngine()
             }
-            idx += 1
-            continue
+
+            let synthesis = synthesizeSpeechAudio(
+                spokenText,
+                speed: speed,
+                requestedEngine: requestedEngine,
+                openAIVoice: currentOpenAIVoice(),
+                outputBasePath: outputBasePath
+            )
+            guard synthesis.success, let synthesizedFile = synthesis.outputFile else {
+                debugPrint("TTS — synthesis failed for sentence \(idx + 1)")
+                if queueRestartAware && shouldRestartQueuePlayback() {
+                    break
+                }
+                idx += 1
+                continue
+            }
+            outputFile = synthesizedFile
+            shouldRemoveAfterPlayback = playbackItemID == nil
+
+            if let playbackItemID {
+                updatePlaybackLogAudioState(
+                    itemID: playbackItemID,
+                    sentenceIndex: cacheSentenceIndex,
+                    audioFile: synthesizedFile,
+                    actualEngine: synthesis.actualEngine,
+                    fallbackReason: synthesis.fallbackReason
+                )
+            }
         }
 
         if FileManager.default.fileExists(atPath: skipFlag) {
-            try? FileManager.default.removeItem(atPath: tmpFile)
+            if shouldRemoveAfterPlayback {
+                try? FileManager.default.removeItem(atPath: outputFile)
+            }
             break
         }
         if queueRestartAware && shouldRestartQueuePlayback() {
-            try? FileManager.default.removeItem(atPath: tmpFile)
+            if shouldRemoveAfterPlayback {
+                try? FileManager.default.removeItem(atPath: outputFile)
+            }
             break
         }
         if !waitWhilePaused() {
-            try? FileManager.default.removeItem(atPath: tmpFile)
+            if shouldRemoveAfterPlayback {
+                try? FileManager.default.removeItem(atPath: outputFile)
+            }
             break
         }
 
         // Play audio
-        let played = playAudioFile(tmpFile, volume: volume)
+        let played = playAudioFile(outputFile, volume: volume)
 
-        try? FileManager.default.removeItem(atPath: tmpFile)
+        if shouldRemoveAfterPlayback {
+            try? FileManager.default.removeItem(atPath: outputFile)
+        }
         if !played {
             debugPrint("TTS — afplay failed for sentence \(idx + 1)")
             if queueRestartAware && shouldRestartQueuePlayback() {
@@ -1040,7 +1528,7 @@ func speakText(
                 try? FileManager.default.removeItem(atPath: lastSessionFile)
             }
         }
-        writePlaybackCursor(idx + 1)
+        writePlaybackCursor(cacheSentenceIndex + 1)
         idx += 1
     }
 }
@@ -1219,6 +1707,107 @@ func triggerDrillDown(target: String? = nil) {
 
 // MARK: - Message Navigation (opt+shift+arrow)
 
+func interruptPlaybackForReplay() {
+    FileManager.default.createFile(atPath: skipFlag, contents: nil)
+    killTTSProcesses()
+    try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
+}
+
+func waitForPlaybackLockRelease(maxTicks: Int = 30) {
+    var waited = 0
+    while FileManager.default.fileExists(atPath: ttsLockDir) && waited < maxTicks {
+        if let pidStr = try? String(contentsOfFile: ttsLockPidFile, encoding: .utf8),
+           let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+           kill(pid, 0) != 0 {
+            try? FileManager.default.removeItem(atPath: ttsLockDir)
+            break
+        }
+        usleep(100_000)
+        waited += 1
+    }
+    if FileManager.default.fileExists(atPath: ttsLockDir) {
+        try? FileManager.default.removeItem(atPath: ttsLockDir)
+    }
+}
+
+func playbackLogTargetItem(direction: String? = nil, useLatest: Bool = false) -> PlaybackLogItem? {
+    let items = focusedPlaybackLogItems()
+    guard !items.isEmpty else { return nil }
+
+    if useLatest {
+        let latest = items.last
+        writeCurrentPlaybackItemID(latest?.id)
+        return latest
+    }
+
+    let defaultIndex = max(items.count - 1, 0)
+    let currentIndex: Int
+    if let currentID = readCurrentPlaybackItemID(),
+       let idx = items.firstIndex(where: { $0.id == currentID }) {
+        currentIndex = idx
+    } else {
+        currentIndex = defaultIndex
+    }
+
+    let targetIndex: Int
+    switch direction {
+    case "next":
+        guard currentIndex < items.count - 1 else { return nil }
+        targetIndex = currentIndex + 1
+    case "prev":
+        guard currentIndex > 0 else { return nil }
+        targetIndex = currentIndex - 1
+    default:
+        targetIndex = currentIndex
+    }
+
+    let target = items[targetIndex]
+    writeCurrentPlaybackItemID(target.id)
+    return target
+}
+
+@discardableResult
+func triggerPlaybackLogAction(direction: String? = nil, useLatest: Bool = false, status: String) -> Bool {
+    guard let target = playbackLogTargetItem(direction: direction, useLatest: useLatest),
+          let context = playbackContext(from: target) else {
+        playChime()
+        return false
+    }
+
+    interruptPlaybackForReplay()
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        waitForPlaybackLockRelease()
+        debugPrint("PLAYBACK LOG — playing \(target.id) status=\(status)")
+        playContext(context, startIndex: 0, status: status)
+    }
+
+    return true
+}
+
+func handlePlaybackLogCommandIfNeeded() {
+    guard let command = try? String(contentsOfFile: playbackLogCommandFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          !command.isEmpty else {
+        return
+    }
+
+    try? FileManager.default.removeItem(atPath: playbackLogCommandFile)
+
+    switch command {
+    case "back":
+        _ = triggerPlaybackLogAction(direction: "prev", status: "nav")
+    case "next":
+        _ = triggerPlaybackLogAction(direction: "next", status: "nav")
+    case "replay":
+        _ = triggerPlaybackLogAction(status: "repeat")
+    case "latest":
+        _ = triggerPlaybackLogAction(useLatest: true, status: "nav")
+    default:
+        debugPrint("PLAYBACK LOG — unknown command \(command)")
+    }
+}
+
 func extractAssistantTextBlocks(from message: [String: Any]) -> [String] {
     if let role = message["role"] as? String, role != "assistant" {
         return []
@@ -1290,6 +1879,10 @@ func extractMessagesFromTranscript() -> [String] {
 
 func triggerMessageNav(direction: String) {
     debugPrint("MESSAGE NAV — \(direction)")
+
+    if triggerPlaybackLogAction(direction: direction == "next" ? "next" : "prev", status: "nav") {
+        return
+    }
 
     // Signal auto-speak.sh to stop and kill audio
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
@@ -1392,7 +1985,8 @@ func triggerMessageNav(direction: String) {
             speed: currentSpeechSpeed(),
             volume: "1.0",
             sourceLabel: nil,
-            sessionID: nil
+            sessionID: nil,
+            itemID: nil
         )
         debugPrint("MESSAGE NAV — playing transcript \(current + 1)/\(total)")
         playContext(context, startIndex: 0, status: "nav")
@@ -1449,6 +2043,11 @@ func processQueue() {
                 .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
             let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(entryPath)/source", encoding: .utf8))
             let sessionID = normalizeSessionID(try? String(contentsOfFile: "\(entryPath)/session", encoding: .utf8))
+            let blockID = normalizeSessionID(try? String(contentsOfFile: "\(entryPath)/block", encoding: .utf8))
+            let rawText = (try? String(contentsOfFile: "\(entryPath)/raw", encoding: .utf8))
+                ?? text
+            let normalizedText = (try? String(contentsOfFile: "\(entryPath)/normalized", encoding: .utf8))
+                ?? text
             let effectiveSpeed = currentSpeechSpeed(fallback: speed)
             let previewBase = String(text.prefix(60))
             let previewText = sourceLabel != nil ? "[\(sourceLabel!)] \(previewBase)" : previewBase
@@ -1457,13 +2056,29 @@ func processQueue() {
             debugPrint("QUEUE — speaking next entry (remaining \(queueEntries.count))")
 
             try? effectiveSpeed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+            let logResult = upsertPlaybackLogItem(
+                blockID: blockID,
+                rawText: rawText,
+                normalizedText: normalizedText,
+                sourceLabel: sourceLabel,
+                sessionID: sessionID,
+                speed: effectiveSpeed,
+                volume: volume
+            )
+            writeCurrentPlaybackItemID(logResult.item.id)
+
+            let liveText = (logResult.newSentenceText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                ? logResult.newSentenceText!
+                : text
             speakText(
-                text,
+                liveText,
                 speed: effectiveSpeed,
                 volume: volume,
                 sourceLabel: sourceLabel,
                 sessionID: sessionID,
-                queueRestartAware: true
+                queueRestartAware: true,
+                playbackItemID: logResult.newSentenceText == nil ? nil : logResult.item.id,
+                sentenceBaseIndex: logResult.newSentenceText == nil ? 0 : logResult.sentenceOffset
             )
 
             if fm.fileExists(atPath: restartQueueFlag) {
@@ -1921,6 +2536,8 @@ DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
 
 // MARK: - Config File Poll (daemon keepalive)
 
+_ = prunePlaybackLog()
+
 var configMissCount = 0
 var configCheckCounter = 0  // Only check config every 6th tick (6 * 0.3s ≈ 2s)
 
@@ -1932,6 +2549,8 @@ let timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
             processQueue()
         }
     }
+
+    handlePlaybackLogCommandIfNeeded()
 
     configCheckCounter += 1
     guard configCheckCounter >= 6 else { return }

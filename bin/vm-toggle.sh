@@ -31,6 +31,7 @@ MBP_TTS_BRIDGE="/Users/christopherdemartino/.claude-tts/bin/tts-bridge.sh"
 SSH_OPTS=(-o ConnectTimeout=5 -o BatchMode=yes)
 
 LOCAL_SKIP_LISTENER_SRC="$PLUGIN_DIR/cmd/skip-listener/main.swift"
+LOCAL_SPEAK_TEXT_SRC="$PLUGIN_DIR/cmd/speak-text/main.go"
 LOCAL_SKIP_LISTENER_BUILD="$PLUGIN_BIN/build-skip-listener-app.sh"
 LOCAL_SKIP_LISTENER_INSTALL="$PLUGIN_BIN/install-skip-listener-launchagent.sh"
 LOCAL_SKIP_LISTENER_RESTART="$PLUGIN_BIN/restart-skip-listener-launchagent.sh"
@@ -40,6 +41,8 @@ DEFAULTS="voice=on
 mic=off
 speed=300
 volume=normal
+engine=say
+openai_voice=nova
 summary=on
 code=silent
 cue=off
@@ -134,6 +137,7 @@ kill_remote_tts_bridge() {
 }
 
 start_remote_tts_bridge() {
+    kill_remote_tts_bridge >/dev/null 2>&1 || true
     ssh_mbp "
         nohup '$MBP_TTS_BRIDGE' mac-mini-ts </dev/null >/tmp/claude-tts-bridge.log 2>&1 &
     "
@@ -166,6 +170,8 @@ status=0
 if [ -n \"$signer\" ]; then
     export SKIP_LISTENER_CODESIGN_IDENTITY=\"$signer\"
 fi
+cd '$MBP_PLUGIN_ROOT' >/dev/null 2>&1
+go build -o '$MBP_PLUGIN_ROOT/bin/speak-text' ./cmd/speak-text >> \"\$LOG\" 2>&1 || status=\$?
 '$MBP_SKIP_LISTENER_BUILD' >> \"\$LOG\" 2>&1 || status=\$?
 if [ \"\$status\" -eq 0 ]; then
     '$MBP_SKIP_LISTENER_INSTALL' >> \"\$LOG\" 2>&1 || status=\$?
@@ -209,6 +215,7 @@ wait_for_remote_gui_rebuild() {
 rebuild_remote_skip_listener() {
     local required_files=(
         "$LOCAL_SKIP_LISTENER_SRC"
+        "$LOCAL_SPEAK_TEXT_SRC"
         "$LOCAL_SKIP_LISTENER_BUILD"
         "$LOCAL_SKIP_LISTENER_INSTALL"
         "$LOCAL_SKIP_LISTENER_RESTART"
@@ -225,9 +232,10 @@ rebuild_remote_skip_listener() {
     done
 
     echo "Syncing skip-listener sources to $MBP_HOST..."
-    ssh_mbp "mkdir -p '$MBP_PLUGIN_ROOT/bin' '$MBP_PLUGIN_ROOT/cmd/skip-listener'" || return 1
+    ssh_mbp "mkdir -p '$MBP_PLUGIN_ROOT/bin' '$MBP_PLUGIN_ROOT/cmd/skip-listener' '$MBP_PLUGIN_ROOT/cmd/speak-text'" || return 1
 
     scp_mbp "$LOCAL_SKIP_LISTENER_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/main.swift" || return 1
+    scp_mbp "$LOCAL_SPEAK_TEXT_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/speak-text/main.go" || return 1
     scp_mbp "$LOCAL_SKIP_LISTENER_BUILD" "$MBP_HOST:$MBP_SKIP_LISTENER_BUILD" || return 1
     scp_mbp "$LOCAL_SKIP_LISTENER_INSTALL" "$MBP_HOST:$MBP_SKIP_LISTENER_INSTALL" || return 1
     scp_mbp "$LOCAL_SKIP_LISTENER_RESTART" "$MBP_HOST:$MBP_SKIP_LISTENER_RESTART" || return 1
@@ -238,6 +246,8 @@ rebuild_remote_skip_listener() {
 
     if ssh_mbp "
         chmod +x '$MBP_SKIP_LISTENER_BUILD' '$MBP_SKIP_LISTENER_INSTALL' '$MBP_SKIP_LISTENER_RESTART' '$MBP_TTS_BRIDGE' && \
+        cd '$MBP_PLUGIN_ROOT' && go build -o '$MBP_PLUGIN_ROOT/bin/speak-text' ./cmd/speak-text && \
+        chmod +x '$MBP_PLUGIN_ROOT/bin/speak-text' && \
         '$MBP_SKIP_LISTENER_BUILD' && \
         '$MBP_SKIP_LISTENER_INSTALL' && \
         nohup '$MBP_TTS_BRIDGE' mac-mini-ts </dev/null >/tmp/claude-tts-bridge.log 2>&1 &
@@ -344,6 +354,33 @@ handle_speed_command() {
     esac
 }
 
+current_engine() {
+    local engine
+    engine="$(read_config "engine")"
+    case "$engine" in
+        openai) printf '%s\n' "openai" ;;
+        *) printf '%s\n' "say" ;;
+    esac
+}
+
+handle_engine_command() {
+    local action="${1:-status}"
+
+    case "$action" in
+        status)
+            echo "Engine: $(current_engine)"
+            ;;
+        say|openai)
+            update_toggle "engine" "$action"
+            echo "Engine: $action"
+            ;;
+        *)
+            echo "Usage: /vm engine [status|say|openai]" >&2
+            return 1
+            ;;
+    esac
+}
+
 arm_voice_session_claim() {
     : > "$CLAIM_NEXT_SESSION_FILE"
     rm -f "$ACTIVE_SESSION_ID_FILE" "$ACTIVE_TRANSCRIPT_PATH_FILE" "$ACTIVE_SOURCE_LABEL_FILE"
@@ -366,6 +403,7 @@ clear_voice_runtime_buffers() {
     rm -f /tmp/claude-tts-last-text /tmp/claude-tts-last-speed /tmp/claude-tts-last-volume
     rm -f /tmp/claude-tts-last-source /tmp/claude-tts-last-session
     rm -f /tmp/claude-tts-transcript-path /tmp/claude-tts-repeat-anchor /tmp/claude-tts-active-segment
+    rm -f /tmp/claude-tts-log-command
 
     ssh -o ConnectTimeout=3 -o BatchMode=yes "$MBP_HOST" "
         pkill say 2>/dev/null || true
@@ -374,6 +412,7 @@ clear_voice_runtime_buffers() {
         rm -f /tmp/claude-tts-last-text /tmp/claude-tts-last-speed /tmp/claude-tts-last-volume
         rm -f '$LAST_SOURCE_FILE' '$LAST_SESSION_FILE'
         rm -f /tmp/claude-tts-transcript-path /tmp/claude-tts-repeat-anchor /tmp/claude-tts-active-segment
+        rm -f /tmp/claude-tts-log-command
         history_dir=\$(cat /tmp/claude-tts-history-dir 2>/dev/null || true)
         if [ -n \"\$history_dir\" ]; then
             rm -rf \"\$history_dir\"
@@ -488,6 +527,7 @@ run_doctor() {
     local launch_snapshot=""
     local skip_lines=""
     local bridge_lines=""
+    local bridge_count=0
     local doctor_output=""
     local doctor_status=0
     local err_health=""
@@ -507,6 +547,9 @@ run_doctor() {
     launch_snapshot="$(ssh_mbp "launchctl print gui/\$(id -u)/com.elle.skip-listener 2>/dev/null | egrep 'state =|pid =|runs =|forks =|path = ' || true")"
     skip_lines="$(ssh_mbp "ps -axo pid=,comm=,args= | awk 'index(\$0, \"$MBP_SKIP_LISTENER\") && \$2 != \"zsh\" && \$2 != \"sshd\" && \$2 != \"awk\" {print}'")"
     bridge_lines="$(ssh_mbp "ps -axo pid=,comm=,args= | awk 'index(\$0, \"$MBP_TTS_BRIDGE mac-mini-ts\") && (\$2 == \"login\" || \$2 == \"/bin/bash\" || \$2 == \"bash\") {print}'")"
+    if [ -n "$bridge_lines" ]; then
+        bridge_count=$(printf '%s\n' "$bridge_lines" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+    fi
     doctor_output="$(ssh_mbp "'$MBP_SKIP_LISTENER' --doctor" 2>&1)"
     doctor_status=$?
 
@@ -520,6 +563,7 @@ run_doctor() {
         fi
         [ -z "$skip_lines" ] && overall=1
         [ -z "$bridge_lines" ] && overall=1
+        [ "${bridge_count:-0}" -ne 1 ] && overall=1
     fi
 
     err_health="$(ssh_mbp "grep -aiE 'Accessibility|Input Monitoring|Event tap|denied|fatal|error' /tmp/elle-skip-listener.err 2>/dev/null | tail -n 5 || true")"
@@ -566,7 +610,7 @@ run_doctor() {
         echo "  skip-listener: <not running>"
     fi
     if [ -n "$bridge_lines" ]; then
-        echo "  tts-bridge:"
+        echo "  tts-bridge (count=${bridge_count:-0}):"
         while IFS= read -r line; do
             [ -n "$line" ] && echo "    $line"
         done <<< "$bridge_lines"
@@ -632,6 +676,43 @@ remote_stop_all() {
             cat \"\$hist_dir/total\" > /tmp/claude-tts-repeat-anchor
         fi
 
+        python3 - <<'PY'
+import json
+import os
+
+manifest = '/tmp/claude-tts-playback-log/manifest.jsonl'
+focus_file = '/tmp/claude-tts-focused-session-id'
+current_file = '/tmp/claude-tts-current-item-id'
+
+def read_text(path):
+    try:
+        return open(path, 'r', encoding='utf-8').read().strip()
+    except FileNotFoundError:
+        return ''
+
+items = []
+if os.path.exists(manifest):
+    with open(manifest, 'r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+focus_session = read_text(focus_file)
+if focus_session:
+    filtered = [item for item in items if (item.get('sessionID') or '').strip() == focus_session]
+else:
+    filtered = items
+latest = filtered[-1] if filtered else None
+if latest:
+    with open(current_file, 'w', encoding='utf-8') as fh:
+        fh.write(latest.get('id', ''))
+PY
+
         pkill -f read-file.sh 2>/dev/null || true
         pkill say 2>/dev/null || true
         pkill afplay 2>/dev/null || true
@@ -691,6 +772,62 @@ remote_seek() {
     "
 }
 
+remote_log_command() {
+    local action="$1"
+    ssh_mbp "printf '%s\n' '$action' > /tmp/claude-tts-log-command"
+}
+
+remote_log_status() {
+    ssh_mbp "python3 - <<'PY'
+import json
+import os
+
+manifest = '/tmp/claude-tts-playback-log/manifest.jsonl'
+focus_file = '/tmp/claude-tts-focused-session-id'
+current_file = '/tmp/claude-tts-current-item-id'
+
+def read_text(path):
+    try:
+        return open(path, 'r', encoding='utf-8').read().strip()
+    except FileNotFoundError:
+        return ''
+
+items = []
+if os.path.exists(manifest):
+    with open(manifest, 'r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+focus_session = read_text(focus_file)
+filtered = [item for item in items if item.get('sessionID') == focus_session] if focus_session else list(items)
+current_item_id = read_text(current_file)
+current_item = next((item for item in filtered if item.get('id') == current_item_id), None)
+latest_item = filtered[-1] if filtered else None
+
+def preview(item):
+    if not item:
+        return ''
+    path = item.get('normalizedTextPath', '')
+    text = read_text(path)[:80]
+    source = (item.get('sourceLabel') or '').strip()
+    return f'[{source}] {text}' if source else text
+
+print(f'total_count={len(items)}')
+print(f'filtered_count={len(filtered)}')
+print(f'focus_session={focus_session}')
+print(f'current_item_id={current_item_id}')
+print(f'current_preview={preview(current_item)}')
+print(f'latest_item_id={(latest_item or {}).get(\"id\", \"\")}')
+print(f'latest_preview={preview(latest_item)}')
+PY"
+}
+
 clear_remote_focus() {
     ssh_mbp "
         rm -f '$FOCUSED_SESSION_ID_FILE' '$FOCUSED_SOURCE_LABEL_FILE' '$RESTART_QUEUE_FLAG'
@@ -704,6 +841,8 @@ remote_focus_status() {
         focus_source=\$(cat '$FOCUSED_SOURCE_LABEL_FILE' 2>/dev/null)
         current_session=\$(cat '$LAST_SESSION_FILE' 2>/dev/null | tr -d '[:space:]')
         match_count=0
+        log_match_count=0
+        current_item_id=\$(cat /tmp/claude-tts-current-item-id 2>/dev/null | tr -d '[:space:]')
 
         if [ -n \"\$focus_session\" ]; then
             for entry in /tmp/claude-tts-queue/entry-*; do
@@ -711,12 +850,37 @@ remote_focus_status() {
                 entry_session=\$(cat \"\$entry/session\" 2>/dev/null | tr -d '[:space:]')
                 [ \"\$entry_session\" = \"\$focus_session\" ] && match_count=\$((match_count + 1))
             done
+
+            log_match_count=\$(python3 - <<'PY'
+import json
+import os
+
+manifest = '/tmp/claude-tts-playback-log/manifest.jsonl'
+focus_session = os.popen(\"cat '$FOCUSED_SESSION_ID_FILE' 2>/dev/null\").read().strip()
+count = 0
+if focus_session and os.path.exists(manifest):
+    with open(manifest, 'r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (item.get('sessionID') or '').strip() == focus_session:
+                count += 1
+print(count)
+PY
+)
         fi
 
         printf 'focus_session=%s\n' \"\$focus_session\"
         printf 'focus_source=%s\n' \"\$focus_source\"
         printf 'match_count=%s\n' \"\$match_count\"
+        printf 'log_match_count=%s\n' \"\$log_match_count\"
         printf 'current_session=%s\n' \"\$current_session\"
+        printf 'current_item_id=%s\n' \"\$current_item_id\"
         if [ -f /tmp/claude-tts-playing ]; then
             printf 'playing=1\n'
         else
@@ -741,6 +905,7 @@ remote_focus_session() {
         paused=0
         [ -f /tmp/claude-tts-pause ] && paused=1
         match_count=0
+        log_match_count=0
 
         printf '%s\n' \"\$session_id\" > '$FOCUSED_SESSION_ID_FILE'
         if [ -n \"\$source_label\" ]; then
@@ -755,62 +920,109 @@ remote_focus_session() {
             [ \"\$entry_session\" = \"\$session_id\" ] && match_count=\$((match_count + 1))
         done
 
+        log_match_count=\$(python3 - <<'PY'
+import json
+import os
+
+manifest = '/tmp/claude-tts-playback-log/manifest.jsonl'
+session_id = os.popen(\"cat '$FOCUSED_SESSION_ID_FILE' 2>/dev/null\").read().strip()
+count = 0
+if session_id and os.path.exists(manifest):
+    with open(manifest, 'r', encoding='utf-8') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (item.get('sessionID') or '').strip() == session_id:
+                count += 1
+print(count)
+PY
+)
+
         restarted=0
+        replayed=0
         if [ \"\$paused\" -eq 0 ] && [ \"\$match_count\" -gt 0 ] && [ -f /tmp/claude-tts-playing ] && [ \"\$current_session\" != \"\$session_id\" ]; then
             : > '$RESTART_QUEUE_FLAG'
             pkill say 2>/dev/null || true
             pkill afplay 2>/dev/null || true
             pkill -f whisper-stream 2>/dev/null || true
             restarted=1
+        elif [ \"\$paused\" -eq 0 ] && [ \"\$match_count\" -eq 0 ] && [ \"\$log_match_count\" -gt 0 ]; then
+            printf 'latest\n' > /tmp/claude-tts-log-command
+            replayed=1
         fi
 
         printf 'focus_session=%s\n' \"\$session_id\"
         printf 'focus_source=%s\n' \"\$source_label\"
         printf 'match_count=%s\n' \"\$match_count\"
+        printf 'log_match_count=%s\n' \"\$log_match_count\"
         printf 'current_session=%s\n' \"\$current_session\"
         printf 'paused=%s\n' \"\$paused\"
         printf 'restarted=%s\n' \"\$restarted\"
+        printf 'replayed=%s\n' \"\$replayed\"
     "
 }
 
 do_repeat() {
-    ssh_mbp "
-        history_dir_file=/tmp/claude-tts-history-dir
-        anchor_file=/tmp/claude-tts-repeat-anchor
-        text_file=/tmp/claude-tts-last-text
-        speed_file=/tmp/claude-tts-last-speed
-        vol_file=/tmp/claude-tts-last-volume
+    remote_log_command "replay"
+}
 
-        hist_dir=\$(cat \"\$history_dir_file\" 2>/dev/null || true)
-        anchor=\$(cat \"\$anchor_file\" 2>/dev/null | tr -d '[:space:]')
-        if [ -n \"\$hist_dir\" ] && [ -n \"\$anchor\" ]; then
-            padded=\$(printf '%03d' \"\$anchor\" 2>/dev/null || true)
-            if [ -f \"\$hist_dir/msg-\$padded.txt\" ]; then
-                text_file=\"\$hist_dir/msg-\$padded.txt\"
-                speed_file=\"\$hist_dir/msg-\$padded.speed\"
-                vol_file=\"\$hist_dir/msg-\$padded.volume\"
+handle_log_command() {
+    local action="${1:-status}"
+    local log_status filtered_count total_count focus_session current_preview latest_preview
+
+    case "$action" in
+        status)
+            log_status="$(remote_log_status)" || return 1
+            total_count="$(parse_focus_field "$log_status" "total_count")"
+            filtered_count="$(parse_focus_field "$log_status" "filtered_count")"
+            focus_session="$(parse_focus_field "$log_status" "focus_session")"
+            current_preview="$(parse_focus_field "$log_status" "current_preview")"
+            latest_preview="$(parse_focus_field "$log_status" "latest_preview")"
+
+            if [ "${filtered_count:-0}" -eq 0 ] 2>/dev/null; then
+                if [ "${total_count:-0}" -eq 0 ] 2>/dev/null; then
+                    echo "Playback log: empty"
+                elif [ -n "$focus_session" ]; then
+                    echo "Playback log: no items for focused session"
+                    echo "  focus_session=$focus_session"
+                    echo "  total_items=${total_count:-0}"
+                else
+                    echo "Playback log: empty"
+                fi
+                return 0
             fi
-        fi
 
-        if [ ! -f \"\$text_file\" ]; then
-            echo 'Nothing to repeat — no previous TTS response saved.'
-            exit 1
-        fi
-
-        speed=\$(cat \"\$speed_file\" 2>/dev/null || echo '300')
-        volume=\$(cat \"\$vol_file\" 2>/dev/null || echo '1.0')
-        tmpfile=\"/tmp/claude-tts-repeat-\$\$.aiff\"
-
-        echo \"Repeating saved response (speed=\$speed, volume=\$volume)...\"
-        pkill say 2>/dev/null || true
-        pkill afplay 2>/dev/null || true
-        say -r \"\$speed\" -o \"\$tmpfile\" < \"\$text_file\" 2>/dev/null
-        if [ -f \"\$tmpfile\" ]; then
-            afplay --volume \"\$volume\" \"\$tmpfile\" 2>/dev/null
-            rm -f \"\$tmpfile\"
-        fi
-        echo 'Done.'
-    "
+            echo "Playback log: ${filtered_count} item(s)"
+            [ -n "$focus_session" ] && echo "  focus_session=$focus_session"
+            [ -n "$current_preview" ] && echo "  current=$current_preview"
+            [ -n "$latest_preview" ] && echo "  latest=$latest_preview"
+            ;;
+        back|prev)
+            remote_log_command "back" || return 1
+            echo "Playback log back requested on the MBP."
+            ;;
+        next)
+            remote_log_command "next" || return 1
+            echo "Playback log next requested on the MBP."
+            ;;
+        replay|repeat)
+            remote_log_command "replay" || return 1
+            echo "Playback log replay requested on the MBP."
+            ;;
+        latest)
+            remote_log_command "latest" || return 1
+            echo "Playback log latest requested on the MBP."
+            ;;
+        *)
+            echo "Usage: /vm log [status|back|next|replay|latest]" >&2
+            return 1
+            ;;
+    esac
 }
 
 case "${1:-status}" in
@@ -896,7 +1108,8 @@ case "${1:-status}" in
         fi
         ;;
     repeat)
-        do_repeat
+        do_repeat || exit 1
+        echo "Playback log replay requested on the MBP."
         ;;
     skip)
         remote_skip || exit 1
@@ -934,7 +1147,9 @@ case "${1:-status}" in
                 focus_session="$(parse_focus_field "$focus_status" "focus_session")"
                 focus_source="$(parse_focus_field "$focus_status" "focus_source")"
                 match_count="$(parse_focus_field "$focus_status" "match_count")"
+                log_match_count="$(parse_focus_field "$focus_status" "log_match_count")"
                 current_session="$(parse_focus_field "$focus_status" "current_session")"
+                current_item_id="$(parse_focus_field "$focus_status" "current_item_id")"
                 playing="$(parse_focus_field "$focus_status" "playing")"
 
                 if [ -z "$focus_session" ]; then
@@ -945,6 +1160,7 @@ case "${1:-status}" in
                 echo "Focused playback: ${focus_source:-Session}"
                 echo "  session_id=$focus_session"
                 echo "  queued_matches=${match_count:-0}"
+                echo "  log_matches=${log_match_count:-0}"
                 echo "  playback_active=$([ "${playing:-0}" = "1" ] && echo yes || echo no)"
                 if [ -n "$current_session" ]; then
                     if [ "${playing:-0}" = "1" ]; then
@@ -953,6 +1169,7 @@ case "${1:-status}" in
                         echo "  last_playback_session=$current_session"
                     fi
                 fi
+                [ -n "$current_item_id" ] && echo "  current_log_item=$current_item_id"
                 ;;
             *)
                 focus_session="$2"
@@ -969,12 +1186,16 @@ case "${1:-status}" in
                 set_local_focus "$focus_session" "$focus_source"
                 focus_result="$(remote_focus_session "$focus_session" "$focus_source")" || exit 1
                 match_count="$(parse_focus_field "$focus_result" "match_count")"
+                log_match_count="$(parse_focus_field "$focus_result" "log_match_count")"
                 current_session="$(parse_focus_field "$focus_result" "current_session")"
                 paused="$(parse_focus_field "$focus_result" "paused")"
                 restarted="$(parse_focus_field "$focus_result" "restarted")"
+                replayed="$(parse_focus_field "$focus_result" "replayed")"
 
                 if [ "${restarted:-0}" = "1" ]; then
                     echo "Focused playback on ${focus_source:-this} session — jumped ahead to queued audio from this thread."
+                elif [ "${replayed:-0}" = "1" ]; then
+                    echo "Focused playback on ${focus_source:-this} session — replaying the newest logged item from this thread now."
                 elif [ "${match_count:-0}" -gt 0 ] 2>/dev/null; then
                     if [ "${paused:-0}" = "1" ]; then
                         echo "Focused playback armed for ${focus_source:-this} session — ${match_count} queued item(s) match, and they will take priority after resume."
@@ -983,14 +1204,26 @@ case "${1:-status}" in
                     else
                         echo "Focused playback armed for ${focus_source:-this} session — ${match_count} queued item(s) will play next."
                     fi
+                elif [ "${log_match_count:-0}" -gt 0 ] 2>/dev/null; then
+                    if [ "${paused:-0}" = "1" ]; then
+                        echo "Focused playback armed for ${focus_source:-this} session — ${log_match_count} logged item(s) match and the newest one will replay after resume."
+                    else
+                        echo "Focused playback on ${focus_source:-this} session — the newest logged item is ready."
+                    fi
                 else
                     echo "Focused playback armed for ${focus_source:-this} session — no queued audio from this thread yet, but new replies will jump the line."
                 fi
                 ;;
         esac
         ;;
+    log)
+        handle_log_command "$2" || exit 1
+        ;;
     speed)
         handle_speed_command "$2" || exit 1
+        ;;
+    engine)
+        handle_engine_command "$2" || exit 1
         ;;
     rebuild)
         rebuild_remote_skip_listener || exit 1
@@ -1032,6 +1265,6 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|speed|status|doctor|voice|mic|cue|subtitle|summary]"
+        echo "Usage: /vm [on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|cue|subtitle|summary]"
         ;;
 esac

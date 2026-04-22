@@ -9,23 +9,41 @@ import (
 	"github.com/ybouhjira/claude-code-tts/internal/tts"
 )
 
+func writeOutputFile(path string, audioData []byte) error {
+	return os.WriteFile(path, audioData, 0o644)
+}
+
+func validateCLIOptions(output string, noPlay bool) error {
+	if output == "" && noPlay {
+		return fmt.Errorf("-no-play requires -output")
+	}
+	return nil
+}
+
 func main() {
 	// Parse flags
 	voice := flag.String("voice", "nova", "Voice to use (alloy, echo, fable, onyx, nova, shimmer)")
+	output := flag.String("output", "", "Optional output file path for synthesized audio")
+	noPlay := flag.Bool("no-play", false, "Synthesize audio without playing it")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] TEXT\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Converts text to speech using OpenAI TTS API and plays it.\n\n")
+		fmt.Fprintf(os.Stderr, "Converts text to speech using OpenAI TTS API.\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExample:\n")
 		fmt.Fprintf(os.Stderr, "  %s \"Build completed\"\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -voice onyx \"Error occurred\"\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -output /tmp/out.mp3 -no-play \"Saved to file\"\n", os.Args[0])
 	}
 	flag.Parse()
 
 	// Check for text argument
 	if flag.NArg() == 0 {
 		flag.Usage()
+		os.Exit(1)
+	}
+	if err := validateCLIOptions(*output, *noPlay); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -58,6 +76,17 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error synthesizing speech: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *output != "" {
+		if err := writeOutputFile(*output, audioData); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing audio file: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if *noPlay {
+		return
 	}
 
 	// Play audio
