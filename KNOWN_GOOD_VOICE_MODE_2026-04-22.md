@@ -11,12 +11,12 @@ This note marks the working voice-mode baseline after the April 22, 2026 trust a
 
 ## Behavioral Contract
 
-- `opt + arrow left/right` moves one spoken sentence at a time during normal playback.
+- `opt + arrow left/right` moves one spoken sentence at a time during normal playback, and while idle it moves backward or forward through playback-log items.
 - `opt + opt` pauses and resumes in place.
 - `shift + shift` stops all playback, clears queued audio, and resets repeat back to the newest saved message.
-- `cmd + shift` repeats from the current repeat anchor.
+- `cmd + shift` repeats from the current repeat anchor while playback is active or paused, and while idle it replays the newest playback-log item first before falling back to saved repeat context.
 - `opt + shift + arrow` message nav uses MBP session history first and only falls back to transcript parsing if that history is missing.
-- `/vm stop` and `/vm repeat` mirror the same repeat-anchor semantics as the keyboard controls.
+- `/vm stop` still resets repeat back to the newest saved history entry, while idle keyboard replay now prefers the playback log.
 - `/vm doctor` is the quick preflight for signer, trust, LaunchAgent, listener, and bridge health.
 - Default `code=silent` speech does not read code literally. It summarizes implementation references into short phrases such as `python code - test transform for speech`, `skip listener implementation`, or `configuration`.
 - Numeric inline references such as `#248`, `#537`, or short hashes like `cdb55310` stay preserved in normalized speech instead of collapsing to placeholder narration.
