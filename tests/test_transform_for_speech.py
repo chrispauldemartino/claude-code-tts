@@ -15,7 +15,7 @@ class TransformForSpeechTest(unittest.TestCase):
     def setUp(self):
         self.config_path = pathlib.Path("/tmp/claude-voice-config")
         self.original_config = self.config_path.read_text(encoding="utf-8") if self.config_path.exists() else None
-        self.config_path.write_text("summary=on\n", encoding="utf-8")
+        self.write_config()
         MODULE.clear_cache()
 
     def tearDown(self):
@@ -28,20 +28,56 @@ class TransformForSpeechTest(unittest.TestCase):
         else:
             self.config_path.write_text(self.original_config, encoding="utf-8")
 
-    def render(self, text: str) -> str:
+    def write_config(self, *, summary: str = "on", code: str = "silent") -> None:
+        self.config_path.write_text(f"summary={summary}\ncode={code}\n", encoding="utf-8")
+
+    def render(self, text: str, *, summary: str = "on", code: str = "silent") -> str:
+        self.write_config(summary=summary, code=code)
         return MODULE.final_polish(MODULE.process_input(text))
 
     def test_paths_and_filenames(self):
-        output = self.render("See `cmd/skip-listener/main.swift` and config.json.")
+        output = self.render("See `cmd/skip-listener/main.swift` and config.json.", code="narrate")
         self.assertIn("cmd slash skip listener slash main swift file", output)
         self.assertIn("config json file", output)
 
     def test_flags_env_vars_and_versions(self):
-        output = self.render("Run --dry-run with $OPENAI_API_KEY on v2.5.1 at 12:30.")
+        output = self.render("Run --dry-run with $OPENAI_API_KEY on v2.5.1 at 12:30.", code="narrate")
         self.assertIn("dash dash dry run", output)
         self.assertIn("OPENAI API KEY environment variable", output)
         self.assertIn("version 2 dot 5 dot 1", output)
         self.assertIn("12 30", output)
+
+    def test_code_silent_hides_non_doc_file_references(self):
+        output = self.render("See `cmd/skip-listener/main.swift` and config.json.")
+        self.assertIn("file skip listener", output)
+        self.assertIn("file config", output)
+        self.assertNotIn("cmd slash skip listener slash main swift file", output)
+        self.assertNotIn("config json file", output)
+
+    def test_code_silent_keeps_internal_doc_names(self):
+        output = self.render(
+            "Review `docs/plans/active/ELLE_VM_Codex_Integration_Plan.md` and ELLE_Skip_Listener_App_Bundle_Plan.md."
+        )
+        self.assertIn("El Lee VM Codex Integration Plan markdown file", output)
+        self.assertIn("El Lee Skip Listener App Bundle Plan markdown file", output)
+        self.assertNotIn("docs slash plans slash active", output)
+
+    def test_code_silent_summarizes_inline_commands(self):
+        output = self.render("Run `python3 /Users/demo/.claude/plugins/claude-code-tts/tests/test_transform_for_speech.py`.")
+        self.assertIn("python code - test transform for speech", output)
+        self.assertNotIn("Users slash demo", output)
+
+    def test_code_silent_summarizes_fenced_code_blocks(self):
+        output = self.render("```swift\nlet x = 1\n```")
+        self.assertIn("swift code on screen.", output)
+
+    def test_code_silent_summarizes_single_command_blocks(self):
+        output = self.render("```bash\npython3 /Users/demo/.claude/plugins/claude-code-tts/tests/test_transform_for_speech.py\n```")
+        self.assertIn("python code - test transform for speech", output)
+
+    def test_pronounces_elle_in_plain_text(self):
+        output = self.render("ELLE should stay consistent in voice mode.")
+        self.assertIn("El Lee should stay consistent in voice mode.", output)
 
     def test_urls_and_emails(self):
         output = self.render("Docs: https://github.com/openai/openai and team@openai.com")
@@ -68,7 +104,8 @@ class TransformForSpeechTest(unittest.TestCase):
         output = self.render(
             "Traceback\n"
             "File \"/tmp/app.py\", line 10, in main\n"
-            "at Runner.execute\n"
+            "at Runner.execute\n",
+            code="narrate",
         )
         self.assertIn("Stack trace with 3 lines", output)
         self.assertIn("tmp slash app python file", output)

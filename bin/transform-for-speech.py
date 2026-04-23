@@ -70,6 +70,26 @@ FILE_EXTENSIONS = {
     "yaml": "yaml",
     "yml": "yaml",
 }
+GENERIC_ENTRYPOINT_STEMS = {"main", "index", "init", "app", "mod", "__init__"}
+COMMAND_LANGUAGE_LABELS = {
+    "python": "python",
+    "python3": "python",
+    "bash": "shell",
+    "sh": "shell",
+    "zsh": "shell",
+    "node": "javascript",
+    "npm": "javascript",
+    "npx": "javascript",
+    "tsx": "typescript",
+    "ts-node": "typescript",
+    "ruby": "ruby",
+    "swift": "swift",
+    "go": "go",
+}
+PRONUNCIATION_OVERRIDES = (
+    (re.compile(r"\bELLE\b"), "El Lee"),
+    (re.compile(r"\bElle\b"), "El Lee"),
+)
 
 
 def ensure_cache_dir() -> None:
@@ -104,15 +124,30 @@ def write_cache(cache_id: str, content: str) -> str:
     return cache_path
 
 
-def is_summary_mode() -> bool:
+def read_config_value(key: str, default: str | None = None) -> str | None:
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
             for line in fh:
-                if line.strip().startswith("summary="):
-                    return line.strip().split("=", 1)[1] == "on"
+                if line.strip().startswith(f"{key}="):
+                    return line.strip().split("=", 1)[1]
     except FileNotFoundError:
         pass
-    return False
+    return default
+
+
+def is_summary_mode() -> bool:
+    return read_config_value("summary", "off") == "on"
+
+
+def is_code_silent() -> bool:
+    return read_config_value("code", "silent") != "narrate"
+
+
+def apply_pronunciation_overrides(text: str) -> str:
+    updated = text
+    for pattern, replacement in PRONUNCIATION_OVERRIDES:
+        updated = pattern.sub(replacement, updated)
+    return updated
 
 
 def split_camel_case(text: str) -> str:
@@ -137,12 +172,119 @@ def humanize_token(text: str) -> str:
     text = text.replace("_", " ")
     text = text.replace("-", " ")
     text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return apply_pronunciation_overrides(text.strip())
 
 
 def humanize_path(text: str) -> str:
     parts = [humanize_token(part) for part in text.split("/") if part]
     return " slash ".join(part for part in parts if part)
+
+
+def strip_reference_suffix(text: str) -> str:
+    cleaned = text.strip().strip("`'\"()[]{}<>")
+    cleaned = re.sub(r":\d+(?::\d+)?$", "", cleaned)
+    cleaned = cleaned.rstrip(".,;:")
+    return cleaned.replace("\\", "/")
+
+
+def is_internal_doc_reference(text: str) -> bool:
+    cleaned = strip_reference_suffix(text)
+    if not cleaned.lower().endswith(".md"):
+        return False
+    normalized = cleaned.lstrip("./")
+    basename = os.path.basename(normalized)
+    return normalized.startswith("docs/") or basename.startswith("ELLE_")
+
+
+def humanize_internal_doc_reference(text: str) -> str:
+    cleaned = strip_reference_suffix(text)
+    basename = os.path.basename(cleaned)
+    return humanize_token(basename)
+
+
+def has_known_file_extension(text: str) -> bool:
+    return bool(re.search(rf"\.({'|'.join(sorted(FILE_EXTENSIONS))})$", text, flags=re.IGNORECASE))
+
+
+def summarize_file_subject(text: str) -> str:
+    cleaned = strip_reference_suffix(text)
+    parts = [part for part in cleaned.split("/") if part]
+    leaf = parts[-1] if parts else cleaned
+    stem = leaf.rsplit(".", 1)[0] if "." in leaf else leaf
+    if stem.lower() in GENERIC_ENTRYPOINT_STEMS and len(parts) >= 2:
+        stem = parts[-2]
+    return humanize_token(stem)
+
+
+def looks_like_command_text(text: str) -> bool:
+    cleaned = strip_reference_suffix(text)
+    if not cleaned or cleaned.startswith("-") or "\n" in cleaned:
+        return False
+    tokens = cleaned.split()
+    if len(tokens) < 2:
+        return False
+    executable = os.path.basename(tokens[0])
+    if executable in COMMAND_LANGUAGE_LABELS:
+        return True
+    if re.fullmatch(r"python\d+(?:\.\d+)?", executable):
+        return True
+    return tokens[0].startswith(("./", "/", "~/"))
+
+
+def summarize_command_text(text: str) -> str:
+    cleaned = strip_reference_suffix(text)
+    tokens = cleaned.split()
+    executable = os.path.basename(tokens[0]) if tokens else ""
+    language = COMMAND_LANGUAGE_LABELS.get(executable, "")
+    if not language and re.fullmatch(r"python\d+(?:\.\d+)?", executable):
+        language = "python"
+
+    target = next(
+        (
+            token
+            for token in reversed(tokens[1:])
+            if "/" in token or has_known_file_extension(strip_reference_suffix(token))
+        ),
+        None,
+    )
+
+    if target:
+        subject = summarize_file_subject(target)
+        if language:
+            return f"{language} code - {subject}"
+        return f"command - {subject}"
+    if language:
+        return f"{language} command"
+    return f"command - {humanize_token(executable or cleaned)}"
+
+
+def summarize_hidden_reference(text: str) -> str:
+    cleaned = strip_reference_suffix(text)
+    if is_internal_doc_reference(cleaned):
+        return humanize_internal_doc_reference(cleaned)
+    if looks_like_command_text(cleaned):
+        return summarize_command_text(cleaned)
+    if "/" in cleaned or has_known_file_extension(cleaned):
+        return f"file {summarize_file_subject(cleaned)}"
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cleaned):
+        return f"code {humanize_token(cleaned)}"
+    return "code on screen"
+
+
+def summarize_code_block(fence_line: str, code_lines: list[str]) -> str:
+    language = fence_line.strip().lstrip("`").strip().split(None, 1)[0] if fence_line.strip().lstrip("`").strip() else ""
+    nonblank = [line.strip() for line in code_lines if line.strip()]
+
+    if len(nonblank) == 1:
+        only_line = nonblank[0]
+        if looks_like_command_text(only_line):
+            return summarize_command_text(only_line)
+        if "/" in only_line or has_known_file_extension(strip_reference_suffix(only_line)):
+            return summarize_hidden_reference(only_line)
+
+    if language and language.lower() not in {"text", "plain", "plaintext"}:
+        return f"{humanize_token(language)} code on screen."
+    return "Code on screen."
 
 
 def normalize_urls(text: str) -> str:
@@ -168,7 +310,10 @@ def normalize_emails(text: str) -> str:
 
 def normalize_paths_and_files(text: str) -> str:
     def path_repl(match: re.Match[str]) -> str:
-        return humanize_path(match.group(0))
+        path = match.group(0)
+        if is_code_silent():
+            return summarize_hidden_reference(path)
+        return humanize_path(path)
 
     text = re.sub(
         r"(?<!https:)(?<!http:)\b[\w.~-]+(?:/[\w.~:-]+)+\b",
@@ -177,7 +322,10 @@ def normalize_paths_and_files(text: str) -> str:
     )
 
     def file_repl(match: re.Match[str]) -> str:
-        return humanize_token(match.group(0))
+        filename = match.group(0)
+        if is_code_silent():
+            return summarize_hidden_reference(filename)
+        return humanize_token(filename)
 
     file_exts = "|".join(sorted(FILE_EXTENSIONS))
     return re.sub(rf"\b[\w.-]+\.({file_exts})\b", file_repl, text, flags=re.IGNORECASE)
@@ -203,7 +351,13 @@ def normalize_numbers_and_times(text: str) -> str:
 
 
 def normalize_inline_code(text: str) -> str:
-    return re.sub(r"`([^`]+)`", lambda m: humanize_token(m.group(1)), text)
+    def repl(match: re.Match[str]) -> str:
+        value = match.group(1)
+        if is_code_silent():
+            return summarize_hidden_reference(value)
+        return humanize_token(value)
+
+    return re.sub(r"`([^`]+)`", repl, text)
 
 
 def normalize_markdown_links(text: str) -> str:
@@ -259,6 +413,8 @@ def transform_diff_block(lines: list[str]) -> str:
 
 
 def normalize_plain_text(text: str) -> str:
+    if is_code_silent() and looks_like_command_text(text.strip()):
+        return apply_pronunciation_overrides(summarize_command_text(text))
     text = normalize_markdown_links(text)
     text = normalize_inline_code(text)
     text = normalize_urls(text)
@@ -271,7 +427,7 @@ def normalize_plain_text(text: str) -> str:
     text = re.sub(r"[_=~]{4,}", " ", text)
     text = split_camel_case(text)
     text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    return apply_pronunciation_overrides(text.strip())
 
 
 def parse_table_row(line: str) -> list[str]:
@@ -434,6 +590,15 @@ def process_input(text: str) -> str:
             i += 1
             continue
         if kind == "fence":
+            if is_code_silent():
+                code_lines = []
+                j = i + 1
+                while j < len(lines) and classify_line(lines[j]) != "fence":
+                    code_lines.append(lines[j])
+                    j += 1
+                output.append(summarize_code_block(line, code_lines))
+                i = j + 1 if j < len(lines) else j
+                continue
             output.append(line)
             i += 1
             continue
@@ -498,7 +663,8 @@ def process_input(text: str) -> str:
             continue
 
         if kind == "command":
-            output.append(f"Command: {normalize_plain_text(line[2:])}.")
+            command_text = summarize_command_text(line[2:]) if is_code_silent() else normalize_plain_text(line[2:])
+            output.append(f"Command: {command_text}.")
             i += 1
             continue
 

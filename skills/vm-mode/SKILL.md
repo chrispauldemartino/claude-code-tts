@@ -68,6 +68,7 @@ When `/tmp/claude-voice-config` exists with `voice=on`, adapt ALL responses:
 - No markdown artifacts. Write in natural language.
 - 2-4 sentences when possible. End with next steps or a question.
 - When `summary=on`: Write full detail on screen, prepend `[SUMMARY: 1-2 sentence spoken version]`.
+- When `code=silent`: Briefly summarize code or implementation references instead of reading them literally. Internal ELLE markdown doc names may still be spoken when useful.
 - When `code=narrate`: Add brief natural language description above code blocks.
 
 ## "Send" Convention
