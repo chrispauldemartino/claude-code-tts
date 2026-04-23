@@ -91,6 +91,16 @@ class TransformForSpeechTest(unittest.TestCase):
         self.assertIn("uses name summary.", output)
         self.assertNotIn("detail", output)
 
+    def test_code_silent_preserves_multiword_inline_phrase(self):
+        output = self.render("The output uses `name summary`.")
+        self.assertIn("uses name summary.", output)
+        self.assertNotIn("implementation detail", output)
+
+    def test_code_silent_preserves_multiword_numeric_phrase(self):
+        output = self.render("The previous output said `19 detail` instead.")
+        self.assertIn("said 19 detail instead.", output)
+        self.assertNotIn("implementation detail", output)
+
     def test_mem_citation_block_is_removed_from_spoken_output(self):
         output = self.render(
             "Fixed in the live VM plugin.\n\n"

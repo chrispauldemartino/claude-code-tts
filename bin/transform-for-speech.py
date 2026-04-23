@@ -399,6 +399,8 @@ def summarize_hidden_reference(text: str) -> str:
         return summarize_file_reference(cleaned)
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cleaned):
         return f"code {humanize_token(cleaned)}"
+    if re.search(r"\s", cleaned) and re.search(r"[A-Za-z0-9]", cleaned):
+        return humanize_token(cleaned)
     return "implementation detail"
 
 
