@@ -374,6 +374,12 @@ def summarize_command_text(text: str) -> str:
 
 def summarize_hidden_reference(text: str) -> str:
     cleaned = strip_reference_suffix(text)
+    if re.fullmatch(r"#\d+", cleaned):
+        return cleaned[1:]
+    if re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
+        return cleaned
+    if re.fullmatch(r"[a-f0-9]{7,40}", cleaned, flags=re.IGNORECASE):
+        return cleaned
     if is_internal_doc_reference(cleaned):
         return humanize_internal_doc_reference(cleaned)
     if looks_like_command_text(cleaned):

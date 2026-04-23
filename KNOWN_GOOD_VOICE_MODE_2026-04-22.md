@@ -19,6 +19,7 @@ This note marks the working voice-mode baseline after the April 22, 2026 trust a
 - `/vm stop` and `/vm repeat` mirror the same repeat-anchor semantics as the keyboard controls.
 - `/vm doctor` is the quick preflight for signer, trust, LaunchAgent, listener, and bridge health.
 - Default `code=silent` speech does not read code literally. It summarizes implementation references into short phrases such as `python code - test transform for speech`, `skip listener implementation`, or `configuration`.
+- Numeric inline references such as `#248`, `#537`, or short hashes like `cdb55310` stay preserved in normalized speech instead of collapsing to placeholder narration.
 - Internal ELLE markdown doc names remain speakable in silent mode, while implementation paths and filenames are shortened instead of being read token by token.
 - `ELLE` is spoken as `El Lee` throughout normalized vm speech output, including prose, doc names, and summarized file references.
 

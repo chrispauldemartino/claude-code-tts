@@ -75,6 +75,12 @@ class TransformForSpeechTest(unittest.TestCase):
         self.assertIn("python code - test transform for speech", output)
         self.assertNotIn("Users slash demo", output)
 
+    def test_code_silent_preserves_numeric_inline_references(self):
+        output = self.render("CI `#537` failed before PR `#248`, while commit `cdb55310` was already under review.")
+        self.assertIn("CI 537 failed before PR 248", output)
+        self.assertIn("commit cdb55310", output)
+        self.assertNotIn("implementation detail", output)
+
     def test_code_silent_summarizes_fenced_code_blocks(self):
         output = self.render("```swift\nlet x = 1\n```")
         self.assertIn("swift snippet that sets x.", output)
