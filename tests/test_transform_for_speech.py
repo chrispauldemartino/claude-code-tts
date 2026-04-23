@@ -49,8 +49,8 @@ class TransformForSpeechTest(unittest.TestCase):
 
     def test_code_silent_hides_non_doc_file_references(self):
         output = self.render("See `cmd/skip-listener/main.swift` and config.json.")
-        self.assertIn("file skip listener", output)
-        self.assertIn("file config", output)
+        self.assertIn("skip listener implementation", output)
+        self.assertIn("configuration", output)
         self.assertNotIn("cmd slash skip listener slash main swift file", output)
         self.assertNotIn("config json file", output)
 
@@ -62,6 +62,14 @@ class TransformForSpeechTest(unittest.TestCase):
         self.assertIn("El Lee Skip Listener App Bundle Plan markdown file", output)
         self.assertNotIn("docs slash plans slash active", output)
 
+    def test_summary_mode_compresses_file_heavy_sentence(self):
+        output = self.render(
+            "I updated ELLE_Skip_Listener_App_Bundle_Plan.md and ELLE_Voice_TTS_Reference.md."
+        )
+        self.assertIn("Updated 2 El Lee markdown docs.", output)
+        self.assertNotIn("Skip Listener App Bundle Plan", output)
+        self.assertNotIn("Voice TTS Reference", output)
+
     def test_code_silent_summarizes_inline_commands(self):
         output = self.render("Run `python3 /Users/demo/.claude/plugins/claude-code-tts/tests/test_transform_for_speech.py`.")
         self.assertIn("python code - test transform for speech", output)
@@ -69,11 +77,25 @@ class TransformForSpeechTest(unittest.TestCase):
 
     def test_code_silent_summarizes_fenced_code_blocks(self):
         output = self.render("```swift\nlet x = 1\n```")
-        self.assertIn("swift code on screen.", output)
+        self.assertIn("swift snippet that sets x.", output)
 
     def test_code_silent_summarizes_single_command_blocks(self):
         output = self.render("```bash\npython3 /Users/demo/.claude/plugins/claude-code-tts/tests/test_transform_for_speech.py\n```")
         self.assertIn("python code - test transform for speech", output)
+
+    def test_code_silent_summarizes_react_like_blocks(self):
+        output = self.render(
+            "```tsx\n"
+            "function Settings() {\n"
+            "  const [searchParams] = useSearchParams()\n"
+            "  useEffect(() => {\n"
+            "    fetchData()\n"
+            "  }, [])\n"
+            "  return <div />\n"
+            "}\n"
+            "```"
+        )
+        self.assertIn("typescript jsx snippet that defines component Settings and uses React hooks.", output)
 
     def test_pronounces_elle_in_plain_text(self):
         output = self.render("ELLE should stay consistent in voice mode.")
@@ -140,6 +162,17 @@ class TransformForSpeechTest(unittest.TestCase):
         index_path = pathlib.Path(MODULE.CACHE_DIR) / "index.txt"
         self.assertTrue(index_path.exists())
         self.assertIn("list-", index_path.read_text(encoding="utf-8"))
+
+    def test_summary_mode_compresses_file_reference_lists(self):
+        output = self.render(
+            "- ELLE_Audit_Summary.md\n"
+            "- ELLE_Voice_TTS_Reference.md\n"
+            "- ELLE_Skip_Listener_App_Bundle_Plan.md\n"
+            "- ELLE_Codex_Claude_Cross_Check_Hooks_Plan.md\n"
+            "- ELLE_Global_Automatic_Continuation_Instructions.md\n"
+        )
+        self.assertIn('5 El Lee markdown docs. Say "read items" for the full list.', output)
+        self.assertNotIn("First three", output)
 
 
 if __name__ == "__main__":

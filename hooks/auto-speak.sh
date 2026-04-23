@@ -443,7 +443,7 @@ strip_markdown() {
     if [ "$code_mode" = "silent" ]; then
         echo "$text" | awk '
             /^```/ {
-                if (in_code) { in_code = 0; print "See code on screen." }
+                if (in_code) { in_code = 0 }
                 else { in_code = 1 }
                 next
             }
@@ -473,6 +473,53 @@ strip_markdown() {
         -e 's/^\* //' \
         -e 's/^[0-9]+\. //' \
         -e '/^[[:space:]]*$/d'
+}
+
+collapse_to_spoken_summary() {
+    python3 - <<'PY'
+import re
+import sys
+
+text = sys.stdin.read().strip()
+if not text:
+    sys.exit(0)
+
+text = text.replace("<<MSG_BREAK>>", " ")
+lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+chunks = []
+for line in lines:
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9 /-]{1,40}:", line):
+        continue
+    parts = re.split(r"(?<=[.!?])\s+", line)
+    for part in parts:
+        part = re.sub(r"\s+", " ", part).strip()
+        if part:
+            chunks.append(part)
+
+if not chunks:
+    chunks = [re.sub(r"\s+", " ", text).strip()]
+
+limit = 280
+summary = []
+for chunk in chunks:
+    candidate = " ".join(summary + [chunk]).strip()
+    if len(candidate) > limit and summary:
+        break
+    if len(candidate) > limit:
+        shortened = chunk[:limit].rsplit(" ", 1)[0].strip()
+        summary = [shortened or chunk[:limit].strip()]
+        break
+    summary.append(chunk)
+    if len(summary) >= 2 and len(candidate) >= 120:
+        break
+
+result = " ".join(summary).strip()
+if not result:
+    result = text[:limit].rsplit(" ", 1)[0].strip() or text[:limit].strip()
+
+print(result, end="")
+PY
 }
 
 speak() {
@@ -838,20 +885,24 @@ if has_config; then
 
         # Extract text to speak
         text_to_queue="$msg"
+        summary_text=""
 
         if [ "$SUMMARY" = "on" ]; then
             summary_text=$(echo "$msg" | sed -n 's/.*\[SUMMARY: \(.*\)\].*/\1/p' | head -1)
             if [ -n "$summary_text" ]; then
                 text_to_queue="$summary_text"
             fi
-            # Summary mode only uses [SUMMARY:] tags when present.
-            # Regular text is always read in full — no truncation.
         fi
 
         # Transform structured data before markdown stripping
         transformed=$(echo "$text_to_queue" | python3 "$PLUGIN_BIN/transform-for-speech.py" 2>/dev/null)
         [ -z "$transformed" ] && transformed="$text_to_queue"
         cleaned=$(strip_markdown "$transformed" "$CODE" | sed 's/<<MSG_BREAK>>//g')
+
+        if [ "$SUMMARY" = "on" ] && [ -z "$summary_text" ] && [ -n "$cleaned" ]; then
+            spoken_summary=$(echo "$cleaned" | collapse_to_spoken_summary)
+            [ -n "$spoken_summary" ] && cleaned="$spoken_summary"
+        fi
 
         if [ -n "$cleaned" ]; then
             if is_vm_status "$cleaned"; then

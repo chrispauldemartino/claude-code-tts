@@ -35,6 +35,7 @@ ORDINALS = [
 ]
 FILE_EXTENSIONS = {
     "aiff": "aiff",
+    "cjs": "javascript",
     "cfg": "config",
     "css": "css",
     "csv": "csv",
@@ -51,6 +52,7 @@ FILE_EXTENSIONS = {
     "lock": "lock",
     "log": "log",
     "md": "markdown",
+    "mjs": "javascript",
     "mp3": "mp3",
     "pdf": "pdf",
     "plist": "plist",
@@ -71,6 +73,8 @@ FILE_EXTENSIONS = {
     "yml": "yaml",
 }
 GENERIC_ENTRYPOINT_STEMS = {"main", "index", "init", "app", "mod", "__init__"}
+CODE_EXTENSIONS = {"cjs", "go", "js", "jsx", "mjs", "py", "rb", "sh", "swift", "ts", "tsx"}
+CONFIG_EXTENSIONS = {"cfg", "env", "ini", "json", "plist", "toml", "yaml", "yml"}
 COMMAND_LANGUAGE_LABELS = {
     "python": "python",
     "python3": "python",
@@ -89,6 +93,10 @@ COMMAND_LANGUAGE_LABELS = {
 PRONUNCIATION_OVERRIDES = (
     (re.compile(r"\bELLE\b"), "El Lee"),
     (re.compile(r"\bElle\b"), "El Lee"),
+)
+PATH_OR_FILE_PATTERN = re.compile(
+    rf"(?<!https:)(?<!http:)\b[\w.~-]+(?:/[\w.~:-]+)+\b|\b[\w.-]+\.({'|'.join(sorted(FILE_EXTENSIONS))})\b",
+    flags=re.IGNORECASE,
 )
 
 
@@ -206,6 +214,81 @@ def has_known_file_extension(text: str) -> bool:
     return bool(re.search(rf"\.({'|'.join(sorted(FILE_EXTENSIONS))})$", text, flags=re.IGNORECASE))
 
 
+def extract_file_like_references(text: str) -> list[str]:
+    seen = set()
+    refs = []
+    for match in PATH_OR_FILE_PATTERN.finditer(text):
+        ref = strip_reference_suffix(match.group(0))
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        refs.append(ref)
+    return refs
+
+
+def classify_reference_group(refs: list[str]) -> str:
+    if not refs:
+        return "repo files"
+
+    extensions = []
+    for ref in refs:
+        cleaned = strip_reference_suffix(ref)
+        leaf = os.path.basename(cleaned)
+        ext = leaf.rsplit(".", 1)[1].lower() if "." in leaf else ""
+        extensions.append(ext)
+
+    nonempty_exts = [ext for ext in extensions if ext]
+    if nonempty_exts and all(ext == "md" for ext in nonempty_exts):
+        if all(os.path.basename(strip_reference_suffix(ref)).startswith("ELLE_") for ref in refs):
+            return "ELLE markdown docs"
+        return "markdown docs"
+    if nonempty_exts and all(ext == "json" for ext in nonempty_exts):
+        return "json artifact files"
+    if nonempty_exts and all(ext in CODE_EXTENSIONS for ext in nonempty_exts):
+        return "code files"
+    if nonempty_exts and len(set(nonempty_exts)) == 1:
+        ext_label = FILE_EXTENSIONS.get(nonempty_exts[0], nonempty_exts[0])
+        return f"{ext_label} files"
+    return "repo files"
+
+
+def choose_reference_action(words: list[str]) -> str | None:
+    word_set = set(words)
+    action_map = (
+        ({"update", "updated", "updates", "edit", "edited", "modify", "modified", "change", "changed", "touch", "touched"}, "Updated"),
+        ({"add", "added", "create", "created", "generate", "generated", "write", "wrote"}, "Added"),
+        ({"remove", "removed", "delete", "deleted"}, "Removed"),
+    )
+    for keywords, label in action_map:
+        if word_set.intersection(keywords):
+            return label
+    return None
+
+
+def maybe_summarize_file_heavy_text(text: str) -> str | None:
+    if not (is_summary_mode() and is_code_silent()):
+        return None
+
+    refs = extract_file_like_references(text)
+    if len(refs) < 2:
+        return None
+
+    masked = text
+    for ref in refs:
+        masked = masked.replace(ref, " ", 1)
+
+    words = re.findall(r"[A-Za-z]+", masked.lower())
+    if len(words) > max(8, len(refs) * 3):
+        return None
+
+    action = choose_reference_action(words)
+    if action is None:
+        return None
+    subject = classify_reference_group(refs)
+    count = len(refs)
+    return f"{action} {count} {subject}."
+
+
 def summarize_file_subject(text: str) -> str:
     cleaned = strip_reference_suffix(text)
     parts = [part for part in cleaned.split("/") if part]
@@ -214,6 +297,37 @@ def summarize_file_subject(text: str) -> str:
     if stem.lower() in GENERIC_ENTRYPOINT_STEMS and len(parts) >= 2:
         stem = parts[-2]
     return humanize_token(stem)
+
+
+def summarize_file_reference(text: str) -> str:
+    cleaned = strip_reference_suffix(text)
+    leaf = os.path.basename(cleaned)
+    ext = leaf.rsplit(".", 1)[1].lower() if "." in leaf else ""
+    subject = summarize_file_subject(cleaned)
+    subject_lower = subject.lower()
+
+    if ext in CONFIG_EXTENSIONS:
+        if subject_lower in {"config", "configuration", "settings", "setting"}:
+            return "configuration"
+        return f"{subject} configuration"
+
+    if ext in CODE_EXTENSIONS:
+        if subject_lower in {"test", "tests"}:
+            return "test implementation"
+        return f"{subject} implementation"
+
+    if ext == "sql":
+        return f"{subject} query"
+    if ext == "log":
+        return f"{subject} log"
+    if ext in {"csv", "txt"}:
+        return f"{subject} data"
+    if ext in {"png", "jpg", "jpeg", "gif", "svg"}:
+        return f"{subject} asset"
+    if ext == "pdf":
+        return f"{subject} document"
+
+    return f"{subject} detail"
 
 
 def looks_like_command_text(text: str) -> bool:
@@ -265,10 +379,127 @@ def summarize_hidden_reference(text: str) -> str:
     if looks_like_command_text(cleaned):
         return summarize_command_text(cleaned)
     if "/" in cleaned or has_known_file_extension(cleaned):
-        return f"file {summarize_file_subject(cleaned)}"
+        return summarize_file_reference(cleaned)
     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cleaned):
         return f"code {humanize_token(cleaned)}"
-    return "code on screen"
+    return "implementation detail"
+
+
+def summarize_language_name(language: str) -> str:
+    cleaned = language.strip().lower()
+    if not cleaned or cleaned in {"text", "plain", "plaintext"}:
+        return ""
+    mapped = FILE_EXTENSIONS.get(cleaned) or COMMAND_LANGUAGE_LABELS.get(cleaned) or cleaned
+    return humanize_token(mapped)
+
+
+def join_readable(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{', '.join(parts[:-1])}, and {parts[-1]}"
+
+
+def detect_code_definitions(lines: list[str]) -> list[tuple[str, str]]:
+    patterns = (
+        (re.compile(r"^\s*(?:export\s+default\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "function"),
+        (re.compile(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "function"),
+        (re.compile(r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "function"),
+        (re.compile(r"^\s*(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)\s*=>"), "function"),
+        (re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "class"),
+        (re.compile(r"^\s*struct\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "struct"),
+        (re.compile(r"^\s*enum\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "enum"),
+        (re.compile(r"^\s*interface\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "interface"),
+        (re.compile(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s*="), "type"),
+        (re.compile(r"^\s*protocol\s+([A-Za-z_][A-Za-z0-9_]*)\b"), "protocol"),
+    )
+
+    definitions: list[tuple[str, str]] = []
+    seen = set()
+    for line in lines:
+        for pattern, kind in patterns:
+            match = pattern.search(line)
+            if not match:
+                continue
+            key = (kind, match.group(1))
+            if key in seen:
+                continue
+            seen.add(key)
+            definitions.append(key)
+            break
+    return definitions
+
+
+def detect_assignment_targets(lines: list[str]) -> list[str]:
+    patterns = (
+        re.compile(r"^\s*(?:const|let|var)\s+\[?([A-Za-z_][A-Za-z0-9_]*)"),
+        re.compile(r"^\s*(?:let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*="),
+        re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*="),
+    )
+
+    targets = []
+    seen = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("return ", "if ", "for ", "while ", "switch ", "case ")):
+            continue
+        for pattern in patterns:
+            match = pattern.search(line)
+            if not match:
+                continue
+            target = match.group(1)
+            if target in seen:
+                continue
+            seen.add(target)
+            targets.append(target)
+            break
+    return targets
+
+
+def is_react_like_block(language: str, text: str) -> bool:
+    lowered = language.strip().lower()
+    if lowered in {"jsx", "tsx"}:
+        return True
+    return any(token in text for token in ("useEffect", "useState", "useReducer", "useRef", "useMemo", "useCallback", "useDeferredValue", "useTransition", "useEffectEvent")) or bool(re.search(r"return\s*<", text))
+
+
+def describe_definitions(definitions: list[tuple[str, str]], *, react_like: bool) -> str:
+    phrases = []
+    for kind, name in definitions[:2]:
+        human_name = humanize_token(name)
+        if kind == "function" and react_like and name[:1].isupper():
+            phrases.append(f"defines component {human_name}")
+        else:
+            phrases.append(f"defines {kind} {human_name}")
+    return join_readable(phrases)
+
+
+def summarize_sql_block(lines: list[str]) -> str | None:
+    text = " ".join(line.strip() for line in lines if line.strip()).lower()
+    if text.startswith("select") and " from " in text:
+        table_match = re.search(r"\bfrom\s+([A-Za-z_][A-Za-z0-9_]*)", text)
+        if table_match:
+            return f"queries {humanize_token(table_match.group(1))}"
+        return "runs a select query"
+    if text.startswith("insert") and " into " in text:
+        table_match = re.search(r"\binto\s+([A-Za-z_][A-Za-z0-9_]*)", text)
+        if table_match:
+            return f"inserts into {humanize_token(table_match.group(1))}"
+        return "runs an insert query"
+    if text.startswith("update "):
+        table_match = re.search(r"\bupdate\s+([A-Za-z_][A-Za-z0-9_]*)", text)
+        if table_match:
+            return f"updates {humanize_token(table_match.group(1))}"
+        return "runs an update query"
+    if text.startswith("delete") and " from " in text:
+        table_match = re.search(r"\bfrom\s+([A-Za-z_][A-Za-z0-9_]*)", text)
+        if table_match:
+            return f"deletes from {humanize_token(table_match.group(1))}"
+        return "runs a delete query"
+    return None
 
 
 def summarize_code_block(fence_line: str, code_lines: list[str]) -> str:
@@ -282,9 +513,39 @@ def summarize_code_block(fence_line: str, code_lines: list[str]) -> str:
         if "/" in only_line or has_known_file_extension(strip_reference_suffix(only_line)):
             return summarize_hidden_reference(only_line)
 
-    if language and language.lower() not in {"text", "plain", "plaintext"}:
-        return f"{humanize_token(language)} code on screen."
-    return "Code on screen."
+    language_label = summarize_language_name(language)
+    text = "\n".join(nonblank)
+    react_like = is_react_like_block(language, text)
+    definitions = detect_code_definitions(nonblank)
+    assignment_targets = detect_assignment_targets(nonblank)
+
+    descriptors = []
+    if definitions:
+        descriptors.append(describe_definitions(definitions, react_like=react_like))
+
+    if react_like and "uses React hooks" not in descriptors:
+        if any(token in text for token in ("useEffect", "useState", "useReducer", "useRef", "useMemo", "useCallback", "useDeferredValue", "useTransition", "useEffectEvent", "useSearchParams")):
+            descriptors.append("uses React hooks")
+        elif bool(re.search(r"return\s*<", text)):
+            descriptors.append("renders UI")
+    elif any(token in text for token in ("fetch(", "axios.", "URLSession", "requests.", "httpx.", "client.get(", "client.post(")):
+        descriptors.append("fetches data")
+    elif any(token in text for token in ("describe(", "test(", "it(", "expect(", "assert ")):
+        descriptors.append("defines tests")
+
+    if language.strip().lower() == "sql":
+        sql_descriptor = summarize_sql_block(nonblank)
+        if sql_descriptor:
+            descriptors = [sql_descriptor]
+
+    if not descriptors and assignment_targets:
+        descriptors.append(f"sets {join_readable([humanize_token(name) for name in assignment_targets[:2]])}")
+
+    prefix = f"{language_label} snippet" if language_label else "Code snippet"
+    if descriptors:
+        return f"{prefix} that {join_readable(descriptors[:2])}."
+    line_count = len(nonblank)
+    return f"{prefix} with {line_count} lines."
 
 
 def normalize_urls(text: str) -> str:
@@ -413,6 +674,9 @@ def transform_diff_block(lines: list[str]) -> str:
 
 
 def normalize_plain_text(text: str) -> str:
+    file_summary = maybe_summarize_file_heavy_text(text)
+    if file_summary is not None:
+        return apply_pronunciation_overrides(file_summary)
     if is_code_silent() and looks_like_command_text(text.strip()):
         return apply_pronunciation_overrides(summarize_command_text(text))
     text = normalize_markdown_links(text)
@@ -524,6 +788,19 @@ def extract_list_item(line: str) -> str | None:
 
 
 def transform_list(items: list[str]) -> str:
+    if is_summary_mode() and is_code_silent():
+        refs = [
+            item
+            for item in items
+            if len(extract_file_like_references(item)) == 1
+            and len(re.findall(r"[A-Za-z]+", PATH_OR_FILE_PATTERN.sub(" ", item))) <= 3
+        ]
+        if len(refs) >= 2 and len(refs) >= max(2, len(items) - 1):
+            subject = classify_reference_group([extract_file_like_references(item)[0] for item in refs])
+            return apply_pronunciation_overrides(
+                f"{len(items)} {subject}. Say \"read items\" for the full list."
+            )
+
     items = [normalize_plain_text(item) for item in items]
     num_items = len(items)
 

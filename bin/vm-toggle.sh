@@ -1259,8 +1259,8 @@ case "${1:-status}" in
         ;;
     summary)
         case "$2" in
-            on)  update_toggle "summary" "on";  echo "Summary mode: on — tables summarized, say 'read rows' for detail"  ;;
-            off) update_toggle "summary" "off"; echo "Summary mode: off — all rows narrated"  ;;
+            on)  update_toggle "summary" "on";  echo "Summary mode: on — spoken highlights enabled, with drill-down for tables and lists"  ;;
+            off) update_toggle "summary" "off"; echo "Summary mode: off — full detail narrated"  ;;
             *)   echo "Usage: /vm summary on|off" ;;
         esac
         ;;
