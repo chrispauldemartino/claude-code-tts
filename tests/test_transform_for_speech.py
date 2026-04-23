@@ -81,6 +81,20 @@ class TransformForSpeechTest(unittest.TestCase):
         self.assertIn("commit cdb55310", output)
         self.assertNotIn("implementation detail", output)
 
+    def test_mem_citation_block_is_removed_from_spoken_output(self):
+        output = self.render(
+            "Fixed in the live VM plugin.\n\n"
+            "<oai-mem-citation>\n"
+            "<citation_entries>\n"
+            "MEMORY.md:39-40|note=[used voice-mode debugging preferences]\n"
+            "</citation_entries>\n"
+            "<rollout_ids>\n"
+            "019db07f-3d04-78a2-be91-2e3225c0487b\n"
+            "</rollout_ids>\n"
+            "</oai-mem-citation>\n"
+        )
+        self.assertEqual(output, "Fixed in the live VM plugin.")
+
     def test_code_silent_summarizes_fenced_code_blocks(self):
         output = self.render("```swift\nlet x = 1\n```")
         self.assertIn("swift snippet that sets x.", output)

@@ -151,6 +151,15 @@ def is_code_silent() -> bool:
     return read_config_value("code", "silent") != "narrate"
 
 
+def strip_nonspoken_metadata(text: str) -> str:
+    text = re.sub(
+        r"(?is)\n?<oai-mem-citation>\s*.*?</oai-mem-citation>\s*",
+        "\n",
+        text,
+    )
+    return text
+
+
 def apply_pronunciation_overrides(text: str) -> str:
     updated = text
     for pattern, replacement in PRONUNCIATION_OVERRIDES:
@@ -856,6 +865,7 @@ def classify_line(line: str) -> str:
 
 
 def process_input(text: str) -> str:
+    text = strip_nonspoken_metadata(text)
     lines = text.splitlines()
     output: list[str] = []
     i = 0
