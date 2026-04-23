@@ -1801,6 +1801,8 @@ func handlePlaybackLogCommandIfNeeded() {
         _ = triggerPlaybackLogAction(direction: "next", status: "nav")
     case "replay":
         _ = triggerPlaybackLogAction(status: "repeat")
+    case "repeat":
+        DispatchQueue.main.async { triggerRepeat() }
     case "latest":
         _ = triggerPlaybackLogAction(useLatest: true, status: "nav")
     default:
