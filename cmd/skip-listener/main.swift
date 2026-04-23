@@ -1378,8 +1378,8 @@ func triggerRepeatShortcut() {
         return
     }
 
-    debugPrint("REPEAT SHORTCUT — idle, trying playback-log replay")
-    if triggerPlaybackLogAction(status: "repeat") {
+    debugPrint("REPEAT SHORTCUT — idle, trying latest playback-log replay")
+    if triggerPlaybackLogAction(useLatest: true, status: "repeat") {
         return
     }
 
@@ -2220,7 +2220,7 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
             }
 
             // opt+arrow: forward/rewind. While speaking, seek within the active playback.
-            // When idle, replay the last message from a new sentence offset.
+            // When idle, move through the playback log instead.
             if hasOption && !hasShift && !hasCommand && !hasControl && (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode) {
                 markOptionComboUse()
                 if keyCode == rightArrowKeyCode {
@@ -2231,8 +2231,10 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
                         usleep(100_000)
                         playChime()
                     } else {
-                        debugPrint("OPT+RIGHT — replay forward 1 sentence from saved message")
-                        DispatchQueue.main.async { triggerSentenceSeek(delta: 1) }
+                        debugPrint("OPT+RIGHT — playback log next")
+                        DispatchQueue.main.async {
+                            _ = triggerPlaybackLogAction(direction: "next", status: "nav")
+                        }
                     }
                 } else {
                     if isTTSPlaying() {
@@ -2242,8 +2244,10 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
                         usleep(100_000)
                         playChime()
                     } else {
-                        debugPrint("OPT+LEFT — replay backward 1 sentence from saved message")
-                        DispatchQueue.main.async { triggerSentenceSeek(delta: -1) }
+                        debugPrint("OPT+LEFT — playback log previous")
+                        DispatchQueue.main.async {
+                            _ = triggerPlaybackLogAction(direction: "prev", status: "nav")
+                        }
                     }
                 }
                 return Unmanaged.passUnretained(event)
