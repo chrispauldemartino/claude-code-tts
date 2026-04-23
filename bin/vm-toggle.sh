@@ -968,7 +968,7 @@ PY
 }
 
 do_repeat() {
-    ssh_mbp "printf 'repeat\n' > /tmp/claude-tts-log-command"
+    remote_log_command "replay"
 }
 
 handle_log_command() {
@@ -1109,7 +1109,7 @@ case "${1:-status}" in
         ;;
     repeat)
         do_repeat || exit 1
-        echo "Repeat requested on the MBP."
+        echo "Playback log replay requested on the MBP."
         ;;
     skip)
         remote_skip || exit 1
