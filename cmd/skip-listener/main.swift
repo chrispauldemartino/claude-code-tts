@@ -1367,14 +1367,25 @@ func triggerRepeat() {
 }
 
 func triggerRepeatShortcut() {
-    if let context = loadReplayContext() {
-        debugPrint("REPEAT SHORTCUT — using repeat context")
-        playContext(context, startIndex: 0, status: "repeat")
+    let hasActiveRepeatContext =
+        FileManager.default.fileExists(atPath: ttsPlayingFlag) ||
+        FileManager.default.fileExists(atPath: pauseFlag) ||
+        state.isPaused
+
+    if hasActiveRepeatContext {
+        debugPrint("REPEAT SHORTCUT — active playback, using repeat context")
+        triggerRepeat()
         return
     }
 
-    debugPrint("REPEAT SHORTCUT — no repeat context, trying latest playback-log item")
-    if triggerPlaybackLogAction(useLatest: true, status: "repeat") {
+    debugPrint("REPEAT SHORTCUT — idle, trying playback-log replay")
+    if triggerPlaybackLogAction(status: "repeat") {
+        return
+    }
+
+    debugPrint("REPEAT SHORTCUT — no playback-log item, falling back to saved repeat context")
+    if let context = loadReplayContext() {
+        playContext(context, startIndex: 0, status: "repeat")
         return
     }
 
