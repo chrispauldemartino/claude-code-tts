@@ -1366,6 +1366,22 @@ func triggerRepeat() {
     playContext(context, startIndex: 0, status: "repeat")
 }
 
+func triggerRepeatShortcut() {
+    if let context = loadReplayContext() {
+        debugPrint("REPEAT SHORTCUT — using repeat context")
+        playContext(context, startIndex: 0, status: "repeat")
+        return
+    }
+
+    debugPrint("REPEAT SHORTCUT — no repeat context, trying latest playback-log item")
+    if triggerPlaybackLogAction(useLatest: true, status: "repeat") {
+        return
+    }
+
+    debugPrint("REPEAT SHORTCUT — no repeat or replay target")
+    playChime()
+}
+
 // Shared text-to-speech function — speaks sentence by sentence with skip/forward/rewind support
 func speakText(
     _ text: String,
@@ -2311,7 +2327,7 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
             state.cmdShiftTriggered = false
             if !state.regularKeyDuringCmdShift {
                 debugPrint("CMD+SHIFT released — triggering repeat")
-                DispatchQueue.main.async { triggerRepeat() }
+                DispatchQueue.main.async { triggerRepeatShortcut() }
             } else {
                 debugPrint("CMD+SHIFT released — ignored (regular key was pressed)")
             }
