@@ -336,7 +336,7 @@ def summarize_file_reference(text: str) -> str:
     if ext == "pdf":
         return f"{subject} document"
 
-    return f"{subject} detail"
+    return subject
 
 
 def looks_like_command_text(text: str) -> bool:
@@ -386,6 +386,8 @@ def summarize_hidden_reference(text: str) -> str:
     if re.fullmatch(r"#\d+", cleaned):
         return cleaned[1:]
     if re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
+        return cleaned
+    if re.fullmatch(r"\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)+", cleaned):
         return cleaned
     if re.fullmatch(r"[a-f0-9]{7,40}", cleaned, flags=re.IGNORECASE):
         return cleaned

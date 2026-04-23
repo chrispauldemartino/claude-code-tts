@@ -81,6 +81,16 @@ class TransformForSpeechTest(unittest.TestCase):
         self.assertIn("commit cdb55310", output)
         self.assertNotIn("implementation detail", output)
 
+    def test_code_silent_preserves_numeric_slash_references(self):
+        output = self.render("Verification: the transformer suite passes `19/19`.")
+        self.assertIn("passes 19/19.", output)
+        self.assertNotIn("detail", output)
+
+    def test_code_silent_uses_name_summary_for_slash_labels(self):
+        output = self.render("The output uses `text/name summary`.")
+        self.assertIn("uses name summary.", output)
+        self.assertNotIn("detail", output)
+
     def test_mem_citation_block_is_removed_from_spoken_output(self):
         output = self.render(
             "Fixed in the live VM plugin.\n\n"
