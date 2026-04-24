@@ -6,6 +6,7 @@ import ApplicationServices
 // - Double-Command tap (cmd+cmd): SKIP — kills audio + mic
 // - Double-Option tap (opt+opt): PAUSE/RESUME — SIGSTOP/SIGCONT
 // - Command+Shift (single tap): REPEAT — replay last TTS response
+// - Function+Function tap (fn+fn): PLAY LOG — continue playback-log timeline
 // - Option+Arrow (keyDown): FORWARD/REWIND — skip ±1 sentence
 // - Option+Shift+Arrow (keyDown): MESSAGE NAV — play prev/next history message
 // - Enter (keyDown): STOP — kills entire voice session
@@ -31,6 +32,7 @@ let leftArrowKeyCode: Int64 = 123
 let rightArrowKeyCode: Int64 = 124
 let downArrowKeyCode: Int64 = 125
 let upArrowKeyCode: Int64 = 126
+let functionKeyCode: Int64 = 63
 let sendingFlag = "/tmp/claude-voice-input-sending"
 let voiceInputStopFlag = "/tmp/claude-voice-input-stop"
 let minSpeechSpeed = 150
@@ -128,6 +130,9 @@ class ControlState {
     // Shift double-tap (stop all)
     var lastShiftUp: Date?
     var shiftIsDown = false
+    // Function double-tap (play next log item)
+    var lastFunctionUp: Date?
+    var functionIsDown = false
     // Command+Shift (repeat)
     var cmdShiftTriggered = false
     // Track if a regular key was pressed while cmd+shift held (prevents false triggers)
@@ -635,6 +640,32 @@ func resetPlaybackLogCursorToLatest() {
     writePlaybackCursor(0)
 }
 
+func playbackLogFirstItem() -> PlaybackLogItem? {
+    let items = focusedPlaybackLogItems()
+    guard let first = items.first else { return nil }
+    writeCurrentPlaybackItemID(first.id)
+    writePlaybackCursor(0)
+    return first
+}
+
+func playbackLogTimelineItem() -> PlaybackLogItem? {
+    let items = focusedPlaybackLogItems()
+    guard !items.isEmpty else { return nil }
+
+    let target: PlaybackLogItem
+    if let currentID = readCurrentPlaybackItemID(),
+       let idx = items.firstIndex(where: { $0.id == currentID }) {
+        let nextIndex = min(idx + 1, items.count - 1)
+        target = items[nextIndex]
+    } else {
+        target = items[0]
+    }
+
+    writeCurrentPlaybackItemID(target.id)
+    writePlaybackCursor(0)
+    return target
+}
+
 func rewritePlaybackTexts(rawText: String, normalizedText: String, item: PlaybackLogItem) {
     writeString(rawText, to: item.rawTextPath)
     writeString(normalizedText, to: item.normalizedTextPath)
@@ -803,6 +834,21 @@ func playbackPreview(_ context: PlaybackContext) -> String {
         return "[\(source)] \(previewBase)"
     }
     return previewBase
+}
+
+func sentenceStartsWithSource(_ sentence: String, source: String) -> Bool {
+    let normalizedSentence = sentence
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    let normalizedSource = source
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+
+    guard !normalizedSource.isEmpty else { return false }
+    return normalizedSentence == normalizedSource ||
+        normalizedSentence.hasPrefix("\(normalizedSource) ") ||
+        normalizedSentence.hasPrefix("\(normalizedSource).") ||
+        normalizedSentence.hasPrefix("\(normalizedSource):")
 }
 
 func killTTSProcesses() {
@@ -1204,6 +1250,75 @@ func resetRepeatAnchor() {
     debugPrint("RESET ANCHOR — set to last message \(total)")
 }
 
+func historyPlaybackTarget(
+    direction: String? = nil,
+    useFirst: Bool = false,
+    useLatest: Bool = false,
+    timeline: Bool = false
+) -> (context: PlaybackContext, index: Int, total: Int)? {
+    let total = historyMessageTotal()
+    guard total > 0 else { return nil }
+
+    let defaultIndex = min(max(getRepeatAnchor() - 1, 0), total - 1)
+    let savedIndex = (try? String(contentsOfFile: navIndexFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines))
+        .flatMap { Int($0) }
+    let current = min(max(savedIndex ?? defaultIndex, 0), total - 1)
+
+    let target: Int
+    if useFirst {
+        target = 0
+    } else if useLatest {
+        target = total - 1
+    } else if direction == "next" {
+        guard current < total - 1 else { return nil }
+        target = current + 1
+    } else if direction == "prev" {
+        guard current > 0 else { return nil }
+        target = current - 1
+    } else if timeline {
+        target = savedIndex == nil ? defaultIndex : min(current + 1, total - 1)
+    } else {
+        target = current
+    }
+
+    guard let context = readHistoryMessage(at: target + 1) else {
+        return nil
+    }
+
+    try? "\(target)".write(toFile: navIndexFile, atomically: true, encoding: .utf8)
+    try? "\(target + 1)".write(toFile: repeatAnchorFile, atomically: true, encoding: .utf8)
+    return (context: context, index: target, total: total)
+}
+
+@discardableResult
+func triggerHistoryPlaybackAction(
+    direction: String? = nil,
+    useFirst: Bool = false,
+    useLatest: Bool = false,
+    timeline: Bool = false,
+    status: String
+) -> Bool {
+    guard let target = historyPlaybackTarget(
+        direction: direction,
+        useFirst: useFirst,
+        useLatest: useLatest,
+        timeline: timeline
+    ) else {
+        return false
+    }
+
+    interruptPlaybackForReplay()
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        waitForPlaybackLockRelease()
+        debugPrint("HISTORY LOG — playing \(target.index + 1)/\(target.total) status=\(status)")
+        playContext(target.context, startIndex: 0, status: status)
+    }
+
+    return true
+}
+
 func playbackContext(from item: PlaybackLogItem) -> PlaybackContext? {
     guard let text = try? String(contentsOfFile: item.normalizedTextPath, encoding: .utf8),
           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -1378,8 +1493,8 @@ func triggerRepeatShortcut() {
         return
     }
 
-    debugPrint("REPEAT SHORTCUT — idle, trying latest playback-log replay")
-    if triggerPlaybackLogAction(useLatest: true, status: "repeat") {
+    debugPrint("REPEAT SHORTCUT — idle, continuing playback-log timeline")
+    if triggerPlaybackLogAction(timeline: true, status: "repeat") {
         return
     }
 
@@ -1445,7 +1560,7 @@ func speakText(
 
         if let source = normalizedSource {
             subtitleText = "[\(source)] \(sentence)"
-            if idx == 0 && shouldAnnounceSource {
+            if idx == 0 && shouldAnnounceSource && !sentenceStartsWithSource(sentence, source: source) {
                 spokenText = "\(source). \(sentence)"
             } else {
                 spokenText = sentence
@@ -1794,9 +1909,33 @@ func playbackLogTargetItem(direction: String? = nil, useLatest: Bool = false) ->
 }
 
 @discardableResult
-func triggerPlaybackLogAction(direction: String? = nil, useLatest: Bool = false, status: String) -> Bool {
-    guard let target = playbackLogTargetItem(direction: direction, useLatest: useLatest),
+func triggerPlaybackLogAction(
+    direction: String? = nil,
+    useLatest: Bool = false,
+    useFirst: Bool = false,
+    timeline: Bool = false,
+    status: String
+) -> Bool {
+    let targetItem: PlaybackLogItem?
+    if useFirst {
+        targetItem = playbackLogFirstItem()
+    } else if timeline {
+        targetItem = playbackLogTimelineItem()
+    } else {
+        targetItem = playbackLogTargetItem(direction: direction, useLatest: useLatest)
+    }
+
+    guard let target = targetItem,
           let context = playbackContext(from: target) else {
+        if triggerHistoryPlaybackAction(
+            direction: direction,
+            useFirst: useFirst,
+            useLatest: useLatest,
+            timeline: timeline,
+            status: status
+        ) {
+            return true
+        }
         playChime()
         return false
     }
@@ -1822,6 +1961,10 @@ func handlePlaybackLogCommandIfNeeded() {
     try? FileManager.default.removeItem(atPath: playbackLogCommandFile)
 
     switch command {
+    case "play", "timeline":
+        _ = triggerPlaybackLogAction(timeline: true, status: "nav")
+    case "first", "oldest":
+        _ = triggerPlaybackLogAction(useFirst: true, status: "nav")
     case "back":
         _ = triggerPlaybackLogAction(direction: "prev", status: "nav")
     case "next":
@@ -2277,8 +2420,43 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
     let isOptionKey = (keyCode == 58 || keyCode == 61)
     // Shift keys: 56 (left), 60 (right)
     let isShiftKey = (keyCode == 56 || keyCode == 60)
+    // Function key: 63 on Apple keyboards
+    let isFunctionKey = (keyCode == functionKeyCode || flags.contains(.maskSecondaryFn))
 
-    if !isCommandKey && !isOptionKey && !isShiftKey {
+    if !isCommandKey && !isOptionKey && !isShiftKey && !isFunctionKey {
+        return Unmanaged.passUnretained(event)
+    }
+
+    // --- FUNCTION DOUBLE-TAP: PLAY NEXT LOG ITEM ---
+    if isFunctionKey {
+        let hasFunction = flags.contains(.maskSecondaryFn)
+        let hasOtherModifier = !flags.intersection([.maskCommand, .maskShift, .maskControl, .maskAlternate]).isEmpty
+
+        if hasOtherModifier {
+            state.functionIsDown = false
+            state.lastFunctionUp = nil
+            return Unmanaged.passUnretained(event)
+        }
+
+        debugPrint("Function flagsChanged: keyCode=\(keyCode) hasFunction=\(hasFunction)")
+
+        if hasFunction && !state.functionIsDown {
+            state.functionIsDown = true
+        } else if !hasFunction && state.functionIsDown {
+            state.functionIsDown = false
+            let now = Date()
+
+            if let last = state.lastFunctionUp, now.timeIntervalSince(last) < doubleTapWindow {
+                state.lastFunctionUp = nil
+                debugPrint("FUNCTION DOUBLE TAP — playback log timeline")
+                DispatchQueue.main.async {
+                    _ = triggerPlaybackLogAction(timeline: true, status: "nav")
+                }
+            } else {
+                state.lastFunctionUp = now
+            }
+        }
+
         return Unmanaged.passUnretained(event)
     }
 

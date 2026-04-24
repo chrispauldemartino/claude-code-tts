@@ -1006,9 +1006,17 @@ handle_log_command() {
             remote_log_command "back" || return 1
             echo "Playback log back requested on the MBP."
             ;;
+        play|timeline)
+            remote_log_command "play" || return 1
+            echo "Playback log timeline play requested on the MBP."
+            ;;
         next)
             remote_log_command "next" || return 1
             echo "Playback log next requested on the MBP."
+            ;;
+        first|oldest)
+            remote_log_command "first" || return 1
+            echo "Playback log first item requested on the MBP."
             ;;
         replay|repeat)
             remote_log_command "replay" || return 1
@@ -1019,7 +1027,7 @@ handle_log_command() {
             echo "Playback log latest requested on the MBP."
             ;;
         *)
-            echo "Usage: /vm log [status|back|next|replay|latest]" >&2
+            echo "Usage: /vm log [status|play|timeline|back|next|first|oldest|replay|latest]" >&2
             return 1
             ;;
     esac

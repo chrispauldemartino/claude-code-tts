@@ -148,6 +148,22 @@ Claude responds → Stop hook fires → First sentence extracted → Audio plays
 
 The hook runs in the background and won't block Claude's responses.
 
+## ELLE Voice Mode Runtime
+
+The ELLE deployment extends the base plugin with a remote Mac Mini to MBP voice
+mode runtime:
+
+- `/vm rebuild` syncs and rebuilds the bundled MBP `SkipListener.app`.
+- `/vm doctor` verifies signer, Accessibility, Input Monitoring, LaunchAgent
+  ownership, the direct `skip-listener` process, and the bridge process count.
+- `/vm log play` and `fn + fn` continue through the playback timeline instead
+  of jumping to the newest message.
+- `/vm log first` and `/vm log latest` are explicit timeline jumps.
+- If the 200-item playback manifest is empty, timeline playback falls back to
+  the current MBP session history before giving a boundary chime.
+- Spoken replies are prefixed with a source and short title, for example
+  `Codex Queue Cleanup` or `Claude Code Subscription Consumption`.
+
 ### speak-text CLI
 
 A standalone binary for direct TTS without going through MCP:

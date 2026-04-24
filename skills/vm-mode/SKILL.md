@@ -60,6 +60,21 @@ If no config file exists and user says an individual toggle: create with all def
 - "Switched to Yeti X mic."
 - "Text mode. Voice off."
 
+## Playback Controls
+
+The MBP `skip-listener` owns keyboard playback controls while voice mode is
+active:
+
+- `fn + fn` continues the playback timeline. It does not wrap at the end.
+- `cmd + shift` repeats the active or paused item; while idle it follows the
+  same timeline behavior.
+- `/vm log play` mirrors `fn + fn`.
+- `/vm log first` and `/vm log latest` explicitly move the timeline cursor.
+- If the 200-item playback manifest is empty, timeline playback falls back to
+  current MBP session history before giving a boundary chime.
+- Spoken replies begin with source plus a short title when available, such as
+  `Codex Queue Cleanup`.
+
 ## Output Style (while config file exists)
 
 When `/tmp/claude-voice-config` exists with `voice=on`, adapt ALL responses:

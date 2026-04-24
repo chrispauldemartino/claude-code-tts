@@ -210,6 +210,27 @@ is_title_only_payload() {
     printf '%s' "$text" | jq -e 'type == "object" and (keys | sort) == ["title"]' >/dev/null 2>&1
 }
 
+extract_payload_title() {
+    python3 -c '
+import json
+import sys
+
+raw = sys.stdin.read().strip()
+if not raw:
+    sys.exit(0)
+
+try:
+    parsed = json.loads(raw)
+except Exception:
+    sys.exit(0)
+
+if isinstance(parsed, dict):
+    title = str(parsed.get("title", "")).strip()
+    if title:
+        print(title, end="")
+'
+}
+
 # Read JSON from stdin, extract message
 json=$(cat)
 
@@ -237,6 +258,7 @@ transcript_path=$(echo "$json" | jq -r '.transcript_path // ""' 2>/dev/null)
 
 # Primary: get last_assistant_message from hook JSON (always current)
 last_msg=$(echo "$json" | jq -r '.last_assistant_message // ""' 2>/dev/null)
+payload_title=$(printf '%s' "$last_msg" | extract_payload_title)
 
 SOURCE_LABEL=$(classify_source_label "$SESSION_CWD" "$transcript_path" "$SESSION_SOURCE")
 
@@ -251,6 +273,7 @@ echo "  source: ${SESSION_SOURCE:-<empty>}" >> "$DEBUG_LOG"
 echo "  transcript_path: ${transcript_path:-<empty>}" >> "$DEBUG_LOG"
 echo "  transcript_exists: $([ -f "$transcript_path" ] && echo yes || echo no)" >> "$DEBUG_LOG"
 echo "  last_msg length: ${#last_msg}, preview: ${last_msg:0:80}" >> "$DEBUG_LOG"
+[ -n "$payload_title" ] && echo "  payload_title: $payload_title" >> "$DEBUG_LOG"
 
 if [ "$HOOK_EVENT" != "Stop" ]; then
     echo "  [skip] hook event is not Stop" >> "$DEBUG_LOG"
@@ -433,6 +456,10 @@ msg_breaks=$(echo "$msg" | grep -c '<<MSG_BREAK>>' || true)
 echo "  final msg: ${#msg} chars, $msg_breaks breaks, preview: ${msg:0:80}" >> "$DEBUG_LOG"
 
 [ -z "$msg" ] && exit 0
+if is_title_only_payload "$msg"; then
+    echo "  [skip] title-only payload after parsing — not a spoken assistant reply" >> "$DEBUG_LOG"
+    exit 0
+fi
 
 rm -f "$SKIP_FLAG"
 
@@ -520,6 +547,102 @@ if not result:
 
 print(result, end="")
 PY
+}
+
+build_spoken_title_prefix() {
+    local source="$1"
+    local explicit_title="$2"
+    local body="$3"
+
+    python3 -c '
+import re
+import sys
+
+source = sys.argv[1].strip()
+explicit = sys.argv[2].strip()
+text = sys.stdin.read()
+
+def clean(value):
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"[\[\]{}\"`*_>#|]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" .:-")
+    return value
+
+def title_case(words):
+    acronyms = {
+        "ai": "AI",
+        "api": "API",
+        "codex": "Codex",
+        "claude": "Claude",
+        "elle": "ELLE",
+        "fn": "Fn",
+        "leq": "LEQ",
+        "mbp": "MBP",
+        "tts": "TTS",
+        "vm": "VM",
+    }
+    rendered = []
+    for word in words:
+        key = word.lower()
+        if key in acronyms:
+            rendered.append(acronyms[key])
+        elif word.isupper() and len(word) <= 5:
+            rendered.append(word)
+        else:
+            rendered.append(word[:1].upper() + word[1:].lower())
+    return " ".join(rendered)
+
+def derive_title(value):
+    lines = [clean(line) for line in value.replace("<<MSG_BREAK>>", "\n").splitlines()]
+    lines = [line for line in lines if line]
+
+    for line in lines:
+        words = re.findall(r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)?", line)
+        if 2 <= len(words) <= 9 and len(line) <= 80 and not re.search(r"[.!?]$", line):
+            return title_case(words[:8])
+
+    chunks = []
+    for line in lines:
+        for chunk in re.split(r"(?<=[.!?])\s+", line):
+            chunk = clean(chunk)
+            if chunk:
+                chunks.append(chunk)
+
+    skip = {"done", "ok", "okay", "sure", "yes", "no"}
+    drop = {
+        "a", "an", "and", "are", "as", "for", "from", "i", "in", "it", "of",
+        "on", "the", "this", "to", "we", "with", "you",
+    }
+    leading = {"done", "i", "ive", "i ve", "implemented", "updated", "fixed", "added"}
+
+    for chunk in chunks:
+        lowered = chunk.lower().strip(" .")
+        if lowered in skip:
+            continue
+        words = re.findall(r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)?", chunk)
+        while words and words[0].lower() in leading:
+            words = words[1:]
+        words = [word for word in words if word.lower() not in drop]
+        if len(words) >= 2:
+            return title_case(words[:7])
+
+    return ""
+
+title = clean(explicit) if explicit else derive_title(text)
+if not title:
+    sys.exit(0)
+
+title_words = re.findall(r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)?", title)
+title = title_case(title_words[:8]) if title_words else title[:70].strip()
+if not title:
+    sys.exit(0)
+
+prefix = title
+if source and not title.lower().startswith(source.lower()):
+    prefix = f"{source} {title}"
+
+print(f"{prefix}. ", end="")
+' "$source" "$explicit_title" <<< "$body"
 }
 
 speak() {
@@ -908,6 +1031,14 @@ if has_config; then
             if is_vm_status "$cleaned"; then
                 echo "  [queue] skipped vm control output" >> "$DEBUG_LOG"
                 cleaned=""
+            fi
+        fi
+
+        if [ -n "$cleaned" ]; then
+            title_prefix=$(build_spoken_title_prefix "$SOURCE_LABEL" "$payload_title" "$cleaned")
+            if [ -n "$title_prefix" ]; then
+                cleaned="${title_prefix}${cleaned}"
+                echo "  [title] prefix: $title_prefix" >> "$DEBUG_LOG"
             fi
         fi
 
