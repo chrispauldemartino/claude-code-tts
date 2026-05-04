@@ -7,6 +7,9 @@ dist/
 *.dylib
 /bin/tts-server
 
+# Whisper models — too large for GitHub (>100MB), live on MBP via voice-input install path
+models/*.bin
+
 # Test files
 coverage.out
 coverage.html
