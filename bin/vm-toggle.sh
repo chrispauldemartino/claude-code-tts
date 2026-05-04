@@ -38,14 +38,15 @@ LOCAL_SKIP_LISTENER_RESTART="$PLUGIN_BIN/restart-skip-listener-launchagent.sh"
 LOCAL_TTS_BRIDGE="$PLUGIN_BIN/tts-bridge.sh"
 
 DEFAULTS="voice=on
-mic=off
+mic=on
+target=both
 speed=300
 volume=normal
 engine=say
 openai_voice=nova
 summary=on
 code=silent
-cue=off
+cue=on
 subtitle=off
 mic_device="
 SPEED_MIN=150
@@ -1043,8 +1044,14 @@ case "${1:-status}" in
     on)
         clear_voice_session_claim
         write_full_config "$DEFAULTS"
+        case "${2:-both}" in
+            claude) update_toggle "target" "claude"; scope_label="Claude Code only" ;;
+            codex)  update_toggle "target" "codex";  scope_label="Codex only" ;;
+            both|"") update_toggle "target" "both";  scope_label="Claude Code + Codex" ;;
+            *) echo "Usage: /vm on [claude|codex]"; exit 1 ;;
+        esac
         start_daemon
-        echo "Voice mode ON — global Claude Code + Codex speech enabled"
+        echo "Voice mode ON — global speech + dictation enabled ($scope_label)"
         ;;
     off)
         rm -f "$CONFIG"
@@ -1058,8 +1065,14 @@ case "${1:-status}" in
         update_toggle "voice" "on"
         update_toggle "mic" "off"
         update_toggle "cue" "off"
+        case "${2:-both}" in
+            claude) update_toggle "target" "claude"; scope_label="Claude Code only" ;;
+            codex)  update_toggle "target" "codex";  scope_label="Codex only" ;;
+            both|"") update_toggle "target" "both";  scope_label="Claude Code + Codex" ;;
+            *) echo "Usage: /vm listen [claude|codex]"; exit 1 ;;
+        esac
         start_daemon
-        echo "Listen mode — global Claude Code + Codex speech, you type"
+        echo "Listen mode — TTS on, you type ($scope_label)"
         ;;
     test)
         [ ! -f "$CONFIG" ] && write_full_config "$DEFAULTS"
@@ -1077,8 +1090,14 @@ case "${1:-status}" in
         update_toggle "voice" "off"
         update_toggle "mic" "on"
         update_toggle "cue" "off"
+        case "${2:-both}" in
+            claude) update_toggle "target" "claude"; scope_label="Claude Code only" ;;
+            codex)  update_toggle "target" "codex";  scope_label="Codex only" ;;
+            both|"") update_toggle "target" "both";  scope_label="Claude Code + Codex" ;;
+            *) echo "Usage: /vm dictation [claude|codex]"; exit 1 ;;
+        esac
         start_daemon
-        echo "Dictation mode — you speak, text replies"
+        echo "Dictation mode — you speak, text replies ($scope_label)"
         ;;
     quiet)
         [ ! -f "$CONFIG" ] && write_full_config "$DEFAULTS"
@@ -1273,6 +1292,6 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|cue|subtitle|summary]"
+        echo "Usage: /vm [on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|cue|subtitle|summary]"
         ;;
 esac

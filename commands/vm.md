@@ -1,6 +1,6 @@
 ---
-description: "Global voice mode toggle for Claude Code + Codex — on, off, rebuild, listen, test, dictation, quiet, repeat, skip, stop, pause, resume, forward, rewind, focus, log, speed, engine, doctor, status"
-argument-hint: "[on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|focus status|focus off|log|log status|log play|log back|log next|log first|log replay|log latest|speed|speed up|speed down|speed <wpm>|engine|engine say|engine openai|doctor|status|voice on/off|mic on/off|cue on/off|subtitle on/off|summary on/off]"
+description: "Global voice mode toggle for Claude Code + Codex — on, off, rebuild, listen, test, dictation, quiet, repeat, skip, stop, pause, resume, forward, rewind, focus, log, speed, engine, doctor, status. Each of on/listen/dictation accepts optional claude|codex scope."
+argument-hint: "[on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|focus status|focus off|log|log status|log play|log back|log next|log first|log replay|log latest|speed|speed up|speed down|speed <wpm>|engine|engine say|engine openai|doctor|status|voice on/off|mic on/off|cue on/off|subtitle on/off|summary on/off]"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/vm-toggle.sh:*)
 ---
 
