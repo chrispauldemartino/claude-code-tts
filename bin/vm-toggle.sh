@@ -40,6 +40,7 @@ LOCAL_TTS_BRIDGE="$PLUGIN_BIN/tts-bridge.sh"
 DEFAULTS="voice=on
 mic=on
 target=both
+target_drop_nonmatching=false
 speed=300
 volume=normal
 engine=say
@@ -494,9 +495,13 @@ stop_daemon() {
 }
 
 show_status() {
+    local deferred_count=0
     if [ ! -f "$CONFIG" ]; then
         echo "Voice mode: OFF (text mode)"
         return
+    fi
+    if [ -d /tmp/claude-tts-deferred-queue ]; then
+        deferred_count=$(find /tmp/claude-tts-deferred-queue -maxdepth 1 -type d -name 'entry-*' | wc -l | tr -d ' ')
     fi
     echo "Voice mode: ACTIVE"
     echo "---"
@@ -515,6 +520,9 @@ show_status() {
     fi
     if [ -f "$FOCUSED_SOURCE_LABEL_FILE" ]; then
         echo "  focused_source=$(cat "$FOCUSED_SOURCE_LABEL_FILE" 2>/dev/null)"
+    fi
+    if [ "${deferred_count:-0}" -gt 0 ]; then
+        echo "  deferred_queue_count=$deferred_count"
     fi
 }
 

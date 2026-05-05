@@ -55,6 +55,8 @@ let playbackLogManifestFile = "\(playbackLogDir)/manifest.jsonl"
 let playbackLogCommandFile = "/tmp/claude-tts-log-command"
 let playbackLogRetentionSeconds: TimeInterval = 90 * 60
 let playbackLogMaxItems = 200
+let deferredQueueDir = "/tmp/claude-tts-deferred-queue"
+let deferredQueueMaxItems = 200
 
 // Forward/rewind flags
 let forwardFlag = "/tmp/claude-tts-forward"
@@ -378,6 +380,73 @@ func clearActiveSegment() {
     try? FileManager.default.removeItem(atPath: activeSegmentFile)
 }
 
+func ensureDirectory(_ path: String) {
+    try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+}
+
+func uniqueDeferredEntryName(for entry: String) -> String {
+    let safeEntry = entry.hasPrefix("entry-") ? String(entry.dropFirst(6)) : entry
+    return "entry-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString)-\(safeEntry)"
+}
+
+func trimDeferredQueueIfNeeded() {
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(atPath: deferredQueueDir).sorted() else { return }
+    let deferredEntries = entries.filter { $0.hasPrefix("entry-") }
+    guard deferredEntries.count > deferredQueueMaxItems else { return }
+
+    for entry in deferredEntries.prefix(deferredEntries.count - deferredQueueMaxItems) {
+        try? fm.removeItem(atPath: "\(deferredQueueDir)/\(entry)")
+    }
+}
+
+func deferQueueEntry(entryPath: String, entryName: String, sourceLabel: String?, target: String) {
+    let fm = FileManager.default
+    ensureDirectory(deferredQueueDir)
+    let deferredName = uniqueDeferredEntryName(for: entryName)
+    let deferredPath = "\(deferredQueueDir)/\(deferredName)"
+    if fm.fileExists(atPath: deferredPath) {
+        try? fm.removeItem(atPath: deferredPath)
+    }
+    try? fm.moveItem(atPath: entryPath, toPath: deferredPath)
+    trimDeferredQueueIfNeeded()
+    debugPrint("QUEUE — deferred \(entryName) target=\(target) source=\(sourceLabel ?? "unknown") count=\(deferredQueueCount())")
+}
+
+func restoreDeferredEntriesIfNeeded(target: String) {
+    guard FileManager.default.fileExists(atPath: deferredQueueDir) else { return }
+    ensureDirectory(queueDir)
+
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(atPath: deferredQueueDir).sorted() else { return }
+
+    for entry in entries where entry.hasPrefix("entry-") {
+        let deferredPath = "\(deferredQueueDir)/\(entry)"
+        let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(deferredPath)/source", encoding: .utf8))
+        guard target == "both" || sourceMatchesTarget(sourceLabel, target: target) else { continue }
+
+        let restoredName = "entry-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString)"
+        let restoredPath = "\(queueDir)/\(restoredName)"
+        try? fm.moveItem(atPath: deferredPath, toPath: restoredPath)
+        debugPrint("QUEUE — restored deferred entry for target=\(target) source=\(sourceLabel ?? "unknown")")
+    }
+}
+
+func shouldProcessDeferredQueue() -> Bool {
+    let target = currentTargetScope()
+    guard let entries = try? FileManager.default.contentsOfDirectory(atPath: deferredQueueDir) else {
+        return false
+    }
+
+    return entries.contains { entry in
+        guard entry.hasPrefix("entry-") else { return false }
+        if target == "both" { return true }
+        let deferredPath = "\(deferredQueueDir)/\(entry)"
+        let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(deferredPath)/source", encoding: .utf8))
+        return sourceMatchesTarget(sourceLabel, target: target)
+    }
+}
+
 func readConfigValue(_ key: String) -> String {
     guard let content = try? String(contentsOfFile: configFile, encoding: .utf8) else { return "" }
     for line in content.components(separatedBy: "\n") {
@@ -386,6 +455,50 @@ func readConfigValue(_ key: String) -> String {
         }
     }
     return ""
+}
+
+func normalizedTargetScope(_ raw: String?) -> String {
+    switch raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "claude":
+        return "claude"
+    case "codex":
+        return "codex"
+    default:
+        return "both"
+    }
+}
+
+func currentTargetScope() -> String {
+    normalizedTargetScope(readConfigValue("target"))
+}
+
+func targetDropNonmatchingEnabled() -> Bool {
+    readConfigValue("target_drop_nonmatching").lowercased() == "true"
+}
+
+func sourceMatchesTarget(_ sourceLabel: String?, target: String) -> Bool {
+    guard target != "both" else { return true }
+    guard let source = sourceLabel?.lowercased() else { return false }
+    if target == "claude" {
+        return source.contains("claude")
+    }
+    if target == "codex" {
+        return source.contains("codex")
+    }
+    return true
+}
+
+func deferredQueueCount() -> Int {
+    guard let entries = try? FileManager.default.contentsOfDirectory(atPath: deferredQueueDir) else {
+        return 0
+    }
+    return entries.filter { $0.hasPrefix("entry-") }.count
+}
+
+func queueStatusLabel(base: String) -> String {
+    let deferred = deferredQueueCount()
+    guard deferred > 0 else { return base }
+    return "\(base) deferred=\(deferred)"
 }
 
 func writeConfigValue(_ key: String, value: String) {
@@ -2173,12 +2286,14 @@ func processQueue() {
         defer { state.isProcessingQueue = false }
 
         let fm = FileManager.default
-        guard fm.fileExists(atPath: queueDir) else { return }
+        ensureDirectory(queueDir)
 
         acquireTTSLock()
         fm.createFile(atPath: ttsPlayingFlag, contents: nil)
 
         while true {
+            let target = currentTargetScope()
+            restoreDeferredEntriesIfNeeded(target: target)
             guard let entries = try? fm.contentsOfDirectory(atPath: queueDir).sorted() else { break }
             let queueEntries = prioritizeQueueEntries(
                 entries.filter { $0.hasPrefix("entry-") },
@@ -2219,10 +2334,19 @@ func processQueue() {
             let normalizedText = (try? String(contentsOfFile: "\(entryPath)/normalized", encoding: .utf8))
                 ?? text
             let effectiveSpeed = currentSpeechSpeed(fallback: speed)
+            if !sourceMatchesTarget(sourceLabel, target: target) {
+                if targetDropNonmatchingEnabled() {
+                    debugPrint("QUEUE — dropping nonmatching entry target=\(target) source=\(sourceLabel ?? "unknown")")
+                    try? fm.removeItem(atPath: entryPath)
+                } else {
+                    deferQueueEntry(entryPath: entryPath, entryName: entry, sourceLabel: sourceLabel, target: target)
+                }
+                continue
+            }
             let previewBase = String(text.prefix(60))
             let previewText = sourceLabel != nil ? "[\(sourceLabel!)] \(previewBase)" : previewBase
             writeActiveSegment(segment: 1, total: queueEntries.count,
-                             preview: previewText, status: "speaking")
+                             preview: previewText, status: queueStatusLabel(base: "speaking"))
             debugPrint("QUEUE — speaking next entry (remaining \(queueEntries.count))")
 
             try? effectiveSpeed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
@@ -2752,9 +2876,16 @@ var configCheckCounter = 0  // Only check config every 6th tick (6 * 0.3s ≈ 2s
 
 let timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
     // Queue check runs every tick (0.3s) for responsive pickup
-    if FileManager.default.fileExists(atPath: queueDir) && !state.isProcessingQueue {
-        if let entries = try? FileManager.default.contentsOfDirectory(atPath: queueDir),
-           entries.contains(where: { $0.hasPrefix("entry-") }) {
+    if !state.isProcessingQueue {
+        let hasQueuedEntries: Bool
+        if FileManager.default.fileExists(atPath: queueDir),
+           let entries = try? FileManager.default.contentsOfDirectory(atPath: queueDir) {
+            hasQueuedEntries = entries.contains(where: { $0.hasPrefix("entry-") })
+        } else {
+            hasQueuedEntries = false
+        }
+
+        if hasQueuedEntries || shouldProcessDeferredQueue() {
             processQueue()
         }
     }

@@ -1,5 +1,8 @@
 # Binaries
 bin/
+!bin/
+bin/*
+!bin/build-voice-input.sh
 dist/
 *.exe
 *.dll
@@ -9,6 +12,9 @@ dist/
 
 # Whisper models — too large for GitHub (>100MB), live on MBP via voice-input install path
 models/*.bin
+
+# Codex tooling state (auto-generated memory context)
+AGENTS.md
 
 # Test files
 coverage.out

@@ -1,5 +1,7 @@
 import Foundation
 import CoreGraphics
+import AppKit
+import Darwin
 
 // Voice input daemon: launches whisper-stream, parses ANSI output, types text
 // via CGEvents, detects "send" keyword to submit, handles skip/stop flags.
@@ -16,6 +18,9 @@ let backspaceKeyCode: CGKeyCode = 51
 let enterKeyCode: CGKeyCode = 36
 let sendStabilityDelay: TimeInterval = 1.5
 let sendingFlag = "/tmp/claude-voice-input-sending"
+let voiceConfigPath = "/tmp/claude-voice-config"
+let voiceConfigCacheTTL: TimeInterval = 1.0
+let matcherActivationDelay: TimeInterval = 0.15
 
 let hallucinationTokens: Set<String> = [
     "[BLANK_AUDIO]", "[MUSIC PLAYING]", "[MUSIC]", "[END PLAYBACK]",
@@ -29,6 +34,10 @@ let binaryDir = (CommandLine.arguments[0] as NSString).deletingLastPathComponent
 var modelPath = "\(binaryDir)/../models/ggml-small.en.bin"
 var timeout: TimeInterval = 120
 var debug = false
+var cachedVoiceConfig: [String: String] = [:]
+var cachedVoiceConfigReadAt = Date.distantPast
+var cachedProcessSnapshot: [ProcessSnapshotEntry] = []
+var cachedProcessSnapshotReadAt = Date.distantPast
 
 do {
     let args = CommandLine.arguments
@@ -46,14 +55,222 @@ do {
     }
 }
 
-func debugLog(_ msg: String) {
-    guard debug else { return }
+func appendDebugLine(_ msg: String, force: Bool = false) {
+    guard debug || force else { return }
     let line = "\(Date()): \(msg)\n"
     if let handle = FileHandle(forWritingAtPath: debugLogPath) {
         handle.seekToEndOfFile()
         handle.write(line.data(using: .utf8)!)
         handle.closeFile()
+    } else {
+        try? line.write(toFile: debugLogPath, atomically: true, encoding: .utf8)
     }
+}
+
+func debugLog(_ msg: String) {
+    appendDebugLine(msg)
+}
+
+func readVoiceConfig() -> [String: String] {
+    let now = Date()
+    if now.timeIntervalSince(cachedVoiceConfigReadAt) < voiceConfigCacheTTL {
+        return cachedVoiceConfig
+    }
+
+    cachedVoiceConfigReadAt = now
+    guard let content = try? String(contentsOfFile: voiceConfigPath, encoding: .utf8) else {
+        cachedVoiceConfig = [:]
+        return cachedVoiceConfig
+    }
+
+    var parsed: [String: String] = [:]
+    for rawLine in content.components(separatedBy: .newlines) {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, let separator = line.firstIndex(of: "=") else { continue }
+        let key = String(line[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = String(line[line.index(after: separator)...])
+        parsed[key] = value
+    }
+
+    cachedVoiceConfig = parsed
+    return cachedVoiceConfig
+}
+
+func normalizedTarget(_ value: String?) -> String {
+    switch value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "claude":
+        return "claude"
+    case "codex":
+        return "codex"
+    default:
+        return "both"
+    }
+}
+
+struct ProcessSnapshotEntry {
+    let pid: pid_t
+    let ppid: pid_t
+    let command: String
+}
+
+func readProcessSnapshot() -> [ProcessSnapshotEntry] {
+    let now = Date()
+    if now.timeIntervalSince(cachedProcessSnapshotReadAt) < voiceConfigCacheTTL {
+        return cachedProcessSnapshot
+    }
+
+    let process = Process()
+    let pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/ps")
+    process.arguments = ["-axo", "pid=,ppid=,command="]
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(decoding: data, as: UTF8.self)
+        cachedProcessSnapshot = output
+            .components(separatedBy: .newlines)
+            .compactMap { line -> ProcessSnapshotEntry? in
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                let parts = trimmed.split(maxSplits: 2, whereSeparator: \.isWhitespace)
+                guard parts.count == 3,
+                      let pid = Int32(parts[0]),
+                      let ppid = Int32(parts[1]) else {
+                    return nil
+                }
+                return ProcessSnapshotEntry(pid: pid, ppid: ppid, command: String(parts[2]))
+            }
+    } catch {
+        cachedProcessSnapshot = []
+        debugLog("Process snapshot failed: \(error)")
+    }
+
+    cachedProcessSnapshotReadAt = now
+    return cachedProcessSnapshot
+}
+
+func processExecutablePath(for pid: pid_t) -> String? {
+    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN * 4))
+    let result = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+    guard result > 0 else { return nil }
+    return String(cString: buffer)
+}
+
+func processCommandLine(for pid: pid_t, snapshot: [ProcessSnapshotEntry]) -> String? {
+    snapshot.first(where: { $0.pid == pid })?.command
+}
+
+func descendantPIDs(of rootPID: pid_t, snapshot: [ProcessSnapshotEntry]) -> [pid_t] {
+    let grouped = Dictionary(grouping: snapshot, by: \.ppid)
+    var queue = [rootPID]
+    var index = 0
+    var descendants: [pid_t] = []
+
+    while index < queue.count {
+        let current = queue[index]
+        index += 1
+        for child in grouped[current] ?? [] {
+            descendants.append(child.pid)
+            queue.append(child.pid)
+        }
+    }
+
+    return descendants
+}
+
+func targetMatchesProcess(path: String?, commandLine: String?, target: String) -> Bool {
+    let targetToken = target.lowercased()
+    return [path, commandLine].compactMap { $0?.lowercased() }.contains { $0.contains(targetToken) }
+}
+
+func targetMatchReason(path: String?, commandLine: String?, target: String) -> String {
+    if let path, path.lowercased().contains(target) {
+        return "path"
+    }
+    if let commandLine, commandLine.lowercased().contains(target) {
+        return "argv"
+    }
+    return "none"
+}
+
+func applicationMatchesTarget(_ app: NSRunningApplication, target: String, snapshot: [ProcessSnapshotEntry]) -> (Bool, String) {
+    let appPID = app.processIdentifier
+    let appPath = processExecutablePath(for: appPID)
+    let appCommand = processCommandLine(for: appPID, snapshot: snapshot)
+    if targetMatchesProcess(path: appPath, commandLine: appCommand, target: target) {
+        return (true, "app-\(targetMatchReason(path: appPath, commandLine: appCommand, target: target))")
+    }
+
+    // Known fragile cases: tmux, VS Code integrated terminals, and wrapper
+    // scripts can hide the real claude/codex argv, so we also scan descendants
+    // and log the exact refusal verdict when the matcher cannot prove scope.
+    for descendantPID in descendantPIDs(of: appPID, snapshot: snapshot) {
+        let descendantPath = processExecutablePath(for: descendantPID)
+        let descendantCommand = processCommandLine(for: descendantPID, snapshot: snapshot)
+        if targetMatchesProcess(path: descendantPath, commandLine: descendantCommand, target: target) {
+            return (true, "child-\(descendantPID)-\(targetMatchReason(path: descendantPath, commandLine: descendantCommand, target: target))")
+        }
+    }
+
+    return (false, "no-\(target)-match")
+}
+
+func frontmostTargetVerdict(target: String) -> (matches: Bool, detail: String) {
+    guard target != "both" else { return (true, "target=both") }
+    guard let app = NSWorkspace.shared.frontmostApplication else {
+        return (false, "frontmost=none")
+    }
+
+    let snapshot = readProcessSnapshot()
+    let verdict = applicationMatchesTarget(app, target: target, snapshot: snapshot)
+    let appPath = processExecutablePath(for: app.processIdentifier) ?? "<unknown>"
+    return (
+        verdict.0,
+        "frontmost=\(app.localizedName ?? "<unknown>") pid=\(app.processIdentifier) path=\(appPath) verdict=\(verdict.1)"
+    )
+}
+
+func activateTargetApplication(_ target: String) -> String? {
+    let snapshot = readProcessSnapshot()
+    let candidates = NSWorkspace.shared.runningApplications.filter { app in
+        app.activationPolicy != .prohibited
+            && applicationMatchesTarget(app, target: target, snapshot: snapshot).0
+    }
+
+    for app in candidates {
+        app.activate(options: [.activateIgnoringOtherApps])
+        RunLoop.current.run(until: Date().addingTimeInterval(matcherActivationDelay))
+        let verdict = frontmostTargetVerdict(target: target)
+        if verdict.matches {
+            return "activated pid=\(app.processIdentifier) name=\(app.localizedName ?? "<unknown>")"
+        }
+    }
+
+    return nil
+}
+
+func ensureTargetScope(context: String) -> Bool {
+    let target = normalizedTarget(readVoiceConfig()["target"])
+    guard target != "both" else { return true }
+
+    let frontmost = frontmostTargetVerdict(target: target)
+    if frontmost.matches {
+        debugLog("TARGET OK [\(context)] \(frontmost.detail)")
+        return true
+    }
+
+    if let activation = activateTargetApplication(target) {
+        let postActivation = frontmostTargetVerdict(target: target)
+        appendDebugLine("TARGET ACTIVATE [\(context)] \(activation) \(postActivation.detail)", force: true)
+        return postActivation.matches
+    }
+
+    appendDebugLine("TARGET BLOCK [\(context)] target=\(target) \(frontmost.detail)", force: true)
+    return false
 }
 
 // MARK: - WhisperStreamParser
@@ -142,43 +359,47 @@ class TextTyper {
         source = CGEventSource(stateID: .hidSystemState)
     }
 
-    func update(_ newText: String) {
-        if newText == previouslyTyped { return }
+    func update(_ newText: String) -> Bool {
+        if newText == previouslyTyped { return true }
 
         if newText.hasPrefix(previouslyTyped) && !previouslyTyped.isEmpty {
             // Append only the new suffix
             let suffix = String(newText.dropFirst(previouslyTyped.count))
-            typeString(suffix)
+            guard typeString(suffix) else { return false }
         } else if previouslyTyped.isEmpty {
-            typeString(newText)
+            guard typeString(newText) else { return false }
         } else {
             // Diverged - backspace old text and retype
-            deleteChars(previouslyTyped.count)
+            guard deleteChars(previouslyTyped.count) else { return false }
             usleep(50_000)
-            typeString(newText)
+            guard typeString(newText) else { return false }
         }
         previouslyTyped = newText
+        return true
     }
 
-    func deleteAll() {
+    func deleteAll() -> Bool {
         if !previouslyTyped.isEmpty {
-            deleteChars(previouslyTyped.count)
+            guard deleteChars(previouslyTyped.count) else { return false }
             previouslyTyped = ""
         }
+        return true
     }
 
-    func deleteChars(_ count: Int) {
+    func deleteChars(_ count: Int) -> Bool {
         for _ in 0..<count {
-            sendKey(backspaceKeyCode)
+            guard sendKey(backspaceKeyCode) else { return false }
         }
+        return true
     }
 
-    private func typeString(_ str: String) {
+    private func typeString(_ str: String) -> Bool {
         // Type using CGEvent unicode string support
         let chars = Array(str.utf16)
         // Send in chunks of up to 20 characters
         var i = 0
         while i < chars.count {
+            guard ensureTargetScope(context: "type") else { return false }
             let end = min(i + 20, chars.count)
             var chunk = Array(chars[i..<end])
             if let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
@@ -192,9 +413,11 @@ class TextTyper {
             usleep(10_000)
             i = end
         }
+        return true
     }
 
-    private func sendKey(_ keyCode: CGKeyCode) {
+    private func sendKey(_ keyCode: CGKeyCode) -> Bool {
+        guard ensureTargetScope(context: "key-\(keyCode)") else { return false }
         if let kd = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true) {
             kd.post(tap: .cghidEventTap)
         }
@@ -203,9 +426,10 @@ class TextTyper {
             ku.post(tap: .cghidEventTap)
         }
         usleep(20_000)
+        return true
     }
 
-    func pressEnter() {
+    func pressEnter() -> Bool {
         sendKey(enterKeyCode)
     }
 }
@@ -316,7 +540,7 @@ func shutdown(deletingText: Bool = false) {
 
     if deletingText {
         debugLog("Skip: deleting all typed text (\(typer.previouslyTyped.count) chars)")
-        typer.deleteAll()
+        _ = typer.deleteAll()
     }
 
     usleep(200_000)
@@ -353,14 +577,23 @@ func triggerSend() {
     }
 
     debugLog("Deleting \(deleteCount) chars, then Enter")
-    typer.deleteChars(deleteCount)
+    guard typer.deleteChars(deleteCount) else {
+        appendDebugLine("SEND ABORTED target gate blocked delete path", force: true)
+        usleep(200_000)
+        exit(0)
+    }
     typer.previouslyTyped = String(
         typer.previouslyTyped.dropLast(deleteCount))
     usleep(100_000)
 
     // Flag that WE are pressing Enter (so skip-listener ignores it)
     FileManager.default.createFile(atPath: sendingFlag, contents: nil)
-    typer.pressEnter()
+    guard typer.pressEnter() else {
+        try? FileManager.default.removeItem(atPath: sendingFlag)
+        appendDebugLine("SEND ABORTED target gate blocked Enter", force: true)
+        usleep(200_000)
+        exit(0)
+    }
     usleep(100_000)
     try? FileManager.default.removeItem(atPath: sendingFlag)
 
@@ -381,7 +614,11 @@ func triggerDrillDown(_ target: String) {
     usleep(200_000)
 
     // Delete all typed text (keyword consumed, not sent to Claude)
-    typer.deleteAll()
+    guard typer.deleteAll() else {
+        appendDebugLine("DRILL-DOWN ABORTED target gate blocked cleanup", force: true)
+        usleep(200_000)
+        exit(0)
+    }
     usleep(100_000)
 
     // Write drill-down flag for skip-listener to pick up
@@ -439,7 +676,11 @@ pipe.fileHandleForReading.readabilityHandler = { handle in
 
         DispatchQueue.main.async {
             if !exiting {
-                typer.update(text)
+                if !typer.update(text) {
+                    appendDebugLine("VOICE INPUT ABORT target gate blocked keystroke send", force: true)
+                    shutdown()
+                    return
+                }
                 detector.check(text)
                 debugLog("Text: '\(text.suffix(50))'")
             }
