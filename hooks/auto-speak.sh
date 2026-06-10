@@ -292,6 +292,25 @@ fi
 
 echo "  source_label: $SOURCE_LABEL" >> "$DEBUG_LOG"
 
+# --- Feature B: Foreground allowlist suppression guard ---
+FOREGROUND_ALLOWLIST="/tmp/claude-tts-foreground-sessions"
+suppress_bg="$(grep '^suppress_background=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || true)"
+if [ "$suppress_bg" = "on" ]; then
+    if [ -z "$SESSION_ID" ]; then
+        echo "  [skip] suppress_background on and empty session_id — treating as background" >> "$DEBUG_LOG"
+        exit 0
+    fi
+    if [ -f "$FOREGROUND_ALLOWLIST" ] && [ -s "$FOREGROUND_ALLOWLIST" ]; then
+        if ! grep -Fxq -- "$SESSION_ID" "$FOREGROUND_ALLOWLIST" 2>/dev/null; then
+            echo "  [skip] background session not in foreground allowlist (${SESSION_ID})" >> "$DEBUG_LOG"
+            exit 0
+        fi
+    else
+        echo "  [warn] suppress_background on but foreground allowlist empty — speaking (fail-open)" >> "$DEBUG_LOG"
+    fi
+fi
+# --- end suppression guard ---
+
 claim_active_session "$SESSION_ID" "$transcript_path" "$SOURCE_LABEL"
 echo "  [route] global voice mode accepted ${SESSION_ID:-<no-session-id>} (${SOURCE_LABEL})" >> "$DEBUG_LOG"
 
@@ -979,6 +998,7 @@ if has_config; then
     VOLUME=$(read_config "volume" "normal")
     SUMMARY=$(read_config "summary" "off")
     CODE=$(read_config "code" "silent")
+    TARGET=$(read_config "target" "both")
 
     VOL_LEVEL="1.0"
     [ "$VOLUME" = "quiet" ] && VOL_LEVEL="0.3"
@@ -999,6 +1019,15 @@ if has_config; then
 
     # Safety net: ensure daemon is running
     ensure_daemon
+
+    # --- TARGET FILTER: skip if source doesn't match configured scope ---
+    if [ "$TARGET" = "claude" ] && [ "$SOURCE_LABEL" = "Codex" ]; then
+        echo "  [target] skip — target=claude, source=Codex" >> "$DEBUG_LOG"
+        VOICE="off"
+    elif [ "$TARGET" = "codex" ] && [ "$SOURCE_LABEL" = "Claude Code" ]; then
+        echo "  [target] skip — target=codex, source=Claude Code" >> "$DEBUG_LOG"
+        VOICE="off"
+    fi
 
     # --- VOICE OUTPUT (queue-based: write to queue immediately, daemon speaks) ---
     if [ "$VOICE" = "on" ]; then

@@ -13,6 +13,7 @@ LAST_SOURCE_FILE="/tmp/claude-tts-last-source"
 LAST_SESSION_FILE="/tmp/claude-tts-last-session"
 FOCUSED_SESSION_ID_FILE="/tmp/claude-tts-focused-session-id"
 FOCUSED_SOURCE_LABEL_FILE="/tmp/claude-tts-focused-source"
+FOREGROUND_ALLOWLIST="/tmp/claude-tts-foreground-sessions"
 RESTART_QUEUE_FLAG="/tmp/claude-tts-restart-queue"
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_BIN="$PLUGIN_DIR/bin"
@@ -108,6 +109,29 @@ set_local_focus() {
 
 clear_local_focus() {
     rm -f "$FOCUSED_SESSION_ID_FILE" "$FOCUSED_SOURCE_LABEL_FILE"
+}
+
+append_foreground_allowlist() {
+    local sid="$1"
+    [ -z "$sid" ] && return 0
+    if [ ! -f "$FOREGROUND_ALLOWLIST" ]; then
+        printf '%s\n' "$sid" > "$FOREGROUND_ALLOWLIST"
+    elif ! grep -Fxq -- "$sid" "$FOREGROUND_ALLOWLIST" 2>/dev/null; then
+        printf '%s\n' "$sid" >> "$FOREGROUND_ALLOWLIST"
+    fi
+}
+
+ensure_suppress_background_on() {
+    # Write suppress_background=on to config only if not already explicitly set to off
+    local cur
+    cur="$(grep '^suppress_background=' "$CONFIG" 2>/dev/null | cut -d= -f2 || true)"
+    if [ "$cur" != "off" ]; then
+        if grep -q '^suppress_background=' "$CONFIG" 2>/dev/null; then
+            sed -i '' 's/^suppress_background=.*/suppress_background=on/' "$CONFIG"
+        else
+            echo "suppress_background=on" >> "$CONFIG"
+        fi
+    fi
 }
 
 parse_focus_field() {
@@ -1042,6 +1066,7 @@ handle_log_command() {
     esac
 }
 
+run_vm_command() {
 case "${1:-status}" in
     status)
         show_status
@@ -1052,6 +1077,8 @@ case "${1:-status}" in
     on)
         clear_voice_session_claim
         write_full_config "$DEFAULTS"
+        append_foreground_allowlist "${CLAUDE_CODE_SESSION_ID:-}"
+        ensure_suppress_background_on
         case "${2:-both}" in
             claude) update_toggle "target" "claude"; scope_label="Claude Code only" ;;
             codex)  update_toggle "target" "codex";  scope_label="Codex only" ;;
@@ -1063,6 +1090,7 @@ case "${1:-status}" in
         ;;
     off)
         rm -f "$CONFIG"
+        rm -f "$FOREGROUND_ALLOWLIST"
         clear_voice_session_claim
         stop_daemon
         echo "Voice mode OFF — text mode"
@@ -1070,6 +1098,8 @@ case "${1:-status}" in
     listen)
         clear_voice_session_claim
         [ ! -f "$CONFIG" ] && write_full_config "$DEFAULTS"
+        append_foreground_allowlist "${CLAUDE_CODE_SESSION_ID:-}"
+        ensure_suppress_background_on
         update_toggle "voice" "on"
         update_toggle "mic" "off"
         update_toggle "cue" "off"
@@ -1095,6 +1125,8 @@ case "${1:-status}" in
     dictation)
         clear_voice_session_claim
         [ ! -f "$CONFIG" ] && write_full_config "$DEFAULTS"
+        append_foreground_allowlist "${CLAUDE_CODE_SESSION_ID:-}"
+        ensure_suppress_background_on
         update_toggle "voice" "off"
         update_toggle "mic" "on"
         update_toggle "cue" "off"
@@ -1189,7 +1221,7 @@ case "${1:-status}" in
 
                 if [ -z "$focus_session" ]; then
                     echo "Focused playback: off"
-                    exit 0
+                    return 0
                 fi
 
                 echo "Focused playback: ${focus_source:-Session}"
@@ -1205,11 +1237,27 @@ case "${1:-status}" in
                     fi
                 fi
                 [ -n "$current_item_id" ] && echo "  current_log_item=$current_item_id"
+                # Show invoking session id and whether it matches the lock
+                echo "  invoking_session_id=${CLAUDE_CODE_SESSION_ID:-<not set>}"
+                local locked_active
+                locked_active="$(cat "$ACTIVE_SESSION_ID_FILE" 2>/dev/null | tr -d '[:space:]' || true)"
+                if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && [ -n "$locked_active" ]; then
+                    if [ "$CLAUDE_CODE_SESSION_ID" = "$locked_active" ]; then
+                        echo "  match=yes (invoking session IS the locked active session)"
+                    else
+                        echo "  match=no (invoking session differs from locked active ${locked_active})"
+                    fi
+                fi
                 ;;
             *)
                 focus_session="$2"
                 if [ -z "$focus_session" ] || [ "$focus_session" = "current" ]; then
-                    focus_session="$(detect_current_session_id)"
+                    # Prefer CLAUDE_CODE_SESSION_ID (verified present in env when /vm runs)
+                    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+                        focus_session="$CLAUDE_CODE_SESSION_ID"
+                    else
+                        focus_session="$(detect_current_session_id)"
+                    fi
                 fi
                 focus_source="$(detect_current_source_label || true)"
 
@@ -1217,6 +1265,11 @@ case "${1:-status}" in
                     echo "No current Claude/Codex session ID was found in this shell. Try /vm focus <session-id>."
                     exit 1
                 fi
+
+                # Write session id to active-session file (deterministic lock)
+                printf '%s\n' "$focus_session" > "$ACTIVE_SESSION_ID_FILE"
+                # Append to foreground allowlist
+                append_foreground_allowlist "$focus_session"
 
                 set_local_focus "$focus_session" "$focus_source"
                 focus_result="$(remote_focus_session "$focus_session" "$focus_source")" || exit 1
@@ -1299,7 +1352,144 @@ case "${1:-status}" in
             *)   echo "Usage: /vm summary on|off" ;;
         esac
         ;;
+    background)
+        case "${2:-status}" in
+            on)
+                [ ! -f "$CONFIG" ] && write_full_config "$DEFAULTS"
+                if grep -q '^suppress_background=' "$CONFIG" 2>/dev/null; then
+                    sed -i '' 's/^suppress_background=.*/suppress_background=on/' "$CONFIG"
+                else
+                    echo "suppress_background=on" >> "$CONFIG"
+                fi
+                echo "Background suppression: ON — only allowlisted sessions will speak"
+                ;;
+            off)
+                [ ! -f "$CONFIG" ] && write_full_config "$DEFAULTS"
+                if grep -q '^suppress_background=' "$CONFIG" 2>/dev/null; then
+                    sed -i '' 's/^suppress_background=.*/suppress_background=off/' "$CONFIG"
+                else
+                    echo "suppress_background=off" >> "$CONFIG"
+                fi
+                echo "Background suppression: OFF — all sessions speak (global mode)"
+                ;;
+            status)
+                local cur_bg
+                cur_bg="$(grep '^suppress_background=' "$CONFIG" 2>/dev/null | cut -d= -f2 || true)"
+                [ -z "$cur_bg" ] && cur_bg="unset (defaults to on when voice is active)"
+                echo "Background suppression: $cur_bg"
+                if [ -f "$FOREGROUND_ALLOWLIST" ]; then
+                    echo "Foreground allowlist ($FOREGROUND_ALLOWLIST):"
+                    while IFS= read -r line; do
+                        [ -n "$line" ] && echo "  $line"
+                    done < "$FOREGROUND_ALLOWLIST"
+                else
+                    echo "Foreground allowlist: empty"
+                fi
+                ;;
+            *)
+                echo "Usage: /vm background [on|off|status]" >&2
+                return 1
+                ;;
+        esac
+        ;;
     *)
         echo "Usage: /vm [on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|cue|subtitle|summary]"
         ;;
 esac
+}
+
+vm_chain_arg_count() {
+    local command="$1"
+    local next_arg="${2:-}"
+
+    case "$command" in
+        on|listen|dictation)
+            if [ "$next_arg" = "claude" ] || [ "$next_arg" = "codex" ]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
+        focus)
+            if [ "$next_arg" = "status" ] || [ "$next_arg" = "off" ]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
+        speed)
+            if [ "$next_arg" = "up" ] || [ "$next_arg" = "down" ] || [ "$next_arg" = "status" ] || [[ "$next_arg" =~ ^[0-9]+$ ]]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
+        engine)
+            if [ "$next_arg" = "say" ] || [ "$next_arg" = "openai" ] || [ "$next_arg" = "status" ]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
+        log)
+            if [ "$next_arg" = "status" ] || [ "$next_arg" = "back" ] || [ "$next_arg" = "next" ] || [ "$next_arg" = "replay" ] || [ "$next_arg" = "latest" ]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
+        background)
+            if [ "$next_arg" = "on" ] || [ "$next_arg" = "off" ] || [ "$next_arg" = "status" ]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
+        voice|mic|cue|subtitle|summary)
+            if [ "$next_arg" = "on" ] || [ "$next_arg" = "off" ]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
+        off|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|test|doctor|status|rebuild)
+            printf '%s\n' 1
+            ;;
+        *)
+            printf '%s\n' 0
+            ;;
+    esac
+}
+
+vm_chain_args=("$@")
+if [ "${#vm_chain_args[@]}" -eq 0 ]; then
+    vm_chain_args=(status)
+fi
+
+while [ "${#vm_chain_args[@]}" -gt 0 ]; do
+    vm_command="${vm_chain_args[0]}"
+    vm_next_arg="${vm_chain_args[1]:-}"
+    vm_arity="$(vm_chain_arg_count "$vm_command" "$vm_next_arg")"
+
+    case "$vm_arity" in
+        2)
+            run_vm_command "$vm_command" "$vm_next_arg"
+            vm_rc=$?
+            vm_chain_args=("${vm_chain_args[@]:2}")
+            ;;
+        1)
+            run_vm_command "$vm_command"
+            vm_rc=$?
+            vm_chain_args=("${vm_chain_args[@]:1}")
+            ;;
+        *)
+            printf "vm: unknown command '%s' (skipped)\n" "$vm_command" >&2
+            vm_chain_args=("${vm_chain_args[@]:1}")
+            continue
+            ;;
+    esac
+
+    if [ "$vm_rc" -ne 0 ]; then
+        exit "$vm_rc"
+    fi
+done
