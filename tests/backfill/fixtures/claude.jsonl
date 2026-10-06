@@ -1,0 +1,10 @@
+{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"claude-session","timestamp":"2026-10-06T10:00:00Z","message":{"content":[{"type":"text","text":"First prompt"}]}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"claude-session","timestamp":"2026-10-06T10:00:01Z","message":{"id":"m1","content":[{"type":"text","text":"First answer starts."},{"type":"thinking","thinking":"secret"},{"type":"tool_use","id":"tool-1","name":"Read","input":{}}],"stop_reason":"tool_use"}}
+{"type":"user","uuid":"tr1","parentUuid":"a1","sessionId":"claude-session","timestamp":"2026-10-06T10:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"tool output must not appear"}]}}
+{"type":"assistant","uuid":"a2","parentUuid":"tr1","sessionId":"claude-session","timestamp":"2026-10-06T10:00:03Z","message":{"id":"m2","content":[{"type":"text","text":"First answer finishes."}],"stop_reason":"end_turn"}}
+{"type":"user","uuid":"u2","parentUuid":"a2","sessionId":"claude-session","timestamp":"2026-10-06T10:01:00Z","message":{"content":[{"type":"text","text":"Second prompt"}]}}
+{"type":"assistant","uuid":"old","parentUuid":"u2","sessionId":"claude-session","timestamp":"2026-10-06T10:01:01Z","message":{"content":[{"type":"text","text":"Wrong branch."}],"stop_reason":"end_turn"}}
+{"type":"assistant","uuid":"new","parentUuid":"u2","sessionId":"claude-session","timestamp":"2026-10-06T10:01:02Z","message":{"content":[{"type":"text","text":"Selected branch answer."}],"stop_reason":"end_turn"}}
+{"type":"user","uuid":"u3","parentUuid":"new","sessionId":"claude-session","timestamp":"2026-10-06T10:02:00Z","message":{"content":[{"type":"text","text":"Unanswered prompt"}]}}
+{"type":"assistant","uuid":"partial","parentUuid":"u3","sessionId":"claude-session","timestamp":"2026-10-06T10:02:01Z","message":{"content":[{"type":"text","text":"Partial answer must be skipped."}],"stop_reason":null}}
+{"type":"assistant","uuid":"side","parentUuid":"new","sessionId":"claude-session","timestamp":"2026-10-06T10:03:00Z","isSidechain":true,"message":{"content":[{"type":"text","text":"Sidechain must be skipped."}],"stop_reason":"end_turn"}}

@@ -26,6 +26,7 @@ Manages the voice config file at `/tmp/claude-voice-config`. Each command reads 
 | "session cue" / "source cue" / "both cues" / "cue off" | cue=session / source / both / off |
 | "announce every item" / "announce on session change" | cue_frequency=always / change |
 | "name this session <nickname>" | `/vm name <nickname>` |
+| "backfill this session" / "import recent answers" | `/vm backfill [N]` (default 10, range 1–100) |
 | "summary mode on" / "summary mode off" | summary=on / summary=off |
 | "narrate code" / "skip code" | code=narrate / code=silent |
 | "speak faster" | speed += 50 (cap 350) |
@@ -38,9 +39,10 @@ name and provenance remain fixed; only `/vm name <nickname>` replaces it. The
 automatic tiers are handoff, worktree, main, custom title, tier 4b Claude
 `--name` (`launch_name`), then generated fallback.
 
-Mini-side hook files (`bin/session-metadata.py`, `hooks/session-start.sh`,
-`hooks/hooks.json`, and `hooks/auto-speak.sh`) execute from the plugin checkout
-on the Mini. They are not included in the MBP `/vm rebuild` sync.
+Mini-side hook files (`bin/session-metadata.py`, `bin/backfill-transcript.py`,
+`bin/prepare-speech.sh`, `hooks/session-start.sh`, `hooks/hooks.json`, and
+`hooks/auto-speak.sh`) execute from the plugin checkout on the Mini. They are
+not included in the MBP `/vm rebuild` sync.
 
 ## How to Apply Changes
 
@@ -81,6 +83,8 @@ active:
 - `cmd + shift` repeats the active or paused item; while idle it follows the
   same timeline behavior.
 - `/vm log play` mirrors `fn + fn`.
+- `/vm backfill [N]` adds completed transcript turns as unplayed log items and moves navigation to the newest import. It never starts playback; use `option + shift + left` to walk backward.
+- `/vm backfill status` reports the latest import, skip, and duplicate counts.
 - `/vm log first` and `/vm log latest` explicitly move the timeline cursor.
 - If the 200-item playback manifest is empty, timeline playback falls back to
   current MBP session history before giving a boundary chime.
