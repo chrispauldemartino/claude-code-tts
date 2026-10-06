@@ -1,6 +1,6 @@
 ---
-description: "Global voice mode toggle for Claude Code + Codex — on, off, rebuild, listen, test, dictation, quiet, repeat, skip, stop, pause, resume, forward, rewind, focus, log, speed, engine, doctor, status. Each of on/listen/dictation accepts optional claude|codex scope."
-argument-hint: "[on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|focus status|focus off|log|log status|log play|log back|log next|log first|log replay|log latest|speed|speed up|speed down|speed <wpm>|engine|engine say|engine openai|doctor|status|voice on/off|mic on/off|cue on/off|subtitle on/off|summary on/off]"
+description: "Global voice mode toggle for Claude Code + Codex — including per-session names, session/source announcement cues, focus, playback, and status."
+argument-hint: "[on [claude|codex]|off|listen [claude|codex]|dictation [claude|codex]|name [nickname]|cue session/source/both/off|cue-frequency always/change|focus|log|speed|engine|doctor|status|voice on/off|mic on/off|subtitle on/off|summary on/off]"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/vm-toggle.sh:*)
 ---
 
@@ -11,3 +11,11 @@ Execute the voice toggle script:
 ```
 
 Display the script output to the user without additional commentary.
+
+Session announcement controls:
+
+- `/vm name` shows the invoking session's nickname and provenance.
+- `/vm name <nickname>` stores a per-session override. Quote a nickname that contains spaces.
+- `/vm cue session|source|both|off` selects the standalone announcement content.
+- `/vm cue-frequency change|always` announces only on a `(source, session_id)` transition (the default) or before every item.
+- `/vm status` includes the invoking session ID, nickname/provenance, allowlist state, and whether voice is on, open, or background-muted for that session.

@@ -11,7 +11,7 @@ Manages the voice config file at `/tmp/claude-voice-config`. Each command reads 
 
 | Trigger | Config Changes |
 |---|---|
-| "voice mode" | voice=on, mic=on, cue=on, speed=300, volume=normal, summary=off, code=silent (full reset) |
+| "voice mode" | voice=on, mic=on, cue=session, cue_frequency=change, speed=300, volume=normal, summary=off, code=silent (full reset) |
 | "text mode" | Delete config file entirely |
 | "listen mode" | voice=on, mic=off, cue=off |
 | "dictation mode" | voice=off, mic=on, cue=off |
@@ -23,7 +23,9 @@ Manages the voice config file at `/tmp/claude-voice-config`. Each command reads 
 |---|---|
 | "voice on" / "voice off" | voice=on / voice=off |
 | "mic on" / "mic off" | mic=on / mic=off |
-| "cue on" / "cue off" | cue=on / cue=off |
+| "session cue" / "source cue" / "both cues" / "cue off" | cue=session / source / both / off |
+| "announce every item" / "announce on session change" | cue_frequency=always / change |
+| "name this session <nickname>" | `/vm name <nickname>` |
 | "summary mode on" / "summary mode off" | summary=on / summary=off |
 | "narrate code" / "skip code" | code=narrate / code=silent |
 | "speak faster" | speed += 50 (cap 350) |
