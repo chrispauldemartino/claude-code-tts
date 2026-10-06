@@ -85,6 +85,12 @@ let detailIndexFile = "/tmp/claude-tts-detail-cache/index.txt"
 let drillDownFlag = "/tmp/claude-tts-drill-down"
 let drillDownIndexFile = "/tmp/claude-tts-detail-cache/drill-index"
 let activeSegmentFile = "/tmp/claude-tts-active-segment"
+let stopGenerationFile = "/tmp/claude-tts-stop-generation"
+let stopAllRequestFile = "/tmp/claude-tts-stop-all-request"
+let autoplayResumeRequestFile = "/tmp/claude-tts-autoplay-resume"
+let stopTransactionLockDir = "/tmp/claude-tts-stop-transaction.lock"
+let stopTransactionWarningFile = "/tmp/claude-tts-stop-transaction-timeout.warning"
+let ttsLockOwnerFile = "/tmp/claude-tts-speaking.lock/owner"
 
 // MARK: - Arguments
 
@@ -153,6 +159,44 @@ class ControlState {
 }
 
 let state = ControlState()
+let stopGenerationStore = StopGenerationStore(
+    stateURL: URL(fileURLWithPath: stopGenerationFile)
+)
+
+final class OwnedProcessRegistry {
+    private let lock = NSLock()
+    private var processes: [ObjectIdentifier: Process] = [:]
+
+    func register(_ process: Process) {
+        lock.lock()
+        processes[ObjectIdentifier(process)] = process
+        lock.unlock()
+    }
+
+    func unregister(_ process: Process) {
+        lock.lock()
+        processes.removeValue(forKey: ObjectIdentifier(process))
+        lock.unlock()
+    }
+
+    func terminateAll() {
+        lock.lock()
+        let active = Array(processes.values)
+        lock.unlock()
+        for process in active where process.isRunning {
+            process.terminate()
+        }
+        let deadline = Date().addingTimeInterval(0.25)
+        while active.contains(where: { $0.isRunning }) && Date() < deadline {
+            usleep(10_000)
+        }
+        for process in active where process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+    }
+}
+
+let ownedProcesses = OwnedProcessRegistry()
 var globalTap: CFMachPort?
 let statePtr = Unmanaged.passUnretained(state).toOpaque()
 
@@ -199,6 +243,17 @@ func playChime() {
     try? proc.run()
 }
 
+func playChime(expectedGeneration: StopGenerationSnapshot) {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+    proc.arguments = ["--volume", chimeVolume, chimeSound]
+    _ = runProcessWithTimeout(
+        proc,
+        timeout: 3,
+        expectedGeneration: expectedGeneration
+    )
+}
+
 func playDoubleTink() {
     let proc1 = Process()
     proc1.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
@@ -211,6 +266,13 @@ func playDoubleTink() {
     proc2.arguments = ["--volume", chimeVolume, chimeSound]
     try? proc2.run()
     proc2.waitUntilExit()
+}
+
+func playDoubleTink(expectedGeneration: StopGenerationSnapshot) {
+    playChime(expectedGeneration: expectedGeneration)
+    guard stopGenerationStore.isCurrent(expectedGeneration) else { return }
+    usleep(80_000)
+    playChime(expectedGeneration: expectedGeneration)
 }
 
 // MARK: - Status Line
@@ -384,6 +446,77 @@ func ensureDirectory(_ path: String) {
     try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
 }
 
+func acquireStopTransactionLock(maxTicks: Int = 300) -> Bool {
+    let fm = FileManager.default
+    var waited = 0
+    while waited < maxTicks {
+        do {
+            try fm.createDirectory(
+                atPath: stopTransactionLockDir,
+                withIntermediateDirectories: false,
+                attributes: nil
+            )
+            return true
+        } catch {
+            if let attributes = try? fm.attributesOfItem(atPath: stopTransactionLockDir),
+               let modified = attributes[.modificationDate] as? Date,
+               Date().timeIntervalSince(modified) > 30 {
+                try? fm.removeItem(atPath: stopTransactionLockDir)
+                continue
+            }
+            usleep(10_000)
+            waited += 1
+        }
+    }
+    return false
+}
+
+func releaseStopTransactionLock() {
+    try? FileManager.default.removeItem(atPath: stopTransactionLockDir)
+}
+
+func acquireStopTransactionLockForStopAll() -> Bool {
+    if acquireStopTransactionLock() {
+        try? FileManager.default.removeItem(atPath: stopTransactionWarningFile)
+        return true
+    }
+
+    debugPrint("STOP ALL — WARNING: stop transaction lock unavailable after 3s; retrying up to 7s")
+    for retry in 1...7 {
+        if acquireStopTransactionLock(maxTicks: 100) {
+            debugPrint("STOP ALL — acquired stop transaction lock on bounded retry \(retry)")
+            try? FileManager.default.removeItem(atPath: stopTransactionWarningFile)
+            return true
+        }
+    }
+
+    let warning = "timestamp=\(Date().timeIntervalSince1970)\nreason=stop_transaction_lock_timeout\n"
+    do {
+        try warning.write(toFile: stopTransactionWarningFile, atomically: true, encoding: .utf8)
+    } catch {
+        debugPrint("STOP ALL — WARNING: could not write lock-timeout marker: \(error)")
+    }
+    debugPrint("STOP ALL — WARNING: proceeding after 10s hard cap without stop transaction lock; marker=\(stopTransactionWarningFile)")
+    return false
+}
+
+func drainLocalStopAllQueues() {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    process.arguments = [pluginToolPath("stopall-drain.sh"), queueDir, deferredQueueDir]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.standardError
+    do {
+        try process.run()
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            debugPrint("STOP ALL — WARNING: queue drain exited \(process.terminationStatus)")
+        }
+    } catch {
+        debugPrint("STOP ALL — WARNING: queue drain failed to launch: \(error)")
+    }
+}
+
 func uniqueDeferredEntryName(for entry: String) -> String {
     let safeEntry = entry.hasPrefix("entry-") ? String(entry.dropFirst(6)) : entry
     return "entry-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString)-\(safeEntry)"
@@ -488,6 +621,10 @@ func sourceMatchesTarget(_ sourceLabel: String?, target: String) -> Bool {
     return true
 }
 
+func sourceMatchesCurrentTarget(_ sourceLabel: String?) -> Bool {
+    sourceMatchesTarget(sourceLabel, target: currentTargetScope())
+}
+
 func deferredQueueCount() -> Int {
     guard let entries = try? FileManager.default.contentsOfDirectory(atPath: deferredQueueDir) else {
         return 0
@@ -557,6 +694,8 @@ struct PlaybackLogItem: Codable {
     var rawTextPath: String
     var normalizedTextPath: String
     var sentenceMapPath: String
+    var playbackState: String?
+    var skippedAt: TimeInterval?
 
     var preview: String {
         let base = String((try? String(contentsOfFile: normalizedTextPath, encoding: .utf8))?.prefix(60) ?? "")
@@ -721,8 +860,10 @@ func writeCurrentPlaybackItemID(_ id: String?) {
     writeString(id, to: currentPlaybackItemFile)
 }
 
-func focusedPlaybackLogItems() -> [PlaybackLogItem] {
-    let items = prunePlaybackLog()
+func focusedPlaybackLogItems(prune: Bool = true) -> [PlaybackLogItem] {
+    let target = currentTargetScope()
+    let sourceItems = prune ? prunePlaybackLog() : loadPlaybackLogItems()
+    let items = sourceItems.filter { sourceMatchesTarget($0.sourceLabel, target: target) }
     guard let focusedSession = readFocusedSessionID() else {
         return items
     }
@@ -747,8 +888,8 @@ func currentPlaybackLogItem() -> PlaybackLogItem? {
     return latest
 }
 
-func resetPlaybackLogCursorToLatest() {
-    let latest = focusedPlaybackLogItems().last
+func resetPlaybackLogCursorToLatest(prune: Bool = true) {
+    let latest = focusedPlaybackLogItems(prune: prune).last
     writeCurrentPlaybackItemID(latest?.id)
     writePlaybackCursor(0)
 }
@@ -791,16 +932,21 @@ func upsertPlaybackLogItem(
     sourceLabel: String?,
     sessionID: String?,
     speed: String,
-    volume: String
+    volume: String,
+    timestamp: TimeInterval? = nil,
+    playbackState: String? = nil,
+    skippedAt: TimeInterval? = nil,
+    pruneBeforeUpsert: Bool = true,
+    mergeBlockUpdates: Bool = true
 ) -> (item: PlaybackLogItem, sentenceOffset: Int, newSentenceText: String?) {
     ensurePlaybackLogDirectories()
-    var items = prunePlaybackLog()
+    var items = pruneBeforeUpsert ? prunePlaybackLog() : loadPlaybackLogItems()
     let fm = FileManager.default
 
     let normalizedSentences = splitSentences(normalizedText)
     let requestedEngine = currentRequestedEngine()
 
-    if let blockID,
+    if mergeBlockUpdates, let blockID,
        let idx = items.lastIndex(where: {
            $0.blockID == blockID && $0.sessionID == sessionID && $0.sourceLabel == sourceLabel
        }) {
@@ -824,10 +970,16 @@ func upsertPlaybackLogItem(
             updatedSentences[idx].index = idx
         }
 
-        item.timestamp = Date().timeIntervalSince1970
+        item.timestamp = timestamp ?? Date().timeIntervalSince1970
         item.speed = speed
         item.volume = volume
         item.requestedEngine = requestedEngine
+        if let playbackState {
+            item.playbackState = playbackState
+        }
+        if let skippedAt {
+            item.skippedAt = skippedAt
+        }
         rewritePlaybackTexts(rawText: rawText, normalizedText: normalizedText, item: item)
         saveSentenceMap(updatedSentences, for: item)
         items[idx] = item
@@ -846,7 +998,7 @@ func upsertPlaybackLogItem(
 
     let item = PlaybackLogItem(
         id: itemID,
-        timestamp: Date().timeIntervalSince1970,
+        timestamp: timestamp ?? Date().timeIntervalSince1970,
         sourceLabel: sourceLabel,
         sessionID: sessionID,
         requestedEngine: requestedEngine,
@@ -858,7 +1010,9 @@ func upsertPlaybackLogItem(
         itemDir: itemDir,
         rawTextPath: "\(itemDir)/raw.txt",
         normalizedTextPath: "\(itemDir)/normalized.txt",
-        sentenceMapPath: "\(itemDir)/sentence-map.json"
+        sentenceMapPath: "\(itemDir)/sentence-map.json",
+        playbackState: playbackState,
+        skippedAt: skippedAt
     )
     rewritePlaybackTexts(rawText: rawText, normalizedText: normalizedText, item: item)
     let sentenceMap = normalizedSentences.enumerated().map { offset, sentenceText in
@@ -868,6 +1022,108 @@ func upsertPlaybackLogItem(
     items.append(item)
     savePlaybackLogItems(items)
     return (item, 0, normalizedSentences.isEmpty ? nil : normalizedSentences.joined(separator: " "))
+}
+
+func archiveQueueEntryToPlaybackLog(_ entryURL: URL) -> String? {
+    let entryPath = entryURL.path
+    guard let text = try? String(contentsOf: entryURL.appendingPathComponent("text"), encoding: .utf8),
+          !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        debugPrint("STOP ALL — incomplete committed entry retained: \(entryPath)")
+        return nil
+    }
+
+    if let existingItemID = normalizeSessionID(
+        try? String(contentsOf: entryURL.appendingPathComponent("playback-item-id"), encoding: .utf8)
+    ), markPlaybackLogItemSkipped(id: existingItemID) {
+        debugPrint("STOP ALL — retained cached playback item \(existingItemID) for \(entryPath)")
+        return existingItemID
+    }
+
+    let speed = (try? String(contentsOf: entryURL.appendingPathComponent("speed"), encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "300"
+    let volume = (try? String(contentsOf: entryURL.appendingPathComponent("volume"), encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
+    let sourceLabel = normalizeSourceLabel(
+        try? String(contentsOf: entryURL.appendingPathComponent("source"), encoding: .utf8)
+    )
+    let sessionID = normalizeSessionID(
+        try? String(contentsOf: entryURL.appendingPathComponent("session"), encoding: .utf8)
+    )
+    let blockID = normalizeSessionID(
+        try? String(contentsOf: entryURL.appendingPathComponent("block"), encoding: .utf8)
+    )
+    let rawText = (try? String(contentsOf: entryURL.appendingPathComponent("raw"), encoding: .utf8)) ?? text
+    let normalizedText = (try? String(
+        contentsOf: entryURL.appendingPathComponent("normalized"),
+        encoding: .utf8
+    )) ?? text
+    let modified = (try? entryURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+        .contentModificationDate?.timeIntervalSince1970 ?? Date().timeIntervalSince1970
+
+    let result = upsertPlaybackLogItem(
+        blockID: blockID,
+        rawText: rawText,
+        normalizedText: normalizedText,
+        sourceLabel: sourceLabel,
+        sessionID: sessionID,
+        speed: speed,
+        volume: volume,
+        timestamp: modified,
+        playbackState: "skipped",
+        skippedAt: Date().timeIntervalSince1970,
+        pruneBeforeUpsert: false,
+        mergeBlockUpdates: false
+    )
+    debugPrint("STOP ALL — archived \(entryPath) as \(result.item.id)")
+    return result.item.id
+}
+
+@discardableResult
+func markPlaybackLogItemSkipped(id: String) -> Bool {
+    var items = loadPlaybackLogItems()
+    guard let index = items.firstIndex(where: { $0.id == id }) else { return false }
+    items[index].playbackState = "skipped"
+    items[index].skippedAt = Date().timeIntervalSince1970
+    savePlaybackLogItems(items)
+    return true
+}
+
+func markCurrentPlaybackItemSkipped() {
+    guard let currentID = readCurrentPlaybackItemID() else { return }
+    _ = markPlaybackLogItemSkipped(id: currentID)
+}
+
+@discardableResult
+func archivePendingQueueEntries(
+    discardStaging: Bool,
+    onlyHeldEntries: Bool
+) -> [String] {
+    let directories = [URL(fileURLWithPath: queueDir), URL(fileURLWithPath: deferredQueueDir)]
+    let archivedIDs = archiveStopAllQueueEntries(
+        in: directories,
+        discardStaging: discardStaging
+    ) { entryURL in
+        if onlyHeldEntries {
+            let archiveOnly = FileManager.default.fileExists(
+                atPath: entryURL.appendingPathComponent("archive-only").path
+            )
+            let modified = (try? entryURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate?.timeIntervalSince1970 ?? 0
+            guard stopGenerationStore.queueDisposition(
+                modificationTime: modified,
+                archiveOnly: archiveOnly
+            ) == .archive else {
+                return nil
+            }
+        }
+        return archiveQueueEntryToPlaybackLog(entryURL)
+    }
+
+    if !archivedIDs.isEmpty && (!onlyHeldEntries || stopGenerationStore.isAutoplayHeld()) {
+        writeCurrentPlaybackItemID(archivedIDs.last)
+        writePlaybackCursor(0)
+    }
+    return archivedIDs
 }
 
 func cachedSentenceAudioPath(itemID: String, sentenceIndex: Int) -> String? {
@@ -974,14 +1230,28 @@ func killTTSProcesses() {
     }
 }
 
-func runProcessWithTimeout(_ process: Process, timeout: TimeInterval) -> Bool {
+func runProcessWithTimeout(
+    _ process: Process,
+    timeout: TimeInterval,
+    expectedGeneration: StopGenerationSnapshot? = nil
+) -> Bool {
     let semaphore = DispatchSemaphore(value: 0)
     process.terminationHandler = { _ in
         semaphore.signal()
     }
 
+    ownedProcesses.register(process)
+    defer { ownedProcesses.unregister(process) }
+
     do {
-        try process.run()
+        if let expectedGeneration {
+            let launched = try stopGenerationStore.performIfCurrent(expectedGeneration) {
+                try process.run()
+            }
+            guard launched else { return false }
+        } else {
+            try process.run()
+        }
     } catch {
         debugPrint("PROCESS — failed to launch: \(error)")
         return false
@@ -1001,33 +1271,22 @@ func runProcessWithTimeout(_ process: Process, timeout: TimeInterval) -> Bool {
     return false
 }
 
-func waitWhilePaused() -> Bool {
+func waitWhilePaused(expectedGeneration: StopGenerationSnapshot) -> Bool {
     while FileManager.default.fileExists(atPath: pauseFlag) {
+        guard stopGenerationStore.isCurrent(expectedGeneration) else { return false }
         state.isPaused = true
         if FileManager.default.fileExists(atPath: skipFlag) {
             return false
         }
         usleep(150_000)
     }
+    guard stopGenerationStore.isCurrent(expectedGeneration) else { return false }
     state.isPaused = false
     return true
 }
 
-func pluginBinDirectory() -> String {
-    let executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-    if executableURL.path.contains(".app/Contents/MacOS/") {
-        return executableURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .path
-    }
-    return executableURL.deletingLastPathComponent().path
-}
-
 func speakTextBinaryPath() -> String {
-    "\(pluginBinDirectory())/speak-text"
+    pluginToolPath("speak-text")
 }
 
 struct SynthesisResult {
@@ -1037,7 +1296,12 @@ struct SynthesisResult {
     let outputFile: String?
 }
 
-func synthesizeWithSay(_ spokenText: String, speed: String, outputBasePath: String) -> SynthesisResult {
+func synthesizeWithSay(
+    _ spokenText: String,
+    speed: String,
+    outputBasePath: String,
+    expectedGeneration: StopGenerationSnapshot
+) -> SynthesisResult {
     let textFile = "/tmp/claude-tts-say-\(ProcessInfo.processInfo.processIdentifier).txt"
     let outputFile = "\(outputBasePath).aiff"
     try? spokenText.write(toFile: textFile, atomically: true, encoding: .utf8)
@@ -1045,7 +1309,11 @@ func synthesizeWithSay(_ spokenText: String, speed: String, outputBasePath: Stri
     let sayProc = Process()
     sayProc.executableURL = URL(fileURLWithPath: "/usr/bin/say")
     sayProc.arguments = ["-r", currentSpeechSpeed(fallback: speed), "-f", textFile, "-o", outputFile]
-    let success = runProcessWithTimeout(sayProc, timeout: 15)
+    let success = runProcessWithTimeout(
+        sayProc,
+        timeout: 15,
+        expectedGeneration: expectedGeneration
+    )
     try? FileManager.default.removeItem(atPath: textFile)
 
     if !success {
@@ -1066,7 +1334,8 @@ func synthesizeSpeechAudio(
     speed: String,
     requestedEngine: String,
     openAIVoice: String,
-    outputBasePath: String
+    outputBasePath: String,
+    expectedGeneration: StopGenerationSnapshot
 ) -> SynthesisResult {
     if requestedEngine == "openai" {
         let outputFile = "\(outputBasePath).mp3"
@@ -1078,7 +1347,11 @@ func synthesizeSpeechAudio(
             "-no-play",
             spokenText,
         ]
-        let success = runProcessWithTimeout(proc, timeout: 30)
+        let success = runProcessWithTimeout(
+            proc,
+            timeout: 30,
+            expectedGeneration: expectedGeneration
+        )
         if success && FileManager.default.fileExists(atPath: outputFile) {
             return SynthesisResult(
                 success: true,
@@ -1089,7 +1362,12 @@ func synthesizeSpeechAudio(
         }
 
         try? FileManager.default.removeItem(atPath: outputFile)
-        let fallback = synthesizeWithSay(spokenText, speed: speed, outputBasePath: outputBasePath)
+        let fallback = synthesizeWithSay(
+            spokenText,
+            speed: speed,
+            outputBasePath: outputBasePath,
+            expectedGeneration: expectedGeneration
+        )
         return SynthesisResult(
             success: fallback.success,
             actualEngine: fallback.actualEngine,
@@ -1098,33 +1376,52 @@ func synthesizeSpeechAudio(
         )
     }
 
-    return synthesizeWithSay(spokenText, speed: speed, outputBasePath: outputBasePath)
+    return synthesizeWithSay(
+        spokenText,
+        speed: speed,
+        outputBasePath: outputBasePath,
+        expectedGeneration: expectedGeneration
+    )
 }
 
-func playAudioFile(_ path: String, volume: String) -> Bool {
+func playAudioFile(
+    _ path: String,
+    volume: String,
+    expectedGeneration: StopGenerationSnapshot
+) -> Bool {
     let playProc = Process()
     playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
     playProc.arguments = ["--volume", volume, path]
-    return runProcessWithTimeout(playProc, timeout: 20)
+    return runProcessWithTimeout(
+        playProc,
+        timeout: 20,
+        expectedGeneration: expectedGeneration
+    )
 }
 
 // Audio mutex — same lock as auto-speak.sh so repeat/nav don't overlap with hook TTS
 let ttsLockDir = "/tmp/claude-tts-speaking.lock"
 let ttsLockPidFile = "/tmp/claude-tts-speaking.lock/pid"
 
-func acquireTTSLock() {
+func acquireTTSLock(expectedGeneration: StopGenerationSnapshot) -> String? {
     let fm = FileManager.default
+    let ownerToken = UUID().uuidString
     while true {
+        guard stopGenerationStore.isCurrent(expectedGeneration) else { return nil }
         do {
-            try fm.createDirectory(
-                atPath: ttsLockDir,
-                withIntermediateDirectories: false,
-                attributes: nil
-            )
-            try "\(ProcessInfo.processInfo.processIdentifier)".write(
-                toFile: ttsLockPidFile, atomically: true, encoding: .utf8)
+            let claimed = try stopGenerationStore.performIfCurrent(expectedGeneration) {
+                try fm.createDirectory(
+                    atPath: ttsLockDir,
+                    withIntermediateDirectories: false,
+                    attributes: nil
+                )
+                try "\(ProcessInfo.processInfo.processIdentifier)".write(
+                    toFile: ttsLockPidFile, atomically: true, encoding: .utf8)
+                try ownerToken.write(toFile: ttsLockOwnerFile, atomically: true, encoding: .utf8)
+            }
+            guard claimed else { return nil }
             debugPrint("TTS lock acquired")
-            return
+            return ownerToken
         } catch {
             // Lock exists — check if holder is alive
             if let pidStr = try? String(contentsOfFile: ttsLockPidFile, encoding: .utf8),
@@ -1134,17 +1431,34 @@ func acquireTTSLock() {
                     usleep(300_000)
                 } else {
                     // Stale lock — reclaim
-                    try? fm.removeItem(atPath: ttsLockDir)
+                    _ = stopGenerationStore.performIfCurrent(expectedGeneration) {
+                        let currentPid = try? String(contentsOfFile: ttsLockPidFile, encoding: .utf8)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if currentPid == String(pid) {
+                            try? fm.removeItem(atPath: ttsLockDir)
+                        }
+                    }
                     debugPrint("Removed stale TTS lock (pid \(pid) dead)")
                 }
             } else {
-                try? fm.removeItem(atPath: ttsLockDir)
+                _ = stopGenerationStore.performIfCurrent(expectedGeneration) {
+                    if !fm.fileExists(atPath: ttsLockPidFile) &&
+                        !fm.fileExists(atPath: ttsLockOwnerFile) {
+                        try? fm.removeItem(atPath: ttsLockDir)
+                    }
+                }
             }
         }
     }
 }
 
-func releaseTTSLock() {
+func releaseTTSLock(ownerToken: String) {
+    guard let currentOwner = try? String(contentsOfFile: ttsLockOwnerFile, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+          currentOwner == ownerToken else {
+        debugPrint("TTS lock release ignored for stale owner")
+        return
+    }
     try? FileManager.default.removeItem(atPath: ttsLockDir)
     debugPrint("TTS lock released")
 }
@@ -1220,10 +1534,40 @@ func triggerSkip() {
 
 func triggerStopAll() {
     debugPrint("STOP ALL — killing everything")
+    let hadActivePlayback = FileManager.default.fileExists(atPath: ttsPlayingFlag) ||
+        FileManager.default.fileExists(atPath: ttsLockDir)
+    let ownsTransactionLock = acquireStopTransactionLockForStopAll()
+    let stoppedGeneration = stopGenerationStore.advance()
+    if !stopGenerationStore.isPersistenceHealthy() {
+        debugPrint("STOP ALL — generation persistence failed; autoplay remains fail-closed")
+    }
+    ownedProcesses.terminateAll()
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
-    try? FileManager.default.removeItem(atPath: restartQueueFlag)
-    try? FileManager.default.removeItem(atPath: pauseFlag)
+    for requestFile in [
+        restartQueueFlag,
+        pauseFlag,
+        forwardFlag,
+        rewindFlag,
+        bigForwardFlag,
+        bigRewindFlag,
+        drillDownFlag,
+        playbackLogCommandFile,
+        autoplayResumeRequestFile,
+        voiceInputStopFlag,
+        navIndexFile,
+    ] {
+        try? FileManager.default.removeItem(atPath: requestFile)
+    }
     state.isPaused = false
+
+    if hadActivePlayback {
+        markCurrentPlaybackItemSkipped()
+    }
+    let archivedIDs = archivePendingQueueEntries(
+        discardStaging: true,
+        onlyHeldEntries: false
+    )
+    drainLocalStopAllQueues()
 
     // Kill file read if active — clear flag so auto-speak resumes
     let wasReadingFile = isReadingFile()
@@ -1251,18 +1595,19 @@ func triggerStopAll() {
     // Force-release TTS lock in case something is stuck
     try? FileManager.default.removeItem(atPath: ttsLockDir)
     clearActiveSegment()
-
-    // Reset repeat anchor — next repeat plays from latest terminal message,
-    // NOT from where the file read or TTS was killed
-    resetRepeatAnchor()
-    resetPlaybackLogCursorToLatest()
-
     clearTTYSubtitle()
-
-    // Chime AFTER cleanup so pkill doesn't kill it
-    usleep(100_000)
-    playChime()
-    debugPrint("STOP ALL — everything killed, lock cleared, cursor reset to latest playback item")
+    try? FileManager.default.removeItem(atPath: skipFlag)
+    writeCurrentPlaybackItemID(
+        stopAllCursorItemID(
+            archivedIDs: archivedIDs,
+            manifestLatestID: loadPlaybackLogItems().last?.id
+        )
+    )
+    writePlaybackCursor(0)
+    if ownsTransactionLock {
+        releaseStopTransactionLock()
+    }
+    debugPrint("STOP ALL — generation \(stoppedGeneration.generation), archived \(archivedIDs.count) queued item(s), autoplay held")
 }
 
 // MARK: - Repeat (cmd+shift)
@@ -1410,8 +1755,11 @@ func triggerHistoryPlaybackAction(
     useFirst: Bool = false,
     useLatest: Bool = false,
     timeline: Bool = false,
-    status: String
+    status: String,
+    expectedGeneration: StopGenerationSnapshot? = nil
 ) -> Bool {
+    let playbackGeneration = expectedGeneration ?? stopGenerationStore.snapshot()
+    guard stopGenerationStore.isCurrent(playbackGeneration) else { return false }
     guard let target = historyPlaybackTarget(
         direction: direction,
         useFirst: useFirst,
@@ -1424,9 +1772,14 @@ func triggerHistoryPlaybackAction(
     interruptPlaybackForReplay()
 
     DispatchQueue.global(qos: .userInitiated).async {
-        waitForPlaybackLockRelease()
+        guard waitForPlaybackLockRelease(expectedGeneration: playbackGeneration) else { return }
         debugPrint("HISTORY LOG — playing \(target.index + 1)/\(target.total) status=\(status)")
-        playContext(target.context, startIndex: 0, status: status)
+        playContext(
+            target.context,
+            startIndex: 0,
+            status: status,
+            expectedGeneration: playbackGeneration
+        )
     }
 
     return true
@@ -1501,30 +1854,49 @@ func loadReplayContext() -> PlaybackContext? {
     )
 }
 
-func playContext(_ context: PlaybackContext, startIndex: Int, status: String) {
+func playContext(
+    _ context: PlaybackContext,
+    startIndex: Int,
+    status: String,
+    expectedGeneration: StopGenerationSnapshot? = nil
+) {
+    let playbackGeneration = expectedGeneration ?? stopGenerationStore.snapshot()
+    guard stopGenerationStore.isCurrent(playbackGeneration) else { return }
     let sentences = splitSentences(context.text)
     guard !sentences.isEmpty else {
         debugPrint("PLAYBACK — no sentences available for \(status)")
-        playChime()
+        playChime(expectedGeneration: playbackGeneration)
         return
     }
 
     let clampedStart = min(max(startIndex, 0), max(sentences.count - 1, 0))
 
-    FileManager.default.createFile(atPath: skipFlag, contents: nil)
-    killTTSProcesses()
+    guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+        FileManager.default.createFile(atPath: skipFlag, contents: nil)
+        killTTSProcesses()
+    }) else { return }
 
     DispatchQueue.global(qos: .userInitiated).async {
         usleep(300_000)
-        playChime()
+        guard stopGenerationStore.isCurrent(playbackGeneration) else { return }
+        playChime(expectedGeneration: playbackGeneration)
 
-        acquireTTSLock()
-        try? FileManager.default.removeItem(atPath: skipFlag)
-        persistPlaybackContext(context)
-
-        writePlaybackCursor(clampedStart)
-        FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
-        writeActiveSegment(preview: playbackPreview(context), status: status)
+        guard let lockOwner = acquireTTSLock(expectedGeneration: playbackGeneration) else { return }
+        guard stopGenerationStore.isCurrent(playbackGeneration) else {
+            releaseTTSLock(ownerToken: lockOwner)
+            return
+        }
+        let prepared = stopGenerationStore.performIfCurrent(playbackGeneration) {
+            try? FileManager.default.removeItem(atPath: skipFlag)
+            persistPlaybackContext(context)
+            writePlaybackCursor(clampedStart)
+            FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
+            writeActiveSegment(preview: playbackPreview(context), status: status)
+        }
+        guard prepared else {
+            releaseTTSLock(ownerToken: lockOwner)
+            return
+        }
 
         speakText(
             context.text,
@@ -1533,18 +1905,22 @@ func playContext(_ context: PlaybackContext, startIndex: Int, status: String) {
             sourceLabel: context.sourceLabel,
             sessionID: context.sessionID,
             startIndex: clampedStart,
-            playbackItemID: context.itemID
+            playbackItemID: context.itemID,
+            expectedGeneration: playbackGeneration
         )
 
-        clearTTYSubtitle()
-        try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
-        try? FileManager.default.removeItem(atPath: skipFlag)
-        clearActiveSegment()
-        releaseTTSLock()
+        _ = stopGenerationStore.performIfCurrent(playbackGeneration) {
+            clearTTYSubtitle()
+            try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
+            try? FileManager.default.removeItem(atPath: skipFlag)
+            clearActiveSegment()
+        }
+        releaseTTSLock(ownerToken: lockOwner)
     }
 }
 
 func triggerSentenceSeek(delta: Int) {
+    stopGenerationStore.clearAutoplayHold()
     guard let context = loadReplayContext() else {
         debugPrint("SEEK — no replay context")
         playChime()
@@ -1583,6 +1959,7 @@ func triggerSentenceSeek(delta: Int) {
 }
 
 func triggerRepeat() {
+    stopGenerationStore.clearAutoplayHold()
     debugPrint("REPEAT — replaying current message from start")
 
     guard let context = loadReplayContext() else {
@@ -1631,8 +2008,11 @@ func speakText(
     startIndex: Int = 0,
     queueRestartAware: Bool = false,
     playbackItemID: String? = nil,
-    sentenceBaseIndex: Int = 0
+    sentenceBaseIndex: Int = 0,
+    expectedGeneration: StopGenerationSnapshot? = nil
 ) {
+    let playbackGeneration = expectedGeneration ?? stopGenerationStore.snapshot()
+    guard stopGenerationStore.isCurrent(playbackGeneration) else { return }
     let sentences = splitSentences(text)
     guard !sentences.isEmpty else { return }
 
@@ -1646,23 +2026,28 @@ func speakText(
 
     var idx = min(max(startIndex, 0), max(sentences.count - 1, 0))
     while idx < sentences.count {
+        guard stopGenerationStore.isCurrent(playbackGeneration) else { break }
         if FileManager.default.fileExists(atPath: skipFlag) { break }
         if queueRestartAware && shouldRestartQueuePlayback() {
             debugPrint("QUEUE — restart requested during active playback")
             break
         }
-        if !waitWhilePaused() { break }
+        if !waitWhilePaused(expectedGeneration: playbackGeneration) { break }
 
         // Check forward/rewind
         if FileManager.default.fileExists(atPath: forwardFlag) {
-            try? FileManager.default.removeItem(atPath: forwardFlag)
-            killTTSProcesses()
+            guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+                try? FileManager.default.removeItem(atPath: forwardFlag)
+                killTTSProcesses()
+            }) else { break }
             idx = min(idx + 1, sentences.count - 1)
             continue
         }
         if FileManager.default.fileExists(atPath: rewindFlag) {
-            try? FileManager.default.removeItem(atPath: rewindFlag)
-            killTTSProcesses()
+            guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+                try? FileManager.default.removeItem(atPath: rewindFlag)
+                killTTSProcesses()
+            }) else { break }
             idx = max(idx - 1, 0)
             continue
         }
@@ -1686,8 +2071,10 @@ func speakText(
         let outputFile: String
         let shouldRemoveAfterPlayback: Bool
         let cacheSentenceIndex = sentenceBaseIndex + idx
-        showTTYSubtitle(subtitleText)
-        writePlaybackCursor(cacheSentenceIndex)
+        guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+            showTTYSubtitle(subtitleText)
+            writePlaybackCursor(cacheSentenceIndex)
+        }) else { break }
         if let playbackItemID,
            let cachedPath = cachedSentenceAudioPath(itemID: playbackItemID, sentenceIndex: cacheSentenceIndex) {
             outputFile = cachedPath
@@ -1709,9 +2096,11 @@ func speakText(
                 speed: speed,
                 requestedEngine: requestedEngine,
                 openAIVoice: currentOpenAIVoice(),
-                outputBasePath: outputBasePath
+                outputBasePath: outputBasePath,
+                expectedGeneration: playbackGeneration
             )
             guard synthesis.success, let synthesizedFile = synthesis.outputFile else {
+                guard stopGenerationStore.isCurrent(playbackGeneration) else { break }
                 debugPrint("TTS — synthesis failed for sentence \(idx + 1)")
                 if queueRestartAware && shouldRestartQueuePlayback() {
                     break
@@ -1723,17 +2112,19 @@ func speakText(
             shouldRemoveAfterPlayback = playbackItemID == nil
 
             if let playbackItemID {
-                updatePlaybackLogAudioState(
-                    itemID: playbackItemID,
-                    sentenceIndex: cacheSentenceIndex,
-                    audioFile: synthesizedFile,
-                    actualEngine: synthesis.actualEngine,
-                    fallbackReason: synthesis.fallbackReason
-                )
+                _ = stopGenerationStore.performIfCurrent(playbackGeneration) {
+                    updatePlaybackLogAudioState(
+                        itemID: playbackItemID,
+                        sentenceIndex: cacheSentenceIndex,
+                        audioFile: synthesizedFile,
+                        actualEngine: synthesis.actualEngine,
+                        fallbackReason: synthesis.fallbackReason
+                    )
+                }
             }
         }
 
-        if FileManager.default.fileExists(atPath: skipFlag) {
+        if !stopGenerationStore.isCurrent(playbackGeneration) || FileManager.default.fileExists(atPath: skipFlag) {
             if shouldRemoveAfterPlayback {
                 try? FileManager.default.removeItem(atPath: outputFile)
             }
@@ -1745,7 +2136,7 @@ func speakText(
             }
             break
         }
-        if !waitWhilePaused() {
+        if !waitWhilePaused(expectedGeneration: playbackGeneration) {
             if shouldRemoveAfterPlayback {
                 try? FileManager.default.removeItem(atPath: outputFile)
             }
@@ -1753,7 +2144,11 @@ func speakText(
         }
 
         // Play audio
-        let played = playAudioFile(outputFile, volume: volume)
+        let played = playAudioFile(
+            outputFile,
+            volume: volume,
+            expectedGeneration: playbackGeneration
+        )
 
         if shouldRemoveAfterPlayback {
             try? FileManager.default.removeItem(atPath: outputFile)
@@ -1766,6 +2161,7 @@ func speakText(
             idx += 1
             continue
         }
+        guard stopGenerationStore.isCurrent(playbackGeneration) else { break }
         if FileManager.default.fileExists(atPath: skipFlag) { break }
         if queueRestartAware && shouldRestartQueuePlayback() {
             break
@@ -1773,17 +2169,19 @@ func speakText(
         if FileManager.default.fileExists(atPath: forwardFlag) || FileManager.default.fileExists(atPath: rewindFlag) {
             continue
         }
-        if idx == 0, let source = normalizedSource {
-            try? source.write(toFile: lastSourceFile, atomically: true, encoding: .utf8)
-        }
-        if idx == 0 {
-            if let session = normalizedSession {
-                try? session.write(toFile: lastSessionFile, atomically: true, encoding: .utf8)
-            } else {
-                try? FileManager.default.removeItem(atPath: lastSessionFile)
+        guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+            if idx == 0, let source = normalizedSource {
+                try? source.write(toFile: lastSourceFile, atomically: true, encoding: .utf8)
             }
-        }
-        writePlaybackCursor(cacheSentenceIndex + 1)
+            if idx == 0 {
+                if let session = normalizedSession {
+                    try? session.write(toFile: lastSessionFile, atomically: true, encoding: .utf8)
+                } else {
+                    try? FileManager.default.removeItem(atPath: lastSessionFile)
+                }
+            }
+            writePlaybackCursor(cacheSentenceIndex + 1)
+        }) else { break }
         idx += 1
     }
 }
@@ -1807,12 +2205,24 @@ func adjustSpeechSpeed(delta: Int) {
 // MARK: - Drill-Down (opt+shift double-tap or voice keyword)
 
 func triggerDrillDown(target: String? = nil) {
+    stopGenerationStore.clearAutoplayHold()
+    let playbackGeneration = stopGenerationStore.snapshot()
+    DispatchQueue.global(qos: .userInitiated).async {
+        performDrillDown(target: target, playbackGeneration: playbackGeneration)
+    }
+}
+
+func performDrillDown(
+    target: String?,
+    playbackGeneration: StopGenerationSnapshot
+) {
+    guard stopGenerationStore.isCurrent(playbackGeneration) else { return }
     debugPrint("DRILL-DOWN — target: \(target ?? "cycle")")
 
     // Read available cache entries from index
     guard let indexContent = try? String(contentsOfFile: detailIndexFile, encoding: .utf8) else {
         debugPrint("DRILL-DOWN — no index file, ignoring")
-        playChime()
+        playChime(expectedGeneration: playbackGeneration)
         return
     }
 
@@ -1822,7 +2232,7 @@ func triggerDrillDown(target: String? = nil) {
 
     guard !entries.isEmpty else {
         debugPrint("DRILL-DOWN — index empty, ignoring")
-        playChime()
+        playChime(expectedGeneration: playbackGeneration)
         return
     }
 
@@ -1838,7 +2248,7 @@ func triggerDrillDown(target: String? = nil) {
                 entryFile = match
             } else {
                 debugPrint("DRILL-DOWN — no entry matching '\(t)', ignoring")
-                playChime()
+                playChime(expectedGeneration: playbackGeneration)
                 return
             }
         }
@@ -1848,19 +2258,25 @@ func triggerDrillDown(target: String? = nil) {
             .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "-1"
         var current = Int(currentStr) ?? -1
         current = (current + 1) % entries.count
-        try? "\(current)".write(toFile: drillDownIndexFile, atomically: true, encoding: .utf8)
+        guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+            try? "\(current)".write(toFile: drillDownIndexFile, atomically: true, encoding: .utf8)
+        }) else { return }
         entryFile = entries[current]
         debugPrint("DRILL-DOWN — cycling to entry \(current + 1)/\(entries.count): \(entryFile)")
     }
 
     // Stop any active audio
-    FileManager.default.createFile(atPath: skipFlag, contents: nil)
-    killTTSProcesses()
+    guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+        FileManager.default.createFile(atPath: skipFlag, contents: nil)
+        killTTSProcesses()
+    }) else { return }
     usleep(300_000)
 
-    acquireTTSLock()
-    try? FileManager.default.removeItem(atPath: skipFlag)
-
+    guard let lockOwner = acquireTTSLock(expectedGeneration: playbackGeneration) else { return }
+    guard stopGenerationStore.isCurrent(playbackGeneration) else {
+        releaseTTSLock(ownerToken: lockOwner)
+        return
+    }
     // Read speed/volume from voice config
     let speed = currentSpeechSpeed()
     let volLine = readConfigValue("volume").isEmpty ? "normal" : readConfigValue("volume")
@@ -1875,14 +2291,21 @@ func triggerDrillDown(target: String? = nil) {
     }
 
     // Mark TTS as playing and chime
-    FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
     let previewText = String((try? String(contentsOfFile: "\(detailCacheDir)/\(entriesToPlay[0])", encoding: .utf8))?.prefix(60) ?? "")
-    writeActiveSegment(preview: previewText, status: "drill-down")
-    playDoubleTink()
+    guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+        try? FileManager.default.removeItem(atPath: skipFlag)
+        FileManager.default.createFile(atPath: ttsPlayingFlag, contents: nil)
+        writeActiveSegment(preview: previewText, status: "drill-down")
+    }) else {
+        releaseTTSLock(ownerToken: lockOwner)
+        return
+    }
+    playDoubleTink(expectedGeneration: playbackGeneration)
 
     // Play in background
     DispatchQueue.global(qos: .userInitiated).async {
         for entry in entriesToPlay {
+            guard stopGenerationStore.isCurrent(playbackGeneration) else { break }
             let filePath = "\(detailCacheDir)/\(entry)"
             guard let text = try? String(contentsOfFile: filePath, encoding: .utf8),
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -1891,9 +2314,11 @@ func triggerDrillDown(target: String? = nil) {
             }
 
             // Save for repeat
-            try? text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
-            try? speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
-            try? volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
+            guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+                try? text.write(toFile: lastTextFile, atomically: true, encoding: .utf8)
+                try? speed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+                try? volume.write(toFile: lastVolumeFile, atomically: true, encoding: .utf8)
+            }) else { break }
 
             let sentences = text.components(separatedBy: CharacterSet(charactersIn: ".!?"))
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1902,18 +2327,23 @@ func triggerDrillDown(target: String? = nil) {
             var skipped = false
             var idx = 0
             while idx < sentences.count {
+                guard stopGenerationStore.isCurrent(playbackGeneration) else { skipped = true; break }
                 if FileManager.default.fileExists(atPath: skipFlag) { skipped = true; break }
 
                 // Check forward/rewind
                 if FileManager.default.fileExists(atPath: forwardFlag) {
-                    try? FileManager.default.removeItem(atPath: forwardFlag)
-                    killTTSProcesses()
+                    guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+                        try? FileManager.default.removeItem(atPath: forwardFlag)
+                        killTTSProcesses()
+                    }) else { skipped = true; break }
                     idx = min(idx + 3, sentences.count - 1)
                     continue
                 }
                 if FileManager.default.fileExists(atPath: rewindFlag) {
-                    try? FileManager.default.removeItem(atPath: rewindFlag)
-                    killTTSProcesses()
+                    guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+                        try? FileManager.default.removeItem(atPath: rewindFlag)
+                        killTTSProcesses()
+                    }) else { skipped = true; break }
                     idx = max(idx - 3, 0)
                     continue
                 }
@@ -1929,21 +2359,24 @@ func triggerDrillDown(target: String? = nil) {
                 let pipe = sayProc.standardInput as! Pipe
                 pipe.fileHandleForWriting.write(sentence.data(using: .utf8)!)
                 pipe.fileHandleForWriting.closeFile()
-                try? sayProc.run()
-                sayProc.waitUntilExit()
+                let generated = runProcessWithTimeout(
+                    sayProc,
+                    timeout: 15,
+                    expectedGeneration: playbackGeneration
+                )
 
-                if FileManager.default.fileExists(atPath: skipFlag) {
+                if !generated || !stopGenerationStore.isCurrent(playbackGeneration) || FileManager.default.fileExists(atPath: skipFlag) {
                     try? FileManager.default.removeItem(atPath: tmpFile)
                     skipped = true
                     break
                 }
 
                 // Play audio
-                let playProc = Process()
-                playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
-                playProc.arguments = ["--volume", volume, tmpFile]
-                try? playProc.run()
-                playProc.waitUntilExit()
+                _ = playAudioFile(
+                    tmpFile,
+                    volume: volume,
+                    expectedGeneration: playbackGeneration
+                )
 
                 try? FileManager.default.removeItem(atPath: tmpFile)
                 idx += 1
@@ -1953,10 +2386,12 @@ func triggerDrillDown(target: String? = nil) {
         }
 
         // Cleanup
-        try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
-        try? FileManager.default.removeItem(atPath: skipFlag)
-        clearActiveSegment()
-        releaseTTSLock()
+        _ = stopGenerationStore.performIfCurrent(playbackGeneration) {
+            try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
+            try? FileManager.default.removeItem(atPath: skipFlag)
+            clearActiveSegment()
+        }
+        releaseTTSLock(ownerToken: lockOwner)
     }
 }
 
@@ -1968,21 +2403,34 @@ func interruptPlaybackForReplay() {
     try? FileManager.default.removeItem(atPath: ttsPlayingFlag)
 }
 
-func waitForPlaybackLockRelease(maxTicks: Int = 30) {
+func waitForPlaybackLockRelease(
+    expectedGeneration: StopGenerationSnapshot,
+    maxTicks: Int = 30
+) -> Bool {
     var waited = 0
     while FileManager.default.fileExists(atPath: ttsLockDir) && waited < maxTicks {
+        guard stopGenerationStore.isCurrent(expectedGeneration) else { return false }
         if let pidStr = try? String(contentsOfFile: ttsLockPidFile, encoding: .utf8),
            let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
            kill(pid, 0) != 0 {
-            try? FileManager.default.removeItem(atPath: ttsLockDir)
+            _ = stopGenerationStore.performIfCurrent(expectedGeneration) {
+                let currentPid = try? String(contentsOfFile: ttsLockPidFile, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if currentPid == String(pid) {
+                    try? FileManager.default.removeItem(atPath: ttsLockDir)
+                }
+            }
             break
         }
         usleep(100_000)
         waited += 1
     }
     if FileManager.default.fileExists(atPath: ttsLockDir) {
-        try? FileManager.default.removeItem(atPath: ttsLockDir)
+        guard stopGenerationStore.isCurrent(expectedGeneration) else { return false }
+        debugPrint("TTS lock wait timed out; live owner retained")
+        return false
     }
+    return stopGenerationStore.isCurrent(expectedGeneration)
 }
 
 func playbackLogTargetItem(direction: String? = nil, useLatest: Bool = false) -> PlaybackLogItem? {
@@ -2004,17 +2452,11 @@ func playbackLogTargetItem(direction: String? = nil, useLatest: Bool = false) ->
         currentIndex = defaultIndex
     }
 
-    let targetIndex: Int
-    switch direction {
-    case "next":
-        guard currentIndex < items.count - 1 else { return nil }
-        targetIndex = currentIndex + 1
-    case "prev":
-        guard currentIndex > 0 else { return nil }
-        targetIndex = currentIndex - 1
-    default:
-        targetIndex = currentIndex
-    }
+    guard let targetIndex = playbackLogTargetIndex(
+        itemCount: items.count,
+        currentIndex: currentIndex,
+        direction: direction
+    ) else { return nil }
 
     let target = items[targetIndex]
     writeCurrentPlaybackItemID(target.id)
@@ -2029,6 +2471,8 @@ func triggerPlaybackLogAction(
     timeline: Bool = false,
     status: String
 ) -> Bool {
+    stopGenerationStore.clearAutoplayHold()
+    let playbackGeneration = stopGenerationStore.snapshot()
     let targetItem: PlaybackLogItem?
     if useFirst {
         targetItem = playbackLogFirstItem()
@@ -2040,25 +2484,31 @@ func triggerPlaybackLogAction(
 
     guard let target = targetItem,
           let context = playbackContext(from: target) else {
-        if triggerHistoryPlaybackAction(
+        if !stopGenerationStore.hasRecordedStop(), triggerHistoryPlaybackAction(
             direction: direction,
             useFirst: useFirst,
             useLatest: useLatest,
             timeline: timeline,
-            status: status
+            status: status,
+            expectedGeneration: playbackGeneration
         ) {
             return true
         }
-        playChime()
+        playChime(expectedGeneration: playbackGeneration)
         return false
     }
 
     interruptPlaybackForReplay()
 
     DispatchQueue.global(qos: .userInitiated).async {
-        waitForPlaybackLockRelease()
+        guard waitForPlaybackLockRelease(expectedGeneration: playbackGeneration) else { return }
         debugPrint("PLAYBACK LOG — playing \(target.id) status=\(status)")
-        playContext(context, startIndex: 0, status: status)
+        playContext(
+            context,
+            startIndex: 0,
+            status: status,
+            expectedGeneration: playbackGeneration
+        )
     }
 
     return true
@@ -2166,6 +2616,12 @@ func triggerMessageNav(direction: String) {
     if triggerPlaybackLogAction(direction: direction == "next" ? "next" : "prev", status: "nav") {
         return
     }
+    if stopGenerationStore.hasRecordedStop() {
+        debugPrint("MESSAGE NAV — no playback-log target after stop; legacy history fallback suppressed")
+        playChime()
+        return
+    }
+    let playbackGeneration = stopGenerationStore.snapshot()
 
     // Signal auto-speak.sh to stop and kill audio
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
@@ -2174,35 +2630,22 @@ func triggerMessageNav(direction: String) {
 
     // Everything on background thread — main thread must stay free for CGEvent
     DispatchQueue.global(qos: .userInitiated).async {
-        // Wait for the speaking session to release the lock (up to 3s timeout)
-        var waited = 0
-        while FileManager.default.fileExists(atPath: ttsLockDir) && waited < 30 {
-            // Check if lock holder is dead
-            if let pidStr = try? String(contentsOfFile: ttsLockPidFile, encoding: .utf8),
-               let pid = Int32(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                if kill(pid, 0) != 0 {
-                    // Dead process — clear stale lock
-                    try? FileManager.default.removeItem(atPath: ttsLockDir)
-                    break
-                }
-            }
-            usleep(100_000)
-            waited += 1
-        }
-        // Force-clear if we timed out
-        if FileManager.default.fileExists(atPath: ttsLockDir) {
-            try? FileManager.default.removeItem(atPath: ttsLockDir)
-        }
+        guard waitForPlaybackLockRelease(expectedGeneration: playbackGeneration) else { return }
 
         // Chime immediately — audio is dead
-        playChime()
+        playChime(expectedGeneration: playbackGeneration)
         // Brief wait then kill any straggler say processes (not afplay so chime survives)
         usleep(200_000)
+        guard stopGenerationStore.isCurrent(playbackGeneration) else { return }
         let killSay = Process()
         killSay.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
         killSay.arguments = ["say"]
-        try? killSay.run()
-        killSay.waitUntilExit()
+        _ = runProcessWithTimeout(
+            killSay,
+            timeout: 3,
+            expectedGeneration: playbackGeneration
+        )
+        guard stopGenerationStore.isCurrent(playbackGeneration) else { return }
         try? FileManager.default.removeItem(atPath: skipFlag)
         let totalHistory = historyMessageTotal()
         if totalHistory > 0 {
@@ -2215,26 +2658,39 @@ func triggerMessageNav(direction: String) {
             current = min(max(current, 0), totalHistory - 1)
 
             if direction == "next" {
-                guard current < totalHistory - 1 else { playChime(); return }
+                guard current < totalHistory - 1 else {
+                    playChime(expectedGeneration: playbackGeneration)
+                    return
+                }
                 current += 1
             } else {
-                guard current > 0 else { playChime(); return }
+                guard current > 0 else {
+                    playChime(expectedGeneration: playbackGeneration)
+                    return
+                }
                 current -= 1
             }
 
             let historyIndex = current + 1
             guard let context = readHistoryMessage(at: historyIndex) else {
                 debugPrint("MESSAGE NAV — missing history message \(historyIndex)")
-                playChime()
+                playChime(expectedGeneration: playbackGeneration)
                 return
             }
 
-            try? "\(current)".write(toFile: navIndexFile, atomically: true, encoding: .utf8)
-            try? "\(historyIndex)".write(toFile: repeatAnchorFile, atomically: true, encoding: .utf8)
+            guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+                try? "\(current)".write(toFile: navIndexFile, atomically: true, encoding: .utf8)
+                try? "\(historyIndex)".write(toFile: repeatAnchorFile, atomically: true, encoding: .utf8)
+            }) else { return }
             debugPrint("MESSAGE NAV — updated repeat anchor to \(historyIndex)")
             debugPrint("MESSAGE NAV — playing history \(historyIndex)/\(totalHistory)")
 
-            playContext(context, startIndex: 0, status: "nav")
+            playContext(
+                context,
+                startIndex: 0,
+                status: "nav",
+                expectedGeneration: playbackGeneration
+            )
             return
         }
 
@@ -2245,7 +2701,7 @@ func triggerMessageNav(direction: String) {
 
         guard total > 0 else {
             debugPrint("MESSAGE NAV — no transcript messages, playing boundary chime")
-            playChime()
+            playChime(expectedGeneration: playbackGeneration)
             return
         }
 
@@ -2255,14 +2711,22 @@ func triggerMessageNav(direction: String) {
         current = min(max(current, 0), total - 1)
 
         if direction == "next" {
-            guard current < total - 1 else { playChime(); return }
+            guard current < total - 1 else {
+                playChime(expectedGeneration: playbackGeneration)
+                return
+            }
             current += 1
         } else {
-            guard current > 0 else { playChime(); return }
+            guard current > 0 else {
+                playChime(expectedGeneration: playbackGeneration)
+                return
+            }
             current -= 1
         }
 
-        try? "\(current)".write(toFile: navIndexFile, atomically: true, encoding: .utf8)
+        guard stopGenerationStore.performIfCurrent(playbackGeneration, {
+            try? "\(current)".write(toFile: navIndexFile, atomically: true, encoding: .utf8)
+        }) else { return }
         let context: PlaybackContext = (
             text: messages[current],
             speed: currentSpeechSpeed(),
@@ -2272,7 +2736,12 @@ func triggerMessageNav(direction: String) {
             itemID: nil
         )
         debugPrint("MESSAGE NAV — playing transcript \(current + 1)/\(total)")
-        playContext(context, startIndex: 0, status: "nav")
+        playContext(
+            context,
+            startIndex: 0,
+            status: "nav",
+            expectedGeneration: playbackGeneration
+        )
     }
 }
 
@@ -2280,6 +2749,9 @@ func triggerMessageNav(direction: String) {
 
 func processQueue() {
     guard !state.isProcessingQueue else { return }
+    archivePendingQueueEntries(discardStaging: false, onlyHeldEntries: true)
+    guard !stopGenerationStore.isAutoplayHeld() else { return }
+    let queueGeneration = stopGenerationStore.snapshot()
     state.isProcessingQueue = true
 
     DispatchQueue.global(qos: .userInitiated).async {
@@ -2288,10 +2760,20 @@ func processQueue() {
         let fm = FileManager.default
         ensureDirectory(queueDir)
 
-        acquireTTSLock()
-        fm.createFile(atPath: ttsPlayingFlag, contents: nil)
+        guard let lockOwner = acquireTTSLock(expectedGeneration: queueGeneration) else { return }
+        guard stopGenerationStore.isCurrent(queueGeneration) else {
+            releaseTTSLock(ownerToken: lockOwner)
+            return
+        }
+        guard stopGenerationStore.performIfCurrent(queueGeneration, {
+            fm.createFile(atPath: ttsPlayingFlag, contents: nil)
+        }) else {
+            releaseTTSLock(ownerToken: lockOwner)
+            return
+        }
 
         while true {
+            guard stopGenerationStore.isCurrent(queueGeneration) else { break }
             let target = currentTargetScope()
             restoreDeferredEntriesIfNeeded(target: target)
             guard let entries = try? fm.contentsOfDirectory(atPath: queueDir).sorted() else { break }
@@ -2303,13 +2785,41 @@ func processQueue() {
             guard !queueEntries.isEmpty else { break }
             let entry = queueEntries[0]
             let entryPath = "\(queueDir)/\(entry)"
-
             // Check skip flag — if set, clear remaining queue
             if fm.fileExists(atPath: skipFlag) {
                 debugPrint("QUEUE — skip flag detected, clearing remaining entries")
-                // Remove the currently prioritized entry plus anything still queued.
+                // Remove matching-target entries only. Preserve out-of-scope audio
+                // so target=claude does not delete pending Codex items, and inverse.
                 for remaining in queueEntries {
-                    try? fm.removeItem(atPath: "\(queueDir)/\(remaining)")
+                    let remainingPath = "\(queueDir)/\(remaining)"
+                    let remainingSource = normalizeSourceLabel(
+                        try? String(contentsOfFile: "\(remainingPath)/source", encoding: .utf8)
+                    )
+                    if sourceMatchesTarget(remainingSource, target: target) {
+                        let entryURL = URL(fileURLWithPath: remainingPath)
+                        if archiveQueueEntryThenRemove(
+                            entryURL,
+                            archive: archiveQueueEntryToPlaybackLog
+                        ) == nil {
+                            debugPrint("QUEUE — WARNING: skip archival failed; retaining \(remainingPath)")
+                        }
+                    } else if targetDropNonmatchingEnabled() {
+                        debugPrint("QUEUE — dropping nonmatching skip entry target=\(target) source=\(remainingSource ?? "unknown")")
+                        let entryURL = URL(fileURLWithPath: remainingPath)
+                        if archiveQueueEntryThenRemove(
+                            entryURL,
+                            archive: archiveQueueEntryToPlaybackLog
+                        ) == nil {
+                            debugPrint("QUEUE — WARNING: nonmatching skip archival failed; retaining \(remainingPath)")
+                        }
+                    } else {
+                        deferQueueEntry(
+                            entryPath: remainingPath,
+                            entryName: remaining,
+                            sourceLabel: remainingSource,
+                            target: target
+                        )
+                    }
                 }
                 try? fm.removeItem(atPath: skipFlag)
                 break
@@ -2345,21 +2855,28 @@ func processQueue() {
             }
             let previewBase = String(text.prefix(60))
             let previewText = sourceLabel != nil ? "[\(sourceLabel!)] \(previewBase)" : previewBase
-            writeActiveSegment(segment: 1, total: queueEntries.count,
-                             preview: previewText, status: queueStatusLabel(base: "speaking"))
+            guard let logResult = stopGenerationStore.valueIfCurrent(queueGeneration, {
+                writeActiveSegment(
+                    segment: 1,
+                    total: queueEntries.count,
+                    preview: previewText,
+                    status: queueStatusLabel(base: "speaking")
+                )
+                try? effectiveSpeed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
+                let result = upsertPlaybackLogItem(
+                    blockID: blockID,
+                    rawText: rawText,
+                    normalizedText: normalizedText,
+                    sourceLabel: sourceLabel,
+                    sessionID: sessionID,
+                    speed: effectiveSpeed,
+                    volume: volume
+                )
+                writeCurrentPlaybackItemID(result.item.id)
+                writeString(result.item.id, to: "\(entryPath)/playback-item-id")
+                return result
+            }) else { break }
             debugPrint("QUEUE — speaking next entry (remaining \(queueEntries.count))")
-
-            try? effectiveSpeed.write(toFile: lastSpeedFile, atomically: true, encoding: .utf8)
-            let logResult = upsertPlaybackLogItem(
-                blockID: blockID,
-                rawText: rawText,
-                normalizedText: normalizedText,
-                sourceLabel: sourceLabel,
-                sessionID: sessionID,
-                speed: effectiveSpeed,
-                volume: volume
-            )
-            writeCurrentPlaybackItemID(logResult.item.id)
 
             let liveText = (logResult.newSentenceText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? logResult.newSentenceText!
@@ -2372,9 +2889,11 @@ func processQueue() {
                 sessionID: sessionID,
                 queueRestartAware: true,
                 playbackItemID: logResult.newSentenceText == nil ? nil : logResult.item.id,
-                sentenceBaseIndex: logResult.newSentenceText == nil ? 0 : logResult.sentenceOffset
+                sentenceBaseIndex: logResult.newSentenceText == nil ? 0 : logResult.sentenceOffset,
+                expectedGeneration: queueGeneration
             )
 
+            guard stopGenerationStore.isCurrent(queueGeneration) else { break }
             if fm.fileExists(atPath: restartQueueFlag) {
                 debugPrint("QUEUE — restart requested, keeping current entry and reprioritizing")
                 try? fm.removeItem(atPath: restartQueueFlag)
@@ -2386,12 +2905,14 @@ func processQueue() {
         }
 
         // Cleanup
-        clearTTYSubtitle()
-        try? fm.removeItem(atPath: ttsPlayingFlag)
-        try? fm.removeItem(atPath: skipFlag)
-        try? fm.removeItem(atPath: restartQueueFlag)
-        clearActiveSegment()
-        releaseTTSLock()
+        _ = stopGenerationStore.performIfCurrent(queueGeneration) {
+            clearTTYSubtitle()
+            try? fm.removeItem(atPath: ttsPlayingFlag)
+            try? fm.removeItem(atPath: skipFlag)
+            try? fm.removeItem(atPath: restartQueueFlag)
+            clearActiveSegment()
+        }
+        releaseTTSLock(ownerToken: lockOwner)
         debugPrint("QUEUE — done processing")
     }
 }
@@ -2875,8 +3396,19 @@ var configMissCount = 0
 var configCheckCounter = 0  // Only check config every 6th tick (6 * 0.3s ≈ 2s)
 
 let timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
+    if FileManager.default.fileExists(atPath: stopAllRequestFile) {
+        try? FileManager.default.removeItem(atPath: stopAllRequestFile)
+        triggerStopAll()
+    }
+
+    if FileManager.default.fileExists(atPath: autoplayResumeRequestFile) {
+        try? FileManager.default.removeItem(atPath: autoplayResumeRequestFile)
+        stopGenerationStore.clearAutoplayHold()
+    }
+
     // Queue check runs every tick (0.3s) for responsive pickup
     if !state.isProcessingQueue {
+        archivePendingQueueEntries(discardStaging: false, onlyHeldEntries: true)
         let hasQueuedEntries: Bool
         if FileManager.default.fileExists(atPath: queueDir),
            let entries = try? FileManager.default.contentsOfDirectory(atPath: queueDir) {

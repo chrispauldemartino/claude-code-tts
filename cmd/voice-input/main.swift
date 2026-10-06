@@ -187,6 +187,26 @@ func targetMatchesProcess(path: String?, commandLine: String?, target: String) -
     return [path, commandLine].compactMap { $0?.lowercased() }.contains { $0.contains(targetToken) }
 }
 
+func targetDisplayName(_ target: String) -> String {
+    switch target {
+    case "claude":
+        return "Claude"
+    case "codex":
+        return "Codex"
+    default:
+        return target
+    }
+}
+
+func speakWrongTargetCue(target: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+    process.arguments = ["Wrong target. Focus a \(targetDisplayName(target)) window."]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    try? process.run()
+}
+
 func targetMatchReason(path: String?, commandLine: String?, target: String) -> String {
     if let path, path.lowercased().contains(target) {
         return "path"
@@ -259,7 +279,7 @@ func ensureTargetScope(context: String) -> Bool {
 
     let frontmost = frontmostTargetVerdict(target: target)
     if frontmost.matches {
-        debugLog("TARGET OK [\(context)] \(frontmost.detail)")
+        appendDebugLine("TARGET OK [\(context)] target=\(target) \(frontmost.detail)", force: true)
         return true
     }
 
@@ -270,6 +290,7 @@ func ensureTargetScope(context: String) -> Bool {
     }
 
     appendDebugLine("TARGET BLOCK [\(context)] target=\(target) \(frontmost.detail)", force: true)
+    speakWrongTargetCue(target: target)
     return false
 }
 

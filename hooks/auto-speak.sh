@@ -302,8 +302,15 @@ if [ "$suppress_bg" = "on" ]; then
     fi
     if [ -f "$FOREGROUND_ALLOWLIST" ] && [ -s "$FOREGROUND_ALLOWLIST" ]; then
         if ! grep -Fxq -- "$SESSION_ID" "$FOREGROUND_ALLOWLIST" 2>/dev/null; then
-            echo "  [skip] background session not in foreground allowlist (${SESSION_ID})" >> "$DEBUG_LOG"
-            exit 0
+            # If this session IS the active/claimed session but was dropped from the allowlist
+            # (e.g. due to a non-atomic clear-then-repopulate), re-arm it and fall through.
+            if active_session_matches "$SESSION_ID" "$transcript_path"; then
+                echo "  [warn] active session dropped from foreground allowlist — re-arming (${SESSION_ID})" >> "$DEBUG_LOG"
+                grep -Fxq -- "$SESSION_ID" "$FOREGROUND_ALLOWLIST" 2>/dev/null || printf '%s\n' "$SESSION_ID" >> "$FOREGROUND_ALLOWLIST"
+            else
+                echo "  [skip] background session not in foreground allowlist (${SESSION_ID})" >> "$DEBUG_LOG"
+                exit 0
+            fi
         fi
     else
         echo "  [warn] suppress_background on but foreground allowlist empty — speaking (fail-open)" >> "$DEBUG_LOG"
@@ -1064,11 +1071,9 @@ if has_config; then
         fi
 
         if [ -n "$cleaned" ]; then
+            # Title prefix is logged only — never prepended to spoken text (bug #6: mangled preamble)
             title_prefix=$(build_spoken_title_prefix "$SOURCE_LABEL" "$payload_title" "$cleaned")
-            if [ -n "$title_prefix" ]; then
-                cleaned="${title_prefix}${cleaned}"
-                echo "  [title] prefix: $title_prefix" >> "$DEBUG_LOG"
-            fi
+            [ -n "$title_prefix" ] && echo "  [title] prefix (log only, not spoken): $title_prefix" >> "$DEBUG_LOG"
         fi
 
         if [ -n "$cleaned" ]; then

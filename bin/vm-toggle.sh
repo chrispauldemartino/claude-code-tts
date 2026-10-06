@@ -660,6 +660,21 @@ run_doctor() {
     fi
 
     echo
+    echo "Foreground allowlist:"
+    local active_id=""
+    [ -f "$ACTIVE_SESSION_ID_FILE" ] && active_id=$(cat "$ACTIVE_SESSION_ID_FILE" 2>/dev/null)
+    if [ -n "$active_id" ]; then
+        if [ -f "$FOREGROUND_ALLOWLIST" ] && grep -Fxq -- "$active_id" "$FOREGROUND_ALLOWLIST" 2>/dev/null; then
+            echo "  [OK] active session in foreground allowlist (${active_id})"
+        else
+            echo "  [FAIL] active session ${active_id} NOT in foreground allowlist (forwarder silently blocked)"
+            overall=1
+        fi
+    else
+        echo "  [OK] no active session id claimed (suppress check skipped)"
+    fi
+
+    echo
     if [ "$overall" -eq 0 ]; then
         echo "RESULT: PASS"
         if [ "$config_present" = "no" ]; then
@@ -985,7 +1000,7 @@ PY
             pkill -f whisper-stream 2>/dev/null || true
             restarted=1
         elif [ \"\$paused\" -eq 0 ] && [ \"\$match_count\" -eq 0 ] && [ \"\$log_match_count\" -gt 0 ]; then
-            printf 'latest\n' > /tmp/claude-tts-log-command
+            printf 'timeline\n' > /tmp/claude-tts-log-command
             replayed=1
         fi
 
@@ -1102,7 +1117,6 @@ case "${1:-status}" in
         ensure_suppress_background_on
         update_toggle "voice" "on"
         update_toggle "mic" "off"
-        update_toggle "cue" "off"
         case "${2:-both}" in
             claude) update_toggle "target" "claude"; scope_label="Claude Code only" ;;
             codex)  update_toggle "target" "codex";  scope_label="Codex only" ;;
@@ -1116,7 +1130,6 @@ case "${1:-status}" in
         [ ! -f "$CONFIG" ] && write_full_config "$DEFAULTS"
         update_toggle "voice" "on"
         update_toggle "mic" "off"
-        update_toggle "cue" "off"
         start_daemon
         prepare_voice_test
         queue_voice_test
@@ -1129,7 +1142,6 @@ case "${1:-status}" in
         ensure_suppress_background_on
         update_toggle "voice" "off"
         update_toggle "mic" "on"
-        update_toggle "cue" "off"
         case "${2:-both}" in
             claude) update_toggle "target" "claude"; scope_label="Claude Code only" ;;
             codex)  update_toggle "target" "codex";  scope_label="Codex only" ;;
