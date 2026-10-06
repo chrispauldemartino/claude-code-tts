@@ -979,12 +979,11 @@ for i, p in enumerate(parts):
             continue
         fi
 
-        local segment transformed_seg cleaned_seg
+        local segment cleaned_seg
         segment=$(cat "$seg_file")
-        # Transform structured data (tables/lists) before markdown stripping
-        transformed_seg=$(echo "$segment" | python3 "$PLUGIN_BIN/transform-for-speech.py" 2>/dev/null)
-        [ -z "$transformed_seg" ] && transformed_seg="$segment"
-        cleaned_seg=$(strip_markdown "$transformed_seg" "$code_mode")
+        # Keep this legacy local playback path byte-identical to queue/backfill
+        # preparation for the same input and settings.
+        cleaned_seg=$(printf '%s' "$segment" | CLAUDE_VOICE_CONFIG="$CONFIG" "$PLUGIN_BIN/prepare-speech.sh" 2>/dev/null)
         if [ -z "$cleaned_seg" ]; then
             continue
         fi
@@ -1055,26 +1054,10 @@ if has_config; then
         QUEUE_DIR="/tmp/claude-tts-queue"
         mkdir -p "$QUEUE_DIR"
 
-        # Extract text to speak
+        # Shared, side-effect-free preparation keeps live and backfill speech
+        # identical without invoking Stop-hook dedup/bookkeeping from backfill.
         text_to_queue="$msg"
-        summary_text=""
-
-        if [ "$SUMMARY" = "on" ]; then
-            summary_text=$(echo "$msg" | sed -n 's/.*\[SUMMARY: \(.*\)\].*/\1/p' | head -1)
-            if [ -n "$summary_text" ]; then
-                text_to_queue="$summary_text"
-            fi
-        fi
-
-        # Transform structured data before markdown stripping
-        transformed=$(echo "$text_to_queue" | python3 "$PLUGIN_BIN/transform-for-speech.py" 2>/dev/null)
-        [ -z "$transformed" ] && transformed="$text_to_queue"
-        cleaned=$(strip_markdown "$transformed" "$CODE" | sed 's/<<MSG_BREAK>>//g')
-
-        if [ "$SUMMARY" = "on" ] && [ -z "$summary_text" ] && [ -n "$cleaned" ]; then
-            spoken_summary=$(echo "$cleaned" | collapse_to_spoken_summary)
-            [ -n "$spoken_summary" ] && cleaned="$spoken_summary"
-        fi
+        cleaned=$(printf '%s' "$msg" | CLAUDE_VOICE_CONFIG="$CONFIG" "$PLUGIN_BIN/prepare-speech.sh" 2>/dev/null)
 
         if [ -n "$cleaned" ]; then
             if is_vm_status "$cleaned"; then
@@ -1140,9 +1123,9 @@ if has_config; then
                     [ -n "$SESSION_ID" ] && echo "$SESSION_ID" > "$REMOTE_TTS_DIR/entry-${remote_ts}.session"
                     [ -n "$SESSION_SPEECH_NAME" ] && printf '%s' "$SESSION_SPEECH_NAME" > "$REMOTE_TTS_DIR/entry-${remote_ts}.session_name"
                     echo "$block_id" > "$REMOTE_TTS_DIR/entry-${remote_ts}.block"
-                    printf '%s' "$text_to_queue" > "$REMOTE_TTS_DIR/entry-${remote_ts}.raw"
+                    printf '%s' "$msg" > "$REMOTE_TTS_DIR/entry-${remote_ts}.raw"
                     printf '%s' "$cleaned" > "$REMOTE_TTS_DIR/entry-${remote_ts}.normalized"
-                    content_hash=$(printf '%s' "$cleaned" | shasum -a 256 | awk '{print $1}')
+                    content_hash=$(printf '%s' "$msg" | python3 -c 'import hashlib,sys,unicodedata; text=unicodedata.normalize("NFC",sys.stdin.read().replace("\r\n","\n").replace("\r","\n")); text="\n".join(line.rstrip() for line in text.strip().splitlines()); print(hashlib.sha256(text.encode()).hexdigest())')
                     item_timestamp=$(date +%s)
                     jq -n \
                         --arg origin "live" \

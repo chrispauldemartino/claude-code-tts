@@ -1,0 +1,7 @@
+{"timestamp":"2026-10-06T11:00:00Z","type":"session_meta","payload":{"id":"codex-session"}}
+{"timestamp":"2026-10-06T11:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Prompt one"}]}}
+{"timestamp":"2026-10-06T11:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Canonical answer one."}}
+{"timestamp":"2026-10-06T11:00:02.5Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Progress update must not become the answer."}]}}
+{"timestamp":"2026-10-06T11:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Canonical answer one."}]}}
+{"timestamp":"2026-10-06T11:01:01Z","type":"event_msg","payload":{"type":"user_message","message":"Prompt two"}}
+{"timestamp":"2026-10-06T11:01:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Fallback answer two."}}

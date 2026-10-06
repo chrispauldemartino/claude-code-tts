@@ -154,6 +154,7 @@ swiftc -typecheck \
     "$ROOT/cmd/skip-listener/main.swift" \
     "$ROOT/cmd/skip-listener/ProcessLaunch.swift" \
     "$ROOT/cmd/skip-listener/StopGeneration.swift" \
-    "$ROOT/cmd/skip-listener/StopAllArchive.swift"
+    "$ROOT/cmd/skip-listener/StopAllArchive.swift" \
+    "$ROOT/cmd/skip-listener/BackfillImport.swift"
 
 echo "session cue tests: PASS"

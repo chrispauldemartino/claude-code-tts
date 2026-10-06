@@ -10,6 +10,8 @@ bin/*
 !bin/phone-voice.sh
 !bin/vm-dispatch.sh
 !bin/session-metadata.py
+!bin/backfill-transcript.py
+!bin/prepare-speech.sh
 dist/
 *.exe
 *.dll

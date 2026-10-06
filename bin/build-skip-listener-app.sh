@@ -6,6 +6,7 @@ SRC="$PLUGIN_ROOT/cmd/skip-listener/main.swift"
 PROCESS_LAUNCH_SRC="$PLUGIN_ROOT/cmd/skip-listener/ProcessLaunch.swift"
 STOP_GENERATION_SRC="$PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift"
 STOP_ARCHIVE_SRC="$PLUGIN_ROOT/cmd/skip-listener/StopAllArchive.swift"
+BACKFILL_IMPORT_SRC="$PLUGIN_ROOT/cmd/skip-listener/BackfillImport.swift"
 APP="$PLUGIN_ROOT/bin/SkipListener.app"
 EXE="$APP/Contents/MacOS/skip-listener"
 PLIST="$APP/Contents/Info.plist"
@@ -96,7 +97,7 @@ PLIST
 
 plutil -lint "$PLIST_STAGE" >/dev/null
 
-swiftc -O -o "$EXE_STAGE" "$SRC" "$PROCESS_LAUNCH_SRC" "$STOP_GENERATION_SRC" "$STOP_ARCHIVE_SRC"
+swiftc -O -o "$EXE_STAGE" "$SRC" "$PROCESS_LAUNCH_SRC" "$STOP_GENERATION_SRC" "$STOP_ARCHIVE_SRC" "$BACKFILL_IMPORT_SRC"
 cp "$EXE_STAGE" "$LEGACY_STAGE"
 chmod +x "$EXE_STAGE" "$LEGACY_STAGE"
 

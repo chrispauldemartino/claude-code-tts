@@ -4,11 +4,16 @@
 # skip-listener handles sentence-by-sentence playback + all shortcuts.
 
 HOST="${1:-mac-mini-ts}"
-REMOTE_DIR="/tmp/claude-tts-remote"
-LOCAL_QUEUE="/tmp/claude-tts-queue"
-BRIDGE_STAGING="/tmp/claude-tts-bridge-staging"
-STOP_FLAG="/tmp/claude-tts-bridge-stop"
-STOP_GENERATION_FILE="/tmp/claude-tts-stop-generation"
+REMOTE_DIR="${CLAUDE_TTS_REMOTE_DIR:-/tmp/claude-tts-remote}"
+LOCAL_QUEUE="${CLAUDE_TTS_LOCAL_QUEUE:-/tmp/claude-tts-queue}"
+BRIDGE_STAGING="${CLAUDE_TTS_BRIDGE_STAGING:-/tmp/claude-tts-bridge-staging}"
+REMOTE_BACKFILL_OUTBOX="${CLAUDE_TTS_BACKFILL_OUTBOX:-/tmp/claude-tts-backfill-outbox}"
+REMOTE_BACKFILL_STATUS="${CLAUDE_TTS_BACKFILL_STATUS_DIR:-/tmp/claude-tts-backfill-status}"
+LOCAL_BACKFILL_INBOX="${CLAUDE_TTS_BACKFILL_INBOX:-/tmp/claude-tts-backfill-inbox}"
+LOCAL_BACKFILL_ACKS="${CLAUDE_TTS_BACKFILL_ACKS:-/tmp/claude-tts-backfill-acks}"
+BACKFILL_STAGING="${CLAUDE_TTS_BACKFILL_STAGING:-/tmp/claude-tts-backfill-staging}"
+STOP_FLAG="${CLAUDE_TTS_BRIDGE_STOP:-/tmp/claude-tts-bridge-stop}"
+STOP_GENERATION_FILE="${CLAUDE_TTS_STOP_GENERATION_FILE:-/tmp/claude-tts-stop-generation}"
 STOP_GENERATION_FAILURE_FILE="${STOP_GENERATION_FILE}.failed"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PUBLISH_MODE="$SCRIPT_DIR/stopall-bridge-publish-mode.sh"
@@ -28,9 +33,41 @@ read_stop_generation() {
 
 mkdir -p "$LOCAL_QUEUE"
 mkdir -p "$BRIDGE_STAGING"
+mkdir -p "$LOCAL_BACKFILL_INBOX" "$LOCAL_BACKFILL_ACKS" "$BACKFILL_STAGING"
 rm -f "$STOP_FLAG"
 
 while [ ! -f "$STOP_FLAG" ]; do
+    # Publish listener acknowledgements back to the Mini before deleting the
+    # retained source batch. Backfill deliberately stays outside the live
+    # queue and the Stop-all transaction.
+    for ack_file in "$LOCAL_BACKFILL_ACKS"/*.imported; do
+        [ -f "$ack_file" ] || continue
+        batch_id=$(basename "$ack_file" .imported)
+        ack_payload=$(cat "$ack_file" 2>/dev/null || true)
+        if printf '%s' "$ack_payload" | ssh -o BatchMode=yes "$HOST" \
+            "mkdir -p '$REMOTE_BACKFILL_STATUS'; cat > '$REMOTE_BACKFILL_STATUS/$batch_id.json'; touch '$REMOTE_BACKFILL_OUTBOX/$batch_id.imported'; rm -rf '$REMOTE_BACKFILL_OUTBOX/$batch_id'" 2>/dev/null; then
+            rm -f "$ack_file"
+        fi
+    done
+
+    backfill_batches=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$HOST" \
+        "find '$REMOTE_BACKFILL_OUTBOX' -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print 2>/dev/null" 2>/dev/null || true)
+    if [ -n "$backfill_batches" ]; then
+        while IFS= read -r remote_batch; do
+            [ -n "$remote_batch" ] || continue
+            batch_id=$(basename "$remote_batch")
+            [ -d "$LOCAL_BACKFILL_INBOX/$batch_id" ] && continue
+            staging_batch="$BACKFILL_STAGING/$batch_id"
+            rm -rf "$staging_batch"
+            if scp -q -r -o ConnectTimeout=5 -o BatchMode=yes \
+                "$HOST:$remote_batch" "$BACKFILL_STAGING/" 2>/dev/null; then
+                mv "$staging_batch" "$LOCAL_BACKFILL_INBOX/$batch_id"
+            fi
+        done <<EOF
+$backfill_batches
+EOF
+    fi
+
     entries=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$HOST" "ls $REMOTE_DIR/*.txt 2>/dev/null" 2>/dev/null)
 
     if [ -n "$entries" ]; then
@@ -110,5 +147,6 @@ while [ ! -f "$STOP_FLAG" ]; do
         done
     fi
 
+    [ "${CLAUDE_TTS_BRIDGE_ONCE:-0}" = "1" ] && break
     sleep 0.5
 done

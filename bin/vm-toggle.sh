@@ -36,6 +36,7 @@ LOCAL_SKIP_LISTENER_SRC="$PLUGIN_DIR/cmd/skip-listener/main.swift"
 LOCAL_PROCESS_LAUNCH_SRC="$PLUGIN_DIR/cmd/skip-listener/ProcessLaunch.swift"
 LOCAL_STOP_GENERATION_SRC="$PLUGIN_DIR/cmd/skip-listener/StopGeneration.swift"
 LOCAL_STOP_ARCHIVE_SRC="$PLUGIN_DIR/cmd/skip-listener/StopAllArchive.swift"
+LOCAL_BACKFILL_IMPORT_SRC="$PLUGIN_DIR/cmd/skip-listener/BackfillImport.swift"
 LOCAL_SPEAK_TEXT_SRC="$PLUGIN_DIR/cmd/speak-text/main.go"
 LOCAL_STOPALL_DRAIN="$PLUGIN_BIN/stopall-drain.sh"
 LOCAL_SKIP_LISTENER_BUILD="$PLUGIN_BIN/build-skip-listener-app.sh"
@@ -43,6 +44,7 @@ LOCAL_SKIP_LISTENER_INSTALL="$PLUGIN_BIN/install-skip-listener-launchagent.sh"
 LOCAL_SKIP_LISTENER_RESTART="$PLUGIN_BIN/restart-skip-listener-launchagent.sh"
 LOCAL_TTS_BRIDGE="$PLUGIN_BIN/tts-bridge.sh"
 LOCAL_STOPALL_PUBLISH_MODE="$PLUGIN_BIN/stopall-bridge-publish-mode.sh"
+BACKFILL_STATUS_DIR="${CLAUDE_TTS_BACKFILL_STATUS_DIR:-/tmp/claude-tts-backfill-status}"
 
 DEFAULTS="voice=on
 mic=on
@@ -255,6 +257,7 @@ rebuild_remote_skip_listener() {
         "$LOCAL_PROCESS_LAUNCH_SRC"
         "$LOCAL_STOP_GENERATION_SRC"
         "$LOCAL_STOP_ARCHIVE_SRC"
+        "$LOCAL_BACKFILL_IMPORT_SRC"
         "$LOCAL_SPEAK_TEXT_SRC"
         "$LOCAL_STOPALL_DRAIN"
         "$LOCAL_SKIP_LISTENER_BUILD"
@@ -280,6 +283,7 @@ rebuild_remote_skip_listener() {
     scp_mbp "$LOCAL_PROCESS_LAUNCH_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/ProcessLaunch.swift" || return 1
     scp_mbp "$LOCAL_STOP_GENERATION_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift" || return 1
     scp_mbp "$LOCAL_STOP_ARCHIVE_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/StopAllArchive.swift" || return 1
+    scp_mbp "$LOCAL_BACKFILL_IMPORT_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/BackfillImport.swift" || return 1
     scp_mbp "$LOCAL_SPEAK_TEXT_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/speak-text/main.go" || return 1
     scp_mbp "$LOCAL_STOPALL_DRAIN" "$MBP_HOST:$MBP_PLUGIN_ROOT/bin/stopall-drain.sh" || return 1
     scp_mbp "$LOCAL_SKIP_LISTENER_BUILD" "$MBP_HOST:$MBP_SKIP_LISTENER_BUILD" || return 1
@@ -887,6 +891,17 @@ remote_log_command() {
     ssh_mbp "printf '%s\n' '$action' > /tmp/claude-tts-log-command"
 }
 
+read_backfill_stop_generation() {
+    local generation="${CLAUDE_TTS_BACKFILL_GENERATION:-}"
+    if [ -z "$generation" ]; then
+        generation="$(ssh_mbp "generation=\$(awk -F= '\$1 == \"generation\" { print \$2; exit }' /tmp/claude-tts-stop-generation 2>/dev/null); printf '%s\n' \"\${generation:-0}\"" 2>/dev/null)" || return 1
+    fi
+    case "$generation" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$generation"
+}
+
 remote_log_status() {
     ssh_mbp "python3 - <<'PY'
 import json
@@ -952,6 +967,7 @@ remote_focus_status() {
         current_session=\$(cat '$LAST_SESSION_FILE' 2>/dev/null | tr -d '[:space:]')
         match_count=0
         log_match_count=0
+        focus_replay_allowed=0
         current_item_id=\$(cat /tmp/claude-tts-current-item-id 2>/dev/null | tr -d '[:space:]')
 
         if [ -n \"\$focus_session\" ]; then
@@ -1030,13 +1046,14 @@ remote_focus_session() {
             [ \"\$entry_session\" = \"\$session_id\" ] && match_count=\$((match_count + 1))
         done
 
-        log_match_count=\$(python3 - <<'PY'
+        log_counts=\$(python3 - <<'PY'
 import json
 import os
 
 manifest = '/tmp/claude-tts-playback-log/manifest.jsonl'
 session_id = os.popen(\"cat '$FOCUSED_SESSION_ID_FILE' 2>/dev/null\").read().strip()
 count = 0
+latest = None
 if session_id and os.path.exists(manifest):
     with open(manifest, 'r', encoding='utf-8') as fh:
         for line in fh:
@@ -1049,9 +1066,12 @@ if session_id and os.path.exists(manifest):
                 continue
             if (item.get('sessionID') or '').strip() == session_id:
                 count += 1
-print(count)
+                latest = item
+print(count, 1 if latest and latest.get('origin') != 'backfill' else 0)
 PY
 )
+        log_match_count=\${log_counts%% *}
+        focus_replay_allowed=\${log_counts##* }
 
         restarted=0
         replayed=0
@@ -1061,7 +1081,7 @@ PY
             pkill afplay 2>/dev/null || true
             pkill -f whisper-stream 2>/dev/null || true
             restarted=1
-        elif [ \"\$paused\" -eq 0 ] && [ \"\$match_count\" -eq 0 ] && [ \"\$log_match_count\" -gt 0 ]; then
+        elif [ \"\$paused\" -eq 0 ] && [ \"\$match_count\" -eq 0 ] && [ \"\$log_match_count\" -gt 0 ] && [ \"\$focus_replay_allowed\" -eq 1 ]; then
             printf 'timeline\n' > /tmp/claude-tts-log-command
             replayed=1
         fi
@@ -1141,6 +1161,74 @@ handle_log_command() {
             return 1
             ;;
     esac
+}
+
+handle_backfill_command() {
+    local requested="${1:-10}" session_id source_label metadata transcript result
+    local batch_id batch_dir export_skipped status_file imported listener_skipped dupes tries latest request_generation
+
+    if [ "$requested" = "status" ]; then
+        latest=""
+        if [ -d "$BACKFILL_STATUS_DIR" ]; then
+            latest=$(ls -t "$BACKFILL_STATUS_DIR"/*.json 2>/dev/null | head -1 || true)
+        fi
+        if [ -z "$latest" ]; then
+            echo "Backfill status: no completed imports"
+            return 0
+        fi
+        imported=$(jq -r '.imported // 0' "$latest")
+        listener_skipped=$(jq -r '.skipped // 0' "$latest")
+        dupes=$(jq -r '.dupes // 0' "$latest")
+        echo "Backfill status: imported $imported, skipped $listener_skipped (dupes $dupes)"
+        return 0
+    fi
+
+    case "$requested" in
+        ''|*[!0-9]*) echo "Usage: /vm backfill [1-100|status]" >&2; return 1 ;;
+    esac
+    if [ "$requested" -lt 1 ] || [ "$requested" -gt 100 ]; then
+        echo "Backfill count must be between 1 and 100." >&2
+        return 1
+    fi
+
+    session_id="$(detect_current_session_id || true)"
+    source_label="$(detect_current_source_label || true)"
+    [ -z "$source_label" ] && source_label="Claude Code"
+    if [ -z "$session_id" ]; then
+        echo "No invoking Claude/Codex session ID was found." >&2
+        return 1
+    fi
+    metadata="$(python3 "$PLUGIN_BIN/session-metadata.py" show \
+        --source "$source_label" --session-id "$session_id" 2>/dev/null || true)"
+    transcript="$(printf '%s' "$metadata" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
+    [ -z "$transcript" ] && transcript="auto"
+
+    if ! request_generation="$(read_backfill_stop_generation)"; then
+        echo "Could not read the MBP stop generation; backfill was not exported." >&2
+        return 1
+    fi
+    result="$(python3 "$PLUGIN_BIN/backfill-transcript.py" "$source_label" "$session_id" "$transcript" "$requested")" || return 1
+    batch_id="$(printf '%s' "$result" | jq -r .batch_id)"
+    batch_dir="$(printf '%s' "$result" | jq -r .batch_dir)"
+    [ -d "$batch_dir" ] || { echo "Backfill exporter returned a missing batch directory." >&2; return 1; }
+    printf '%s\n' "$request_generation" > "$batch_dir/.generation"
+    export_skipped="$(printf '%s' "$result" | jq -r '.skipped // 0')"
+    status_file="$BACKFILL_STATUS_DIR/$batch_id.json"
+
+    tries=0
+    while [ ! -f "$status_file" ] && [ "$tries" -lt 120 ]; do
+        [ "${CLAUDE_TTS_BACKFILL_NO_WAIT:-0}" = "1" ] && break
+        sleep 0.25
+        tries=$((tries + 1))
+    done
+    if [ ! -f "$status_file" ]; then
+        echo "Backfill queued: batch $batch_id (skipped $export_skipped before import)"
+        return 0
+    fi
+    imported=$(jq -r '.imported // 0' "$status_file")
+    listener_skipped=$(jq -r '.skipped // 0' "$status_file")
+    dupes=$(jq -r '.dupes // 0' "$status_file")
+    echo "imported $imported, skipped $listener_skipped (dupes $dupes)"
 }
 
 run_vm_command() {
@@ -1384,6 +1472,9 @@ case "${1:-status}" in
     log)
         handle_log_command "$2" || exit 1
         ;;
+    backfill)
+        handle_backfill_command "${2:-10}" || exit 1
+        ;;
     speed)
         handle_speed_command "$2" || exit 1
         ;;
@@ -1481,7 +1572,7 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary]"
+        echo "Usage: /vm [on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|backfill [N|status]|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary]"
         ;;
 esac
 }
@@ -1526,6 +1617,13 @@ vm_chain_arg_count() {
                 printf '%s\n' 1
             fi
             ;;
+        backfill)
+            if [ "$next_arg" = "status" ] || [[ "$next_arg" =~ ^[0-9]+$ ]]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
         background)
             if [ "$next_arg" = "on" ] || [ "$next_arg" = "off" ] || [ "$next_arg" = "status" ]; then
                 printf '%s\n' 2
@@ -1535,7 +1633,7 @@ vm_chain_arg_count() {
             ;;
         name)
             case "$next_arg" in
-                ""|on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary|background)
+                ""|on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|backfill|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary|background)
                     printf '%s\n' 1
                     ;;
                 *) printf '%s\n' 2 ;;

@@ -56,6 +56,9 @@ let playbackLogManifestFile = "\(playbackLogDir)/manifest.jsonl"
 let playbackLogCommandFile = "/tmp/claude-tts-log-command"
 let playbackLogRetentionSeconds: TimeInterval = 90 * 60
 let playbackLogMaxItems = 200
+let backfillInboxDir = "/tmp/claude-tts-backfill-inbox"
+let backfillAcknowledgementDir = "/tmp/claude-tts-backfill-acks"
+let backfillNavigationAnchorFile = "/tmp/claude-tts-backfill-navigation-anchor"
 let deferredQueueDir = "/tmp/claude-tts-deferred-queue"
 let deferredQueueMaxItems = 200
 
@@ -731,6 +734,7 @@ struct PlaybackLogItem: Codable {
     var normalizedTextPath: String
     var sentenceMapPath: String
     var playbackState: String?
+    var playedAt: TimeInterval?
     var skippedAt: TimeInterval?
     var schemaVersion: Int?
     var origin: String?
@@ -832,7 +836,12 @@ func loadPlaybackLogItems() -> [PlaybackLogItem] {
             }
             return try? decoder.decode(PlaybackLogItem.self, from: data)
         }
-        .sorted { $0.timestamp < $1.timestamp }
+        .sorted {
+            let lhs = backfillOrderingTime(answeredAt: $0.answeredAt, legacyTimestamp: $0.timestamp)
+            let rhs = backfillOrderingTime(answeredAt: $1.answeredAt, legacyTimestamp: $1.timestamp)
+            if lhs == rhs { return $0.timestamp < $1.timestamp }
+            return lhs < rhs
+        }
 }
 
 func savePlaybackLogItems(_ items: [PlaybackLogItem]) {
@@ -854,7 +863,7 @@ func prunePlaybackLog() -> [PlaybackLogItem] {
     let cutoff = Date().timeIntervalSince1970 - playbackLogRetentionSeconds
     var items = loadPlaybackLogItems()
     items = items.filter { item in
-        if item.timestamp >= cutoff {
+        if backfillRetentionTime(importedAt: item.importedAt, legacyTimestamp: item.timestamp) >= cutoff {
             return true
         }
         try? fm.removeItem(atPath: item.itemDir)
@@ -904,6 +913,14 @@ func writeCurrentPlaybackItemID(_ id: String?) {
         return
     }
     writeString(id, to: currentPlaybackItemFile)
+}
+
+func writeBackfillNavigationAnchor(_ id: String) {
+    writeString(id, to: backfillNavigationAnchorFile)
+}
+
+func readBackfillNavigationAnchor() -> String? {
+    normalizeSessionID(try? String(contentsOfFile: backfillNavigationAnchorFile, encoding: .utf8))
 }
 
 func focusedPlaybackLogItems(prune: Bool = true) -> [PlaybackLogItem] {
@@ -1079,6 +1096,7 @@ func upsertPlaybackLogItem(
         normalizedTextPath: "\(itemDir)/normalized.txt",
         sentenceMapPath: "\(itemDir)/sentence-map.json",
         playbackState: playbackState,
+        playedAt: nil,
         skippedAt: skippedAt,
         schemaVersion: metadata?.schemaVersion,
         origin: metadata?.origin,
@@ -1099,6 +1117,100 @@ func upsertPlaybackLogItem(
     items.append(item)
     savePlaybackLogItems(items)
     return (item, 0, normalizedSentences.isEmpty ? nil : normalizedSentences.joined(separator: " "))
+}
+
+func importPendingBackfillBatches() {
+    importBackfillBatches(
+        inboxURL: URL(fileURLWithPath: backfillInboxDir),
+        acknowledgementURL: URL(fileURLWithPath: backfillAcknowledgementDir),
+        isGenerationCurrent: { generation in
+            stopGenerationStore.snapshot().generation == generation
+        }
+    ) { batch, generation in
+        let snapshot = stopGenerationStore.snapshot()
+        let expected = StopGenerationSnapshot(
+            generation: generation,
+            timestamp: snapshot.timestamp,
+            autoplayHold: snapshot.autoplayHold
+        )
+        return stopGenerationStore.valueIfCurrent(expected) {
+            var existing = loadPlaybackLogItems()
+            var knownHashes = BackfillDedupIndex()
+            for index in existing.indices {
+                guard existing[index].sourceLabel == batch.manifest.source,
+                      existing[index].sessionID == batch.manifest.sessionID else { continue }
+                if let text = try? String(contentsOfFile: existing[index].rawTextPath, encoding: .utf8) {
+                    let hash = backfillContentHash(text)
+                    existing[index].contentHash = hash
+                    existing[index].normalizationVersion = 1
+                    knownHashes.insert(source: batch.manifest.source, sessionID: batch.manifest.sessionID, contentHash: hash)
+                } else if let hash = existing[index].contentHash, !hash.isEmpty {
+                    knownHashes.insert(source: batch.manifest.source, sessionID: batch.manifest.sessionID, contentHash: hash)
+                }
+            }
+            insertBackfillQueueHashes(
+                into: &knownHashes,
+                queueURL: URL(fileURLWithPath: queueDir),
+                source: batch.manifest.source,
+                sessionID: batch.manifest.sessionID
+            )
+            savePlaybackLogItems(existing)
+
+            var imported = 0
+            var skipped = batch.manifest.skipped ?? 0
+            var dupes = 0
+            var newestItemID: String?
+            for payload in batch.items {
+                let hash = payload.metadata.contentHash ?? backfillContentHash(payload.fullText)
+                if knownHashes.contains(source: payload.source, sessionID: payload.sessionID, contentHash: hash) {
+                    dupes += 1
+                    continue
+                }
+                guard payload.source == batch.manifest.source,
+                      payload.sessionID == batch.manifest.sessionID else {
+                    skipped += 1
+                    continue
+                }
+                let metadata = QueueItemMetadata(
+                    schemaVersion: payload.metadata.schemaVersion,
+                    origin: "backfill",
+                    autoplay: false,
+                    batchID: payload.metadata.batchID,
+                    batchIndex: payload.metadata.batchIndex,
+                    turnID: payload.metadata.turnID,
+                    answeredAt: payload.metadata.answeredAt,
+                    importedAt: Date().timeIntervalSince1970,
+                    contentHash: hash,
+                    normalizationVersion: payload.metadata.normalizationVersion ?? 1
+                )
+                let result = upsertPlaybackLogItem(
+                    blockID: nil,
+                    rawText: payload.fullText,
+                    normalizedText: payload.speechText,
+                    sourceLabel: payload.source,
+                    sessionID: payload.sessionID,
+                    sessionName: payload.sessionName,
+                    speed: currentSpeechSpeed(),
+                    volume: "1.0",
+                    metadata: metadata,
+                    timestamp: payload.metadata.answeredAt ?? Date().timeIntervalSince1970,
+                    playbackState: "unplayed",
+                    pruneBeforeUpsert: false,
+                    mergeBlockUpdates: false
+                )
+                knownHashes.insert(source: payload.source, sessionID: payload.sessionID, contentHash: hash)
+                newestItemID = result.item.id
+                imported += 1
+            }
+            _ = prunePlaybackLog()
+            if let newestItemID {
+                writeBackfillNavigationAnchor(newestItemID)
+                writeCurrentPlaybackItemID(newestItemID)
+            }
+            debugPrint("BACKFILL — batch \(batch.id) imported=\(imported) skipped=\(skipped) dupes=\(dupes)")
+            return BackfillCommitResult(imported: imported, skipped: skipped, dupes: dupes)
+        }
+    }
 }
 
 func archiveQueueEntryToPlaybackLog(_ entryURL: URL) -> String? {
@@ -1169,6 +1281,16 @@ func markPlaybackLogItemSkipped(id: String) -> Bool {
     items[index].skippedAt = Date().timeIntervalSince1970
     savePlaybackLogItems(items)
     return true
+}
+
+func markPlaybackLogItemPlayback(id: String, completed: Bool) {
+    var items = loadPlaybackLogItems()
+    guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+    items[index].playbackState = completed ? "played" : "partial"
+    if completed {
+        items[index].playedAt = Date().timeIntervalSince1970
+    }
+    savePlaybackLogItems(items)
 }
 
 func markCurrentPlaybackItemSkipped() {
@@ -2363,6 +2485,11 @@ func speakText(
         }) else { break }
         idx += 1
     }
+    if let playbackItemID, startedAudiblePlayback {
+        _ = stopGenerationStore.performIfCurrent(playbackGeneration) {
+            markPlaybackLogItemPlayback(id: playbackItemID, completed: idx >= sentences.count)
+        }
+    }
 }
 
 func adjustSpeechSpeed(delta: Int) {
@@ -2613,7 +2740,7 @@ func waitForPlaybackLockRelease(
 }
 
 func playbackLogTargetItem(direction: String? = nil, useLatest: Bool = false) -> PlaybackLogItem? {
-    let items = focusedPlaybackLogItems()
+    var items = focusedPlaybackLogItems()
     guard !items.isEmpty else { return nil }
 
     if useLatest {
@@ -2624,8 +2751,23 @@ func playbackLogTargetItem(direction: String? = nil, useLatest: Bool = false) ->
 
     let defaultIndex = max(items.count - 1, 0)
     let currentIndex: Int
-    if let currentID = readCurrentPlaybackItemID(),
-       let idx = items.firstIndex(where: { $0.id == currentID }) {
+    if direction != nil,
+       let anchorID = readBackfillNavigationAnchor(),
+       let anchor = items.first(where: { $0.id == anchorID }) {
+        items = items.filter {
+            $0.sourceLabel == anchor.sourceLabel && $0.sessionID == anchor.sessionID
+        }
+        currentIndex = items.firstIndex(where: { $0.id == anchorID }) ?? max(items.count - 1, 0)
+        try? FileManager.default.removeItem(atPath: backfillNavigationAnchorFile)
+    } else if direction != nil,
+              let currentID = readCurrentPlaybackItemID(),
+              let current = items.first(where: { $0.id == currentID }) {
+        items = items.filter {
+            $0.sourceLabel == current.sourceLabel && $0.sessionID == current.sessionID
+        }
+        currentIndex = items.firstIndex(where: { $0.id == currentID }) ?? max(items.count - 1, 0)
+    } else if let currentID = readCurrentPlaybackItemID(),
+              let idx = items.firstIndex(where: { $0.id == currentID }) {
         currentIndex = idx
     } else {
         currentIndex = defaultIndex
@@ -3597,6 +3739,8 @@ let timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
         try? FileManager.default.removeItem(atPath: autoplayResumeRequestFile)
         stopGenerationStore.clearAutoplayHold()
     }
+
+    importPendingBackfillBatches()
 
     // Queue check runs every tick (0.3s) for responsive pickup
     if !state.isProcessingQueue {
