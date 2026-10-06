@@ -57,13 +57,10 @@ while [ ! -f "$STOP_FLAG" ]; do
             [ -n "$remote_batch" ] || continue
             batch_id=$(basename "$remote_batch")
             [ -d "$LOCAL_BACKFILL_INBOX/$batch_id" ] && continue
-            fetch_generation=$(read_stop_generation)
-            [ "$fetch_generation" = "failed" ] && fetch_generation="18446744073709551615"
             staging_batch="$BACKFILL_STAGING/$batch_id"
             rm -rf "$staging_batch"
             if scp -q -r -o ConnectTimeout=5 -o BatchMode=yes \
                 "$HOST:$remote_batch" "$BACKFILL_STAGING/" 2>/dev/null; then
-                printf '%s\n' "$fetch_generation" > "$staging_batch/.generation"
                 mv "$staging_batch" "$LOCAL_BACKFILL_INBOX/$batch_id"
             fi
         done <<EOF

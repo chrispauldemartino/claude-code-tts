@@ -7,6 +7,7 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/remote-outbox/batch-1" "$TEST_ROOT/remote-live"
 
 printf '%s\n' '{"batch_id":"batch-1","item_count":0,"source":"Claude Code","session_id":"s1"}' > "$TEST_ROOT/remote-outbox/batch-1/batch.json"
+printf '%s\n' '2' > "$TEST_ROOT/remote-outbox/batch-1/.generation"
 printf '%s\n' 'generation=3' 'timestamp=0' 'autoplay_hold=0' > "$TEST_ROOT/generation"
 
 cat > "$TEST_ROOT/bin/ssh" <<'MOCK'
@@ -55,7 +56,7 @@ run_bridge() {
 run_bridge
 test -d "$TEST_ROOT/inbox/batch-1"
 test -d "$TEST_ROOT/remote-outbox/batch-1"
-test "$(cat "$TEST_ROOT/inbox/batch-1/.generation")" = "3"
+test "$(cat "$TEST_ROOT/inbox/batch-1/.generation")" = "2"
 test ! -e "$TEST_ROOT/live-queue/entry-batch-1"
 
 mkdir -p "$TEST_ROOT/acks"

@@ -17,7 +17,8 @@ read_setting() {
 summary_mode="$(read_setting summary off)"
 code_mode="$(read_setting code silent)"
 
-python3 -c '
+extract_explicit_summary() {
+    python3 -c '
 import re, sys
 text = sys.stdin.read()
 summary_on = sys.argv[1] == "on"
@@ -26,9 +27,15 @@ if summary_on:
     if match:
         text = "ELLEEXPLICITSUMMARYMARKER\n" + match.group(1).strip()
 sys.stdout.write(text)
-' "$summary_mode" \
-| python3 "$SCRIPT_DIR/transform-for-speech.py" 2>/dev/null \
-| python3 -c '
+' "$summary_mode"
+}
+
+transform_for_speech() {
+    python3 "$SCRIPT_DIR/transform-for-speech.py" 2>/dev/null
+}
+
+strip_speech_markdown() {
+    python3 -c '
 import re, sys
 text = sys.stdin.read().replace("<<MSG_BREAK>>", "")
 code_mode = sys.argv[1]
@@ -46,8 +53,11 @@ text = re.sub(r"\[([^]]*)\]\([^)]*\)", r"\1", text)
 text = re.sub(r"^(?:[-*]|\d+\.)\s+", "", text, flags=re.M)
 lines = [line.rstrip() for line in text.splitlines()]
 sys.stdout.write("\n".join(line for line in lines if line.strip()).strip())
-' "$code_mode" \
-| python3 -c '
+' "$code_mode"
+}
+
+collapse_speech_summary() {
+    python3 -c '
 import re, sys
 text = sys.stdin.read().strip()
 if not text:
@@ -76,3 +86,12 @@ if len(summary) > 280:
     summary = summary[:280].rsplit(" ", 1)[0].strip() or summary[:280]
 sys.stdout.write(summary or text[:280])
 ' "$summary_mode"
+}
+
+# Every stage consumes the previous stage's stdout. Settings-disabled summary
+# stages are pass-throughs inside their functions, so no stage can bypass the
+# transform or markdown stages through shell conditional precedence.
+extract_explicit_summary \
+    | transform_for_speech \
+    | strip_speech_markdown \
+    | collapse_speech_summary

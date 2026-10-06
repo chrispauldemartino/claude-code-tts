@@ -979,12 +979,11 @@ for i, p in enumerate(parts):
             continue
         fi
 
-        local segment transformed_seg cleaned_seg
+        local segment cleaned_seg
         segment=$(cat "$seg_file")
-        # Transform structured data (tables/lists) before markdown stripping
-        transformed_seg=$(echo "$segment" | python3 "$PLUGIN_BIN/transform-for-speech.py" 2>/dev/null)
-        [ -z "$transformed_seg" ] && transformed_seg="$segment"
-        cleaned_seg=$(strip_markdown "$transformed_seg" "$code_mode")
+        # Keep this legacy local playback path byte-identical to queue/backfill
+        # preparation for the same input and settings.
+        cleaned_seg=$(printf '%s' "$segment" | CLAUDE_VOICE_CONFIG="$CONFIG" "$PLUGIN_BIN/prepare-speech.sh" 2>/dev/null)
         if [ -z "$cleaned_seg" ]; then
             continue
         fi

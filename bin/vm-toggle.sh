@@ -891,6 +891,17 @@ remote_log_command() {
     ssh_mbp "printf '%s\n' '$action' > /tmp/claude-tts-log-command"
 }
 
+read_backfill_stop_generation() {
+    local generation="${CLAUDE_TTS_BACKFILL_GENERATION:-}"
+    if [ -z "$generation" ]; then
+        generation="$(ssh_mbp "generation=\$(awk -F= '\$1 == \"generation\" { print \$2; exit }' /tmp/claude-tts-stop-generation 2>/dev/null); printf '%s\n' \"\${generation:-0}\"" 2>/dev/null)" || return 1
+    fi
+    case "$generation" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$generation"
+}
+
 remote_log_status() {
     ssh_mbp "python3 - <<'PY'
 import json
@@ -1154,7 +1165,7 @@ handle_log_command() {
 
 handle_backfill_command() {
     local requested="${1:-10}" session_id source_label metadata transcript result
-    local batch_id export_skipped status_file imported listener_skipped dupes tries latest
+    local batch_id batch_dir export_skipped status_file imported listener_skipped dupes tries latest request_generation
 
     if [ "$requested" = "status" ]; then
         latest=""
@@ -1192,8 +1203,15 @@ handle_backfill_command() {
     transcript="$(printf '%s' "$metadata" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
     [ -z "$transcript" ] && transcript="auto"
 
+    if ! request_generation="$(read_backfill_stop_generation)"; then
+        echo "Could not read the MBP stop generation; backfill was not exported." >&2
+        return 1
+    fi
     result="$(python3 "$PLUGIN_BIN/backfill-transcript.py" "$source_label" "$session_id" "$transcript" "$requested")" || return 1
     batch_id="$(printf '%s' "$result" | jq -r .batch_id)"
+    batch_dir="$(printf '%s' "$result" | jq -r .batch_dir)"
+    [ -d "$batch_dir" ] || { echo "Backfill exporter returned a missing batch directory." >&2; return 1; }
+    printf '%s\n' "$request_generation" > "$batch_dir/.generation"
     export_skipped="$(printf '%s' "$result" | jq -r '.skipped // 0')"
     status_file="$BACKFILL_STATUS_DIR/$batch_id.json"
 

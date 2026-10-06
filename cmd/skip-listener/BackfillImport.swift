@@ -38,6 +38,39 @@ struct BackfillDedupIndex {
     }
 }
 
+func insertBackfillQueueHashes(
+    into index: inout BackfillDedupIndex,
+    queueURL: URL,
+    source: String,
+    sessionID: String
+) {
+    let fm = FileManager.default
+    let entries = (try? fm.contentsOfDirectory(
+        at: queueURL,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    )) ?? []
+    for entry in entries where entry.lastPathComponent.hasPrefix("entry-") {
+        guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+              backfillRead(entry.appendingPathComponent("source")) == source,
+              backfillRead(entry.appendingPathComponent("session")) == sessionID else { continue }
+
+        var hash: String?
+        if let metadataData = try? Data(contentsOf: entry.appendingPathComponent("meta.json")),
+           let metadata = try? JSONSerialization.jsonObject(with: metadataData) as? [String: Any] {
+            hash = metadata["content_hash"] as? String
+        }
+        if hash?.isEmpty != false,
+           let rawText = try? String(contentsOf: entry.appendingPathComponent("raw"), encoding: .utf8),
+           !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            hash = backfillContentHash(rawText)
+        }
+        if let hash, !hash.isEmpty {
+            index.insert(source: source, sessionID: sessionID, contentHash: hash)
+        }
+    }
+}
+
 struct BackfillBatchManifest: Decodable {
     let batchID: String
     let itemCount: Int

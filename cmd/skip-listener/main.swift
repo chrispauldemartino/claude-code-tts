@@ -1148,6 +1148,12 @@ func importPendingBackfillBatches() {
                     knownHashes.insert(source: batch.manifest.source, sessionID: batch.manifest.sessionID, contentHash: hash)
                 }
             }
+            insertBackfillQueueHashes(
+                into: &knownHashes,
+                queueURL: URL(fileURLWithPath: queueDir),
+                source: batch.manifest.source,
+                sessionID: batch.manifest.sessionID
+            )
             savePlaybackLogItems(existing)
 
             var imported = 0
@@ -1197,7 +1203,10 @@ func importPendingBackfillBatches() {
                 imported += 1
             }
             _ = prunePlaybackLog()
-            if let newestItemID { writeBackfillNavigationAnchor(newestItemID) }
+            if let newestItemID {
+                writeBackfillNavigationAnchor(newestItemID)
+                writeCurrentPlaybackItemID(newestItemID)
+            }
             debugPrint("BACKFILL — batch \(batch.id) imported=\(imported) skipped=\(skipped) dupes=\(dupes)")
             return BackfillCommitResult(imported: imported, skipped: skipped, dupes: dupes)
         }

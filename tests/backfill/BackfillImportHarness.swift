@@ -41,6 +41,27 @@ struct BackfillImportHarness {
         try FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
+        let queue = root.appendingPathComponent("queue")
+        let liveEntry = queue.appendingPathComponent("entry-live")
+        try FileManager.default.createDirectory(at: liveEntry, withIntermediateDirectories: true)
+        try "Claude Code\n".write(to: liveEntry.appendingPathComponent("source"), atomically: true, encoding: .utf8)
+        try "s1\n".write(to: liveEntry.appendingPathComponent("session"), atomically: true, encoding: .utf8)
+        try "Full answer.\n".write(to: liveEntry.appendingPathComponent("raw"), atomically: true, encoding: .utf8)
+        let liveHash = backfillContentHash("Full answer.")
+        try "{\"content_hash\":\"\(liveHash)\"}\n".write(
+            to: liveEntry.appendingPathComponent("meta.json"), atomically: true, encoding: .utf8
+        )
+        var liveDedup = BackfillDedupIndex()
+        insertBackfillQueueHashes(into: &liveDedup, queueURL: queue, source: "Claude Code", sessionID: "s1")
+        require(
+            liveDedup.contains(
+                source: "Claude Code",
+                sessionID: "s1",
+                contentHash: liveHash
+            ),
+            "live queued answer is indexed before archive"
+        )
+
         try writeBatch(root: inbox, id: "accepted", generation: 7)
         var committed = 0
         importBackfillBatches(inboxURL: inbox, acknowledgementURL: acks, isGenerationCurrent: { $0 == 7 }) { batch, generation in
@@ -60,7 +81,7 @@ struct BackfillImportHarness {
             committed += 1
             return BackfillCommitResult(imported: 1, skipped: 0, dupes: 0)
         }
-        require(committed == 1, "stale work never reaches commit or synthesis boundary")
+        require(committed == 1, "stop between export and transfer rejects stamped batch before commit")
         let staleAck = try String(contentsOf: acks.appendingPathComponent("stale.imported"), encoding: .utf8)
         require(staleAck.contains("\"status\":\"stale\""), "stale status acknowledged")
         print("backfill import harness: PASS")

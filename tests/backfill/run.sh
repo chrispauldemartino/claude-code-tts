@@ -42,12 +42,16 @@ assert_eq "Release Train seven" "$(cat "$codex_batch/000.session_name")" "Codex 
 printf '%s\n' 'summary=on' 'code=silent' > "$TEST_ROOT/config"
 summary="$(printf '%s' 'First complete sentence. Second useful sentence. Third sentence is extra.' | CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" "$ROOT/bin/prepare-speech.sh")"
 assert_eq "First complete sentence. Second useful sentence." "$summary" "summary fallback consumes stdin"
+transformed_summary="$(printf '%s' 'ELLE ships today. Second sentence stays. Third sentence is extra.' | CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" "$ROOT/bin/prepare-speech.sh")"
+assert_eq "El Lee ships today. Second sentence stays." "$transformed_summary" "summary on runs transform-for-speech"
 explicit="$(printf '%s' 'Long body. [SUMMARY: First chosen sentence. Second chosen sentence. Third chosen sentence.] More detail.' | CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" "$ROOT/bin/prepare-speech.sh")"
 assert_eq "First chosen sentence. Second chosen sentence. Third chosen sentence." "$explicit" "explicit summary is not fallback-truncated"
 
 printf '%s\n' 'summary=off' 'code=silent' > "$TEST_ROOT/config"
 full="$(printf '%s' $'**Heading**\n\n```sh\necho hidden\n```\nVisible text.' | CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" "$ROOT/bin/prepare-speech.sh")"
 assert_eq $'Heading\nshell snippet with 1 lines.\nVisible text.' "$full" "summary off matches live transform and markdown strip"
+transformed_full="$(printf '%s' 'ELLE ships today.' | CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" "$ROOT/bin/prepare-speech.sh")"
+assert_eq "El Lee ships today." "$transformed_full" "summary off runs transform-for-speech"
 code_only="$(printf '%s' $'```python\nprint("hello")\n```' | CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" "$ROOT/bin/prepare-speech.sh")"
 assert_eq "python snippet with 1 lines." "$code_only" "code-only answer remains speakable"
 control_output="$(printf '%s' 'Voice mode ON — global speech enabled' | CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" "$ROOT/bin/prepare-speech.sh")"
@@ -72,14 +76,18 @@ CLAUDE_TTS_SESSIONS_DIR="$TEST_ROOT/sessions" python3 "$ROOT/bin/session-metadat
     --transcript-path "$ROOT/tests/backfill/fixtures/claude.jsonl" >/dev/null
 cli_output="$(CLAUDE_CODE_SESSION_ID=claude-session \
     CLAUDE_TTS_NO_SYNC=1 CLAUDE_TTS_BACKFILL_NO_WAIT=1 \
+    CLAUDE_TTS_BACKFILL_GENERATION=7 \
     CLAUDE_TTS_BACKFILL_OUTBOX="$TEST_ROOT/cli-outbox" \
     CLAUDE_TTS_BACKFILL_STATUS_DIR="$TEST_ROOT/status" \
     CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" \
     CLAUDE_TTS_SESSIONS_DIR="$TEST_ROOT/sessions" \
     "$ROOT/bin/vm-toggle.sh" backfill 2)"
 printf '%s\n' "$cli_output" | grep -F 'Backfill queued: batch ' >/dev/null
+cli_batch="$(find "$TEST_ROOT/cli-outbox" -mindepth 1 -maxdepth 1 -type d | head -1)"
+assert_eq "7" "$(cat "$cli_batch/.generation")" "request stamps stop generation on exported batch"
 default_output="$(CLAUDE_CODE_SESSION_ID=claude-session \
     CLAUDE_TTS_NO_SYNC=1 CLAUDE_TTS_BACKFILL_NO_WAIT=1 \
+    CLAUDE_TTS_BACKFILL_GENERATION=7 \
     CLAUDE_TTS_BACKFILL_OUTBOX="$TEST_ROOT/cli-default-outbox" \
     CLAUDE_TTS_BACKFILL_STATUS_DIR="$TEST_ROOT/status" \
     CLAUDE_VOICE_CONFIG="$TEST_ROOT/config" \
