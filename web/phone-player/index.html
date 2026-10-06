@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111827">
+  <title>Claude Phone Voice</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-rounded, -apple-system, BlinkMacSystemFont, sans-serif; }
+    body { margin: 0; min-height: 100vh; background: #111827; color: #f9fafb; display: grid; place-items: center; }
+    main { width: min(92vw, 32rem); padding: 2rem 0 calc(2rem + env(safe-area-inset-bottom)); }
+    h1 { font-size: 1.6rem; margin: 0 0 .4rem; }
+    #status { color: #9ca3af; min-height: 1.5rem; }
+    #now { min-height: 5rem; padding: 1rem; background: #1f2937; border-radius: 1rem; line-height: 1.45; }
+    button, select { font: inherit; border: 0; border-radius: .8rem; padding: .9rem 1rem; color: #f9fafb; background: #374151; }
+    button:active { transform: scale(.97); }
+    #start { width: 100%; background: #22c55e; color: #052e16; font-weight: 700; margin: 1rem 0; }
+    .controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem; }
+    label { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; color: #d1d5db; }
+    audio { width: 100%; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Claude Phone Voice</h1>
+  <div id="status">Ready to connect</div>
+  <button id="start">Start listening</button>
+  <div id="now">New replies will appear here.</div>
+  <audio id="audio" controls playsinline></audio>
+  <div class="controls">
+    <button id="previous">Previous</button>
+    <button id="replay">Replay</button>
+    <button id="skip">Skip</button>
+    <button id="stop">Stop</button>
+  </div>
+  <label>Playback speed
+    <select id="speed">
+      <option>0.5</option><option>0.75</option><option selected>1</option>
+      <option>1.25</option><option>1.5</option><option>2</option><option>2.5</option><option>3</option>
+    </select>
+  </label>
+</main>
+<script>
+(() => {
+  const audio = document.querySelector('#audio');
+  const status = document.querySelector('#status');
+  const now = document.querySelector('#now');
+  const speed = document.querySelector('#speed');
+  const startButton = document.querySelector('#start');
+  let hasStoredSpeed = localStorage.getItem('phoneVoiceSpeed') !== null;
+  let started = false, unlocking = false, unlockGeneration = 0, waiting = true, playlist = [], cursor = -1;
+  const api = path => path;
+
+  function setRate(value, persist = true) {
+    const rate = Math.min(3, Math.max(.5, Number(value) || 1));
+    audio.playbackRate = rate;
+    speed.value = String(rate);
+    if (persist) localStorage.setItem('phoneVoiceSpeed', String(rate));
+    return rate;
+  }
+  function retryStart(message) {
+    started = false;
+    startButton.hidden = false;
+    status.textContent = message;
+  }
+  function metadata(item) {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: item.text.slice(0, 80) || 'Claude reply', artist: 'Claude Code TTS'
+      });
+    }
+  }
+  async function playAt(index) {
+    if (index < 0 || index >= playlist.length) return;
+    waiting = false;
+    cursor = index;
+    const item = playlist[cursor];
+    audio.src = item.url;
+    setRate(speed.value);
+    now.textContent = item.text || 'Claude reply';
+    status.textContent = `Playing ${cursor + 1} of ${playlist.length}`;
+    metadata(item);
+    try { await audio.play(); } catch (_) { retryStart('Tap Start listening to resume'); }
+  }
+  async function markPlayed(item) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    try {
+      await fetch(api('/api/played'), {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({id:item.id}), signal: controller.signal
+      });
+    } catch (_) {} finally { clearTimeout(timeout); }
+  }
+  function cancelUnlock() {
+    if (!unlocking) return;
+    unlockGeneration += 1;
+    unlocking = false;
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+  }
+  function advance() {
+    if (unlocking) {
+      cancelUnlock();
+      retryStart('Tap Start listening to continue');
+      return;
+    }
+    const completed = cursor >= 0 ? playlist[cursor] : null;
+    if (completed) markPlayed(completed);
+    if (cursor + 1 < playlist.length) playAt(cursor + 1);
+    else {
+      waiting = true;
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      status.textContent = 'Listening for new replies…';
+    }
+  }
+  async function poll() {
+    try {
+      const response = await fetch(api('/api/queue'), {cache:'no-store'});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      const currentId = cursor >= 0 && playlist[cursor] ? playlist[cursor].id : null;
+      const known = new Set(playlist.map(item => item.id));
+      for (const item of data.items) if (!known.has(item.id)) playlist.push(item);
+      playlist.sort((left, right) => left.id.localeCompare(right.id));
+      if (currentId) cursor = playlist.findIndex(item => item.id === currentId);
+      if (!hasStoredSpeed) setRate(data.speed || 1, false);
+      if (started && !unlocking && waiting && cursor + 1 < playlist.length) playAt(cursor + 1);
+    } catch (error) { status.textContent = `Connection error: ${error.message}`; }
+  }
+
+  function silentWavUrl() {
+    const sampleRate = 8000, sampleCount = 800;
+    const buffer = new ArrayBuffer(44 + sampleCount * 2), view = new DataView(buffer);
+    const text = (offset, value) => [...value].forEach((char, index) => view.setUint8(offset + index, char.charCodeAt(0)));
+    text(0, 'RIFF'); view.setUint32(4, 36 + sampleCount * 2, true); text(8, 'WAVEfmt ');
+    view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true); text(36, 'data');
+    view.setUint32(40, sampleCount * 2, true);
+    return URL.createObjectURL(new Blob([buffer], {type: 'audio/wav'}));
+  }
+  function startListening() {
+    started = true;
+    startButton.hidden = true;
+    if (playlist.length) {
+      playAt(cursor >= 0 ? cursor : 0);
+      return;
+    }
+    unlocking = true;
+    const generation = ++unlockGeneration;
+    const silent = silentWavUrl();
+    audio.src = silent;
+    const unlocked = audio.play();
+    unlocked.then(() => {
+      if (generation !== unlockGeneration) {
+        URL.revokeObjectURL(silent);
+        return;
+      }
+      audio.pause();
+      URL.revokeObjectURL(silent);
+      audio.removeAttribute('src');
+      audio.load();
+      unlocking = false;
+      waiting = true;
+      if (!started) return;
+      status.textContent = 'Listening for new replies…';
+      if (cursor + 1 < playlist.length) playAt(cursor + 1); else poll();
+    }).catch(() => {
+      if (generation !== unlockGeneration) {
+        URL.revokeObjectURL(silent);
+        return;
+      }
+      unlocking = false;
+      URL.revokeObjectURL(silent);
+      retryStart('Safari blocked audio; tap Start listening again');
+    });
+  }
+  startButton.onclick = startListening;
+  document.querySelector('#skip').onclick = advance;
+  document.querySelector('#stop').onclick = () => {
+    cancelUnlock();
+    audio.pause();
+    if (audio.currentSrc) audio.currentTime = 0;
+    retryStart('Stopped');
+  };
+  document.querySelector('#replay').onclick = () => { if (cursor >= 0) playAt(cursor); };
+  document.querySelector('#previous').onclick = () => { if (cursor > 0) playAt(cursor - 1); };
+  audio.addEventListener('ended', advance);
+  speed.onchange = async () => {
+    hasStoredSpeed = true;
+    const value = setRate(speed.value);
+    try { await fetch(api('/api/speed'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({speed:value})}); } catch (_) {}
+  };
+  setRate(localStorage.getItem('phoneVoiceSpeed') || 1, false);
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.setActionHandler('play', () => {
+        if (!started) startListening();
+        else audio.play().catch(() => retryStart('Tap Start listening to resume'));
+      });
+    } catch (_) {}
+    try { navigator.mediaSession.setActionHandler('pause', () => audio.pause()); } catch (_) {}
+    try { navigator.mediaSession.setActionHandler('nexttrack', advance); } catch (_) {}
+    try {
+      navigator.mediaSession.setActionHandler('previoustrack', () => {
+        if (cursor > 0) playAt(cursor - 1);
+      });
+    } catch (_) {}
+  }
+  poll();
+  setInterval(poll, 3000);
+})();
+</script>
+</body>
+</html>

@@ -6,6 +6,9 @@ bin/*
 !bin/stopall-drain.sh
 !bin/stopall-bridge-publish-mode.sh
 !bin/stopall-lock.sh
+!bin/phone-audio-server.py
+!bin/phone-voice.sh
+!bin/vm-dispatch.sh
 dist/
 *.exe
 *.dll
@@ -43,6 +46,8 @@ go.work
 *.tmp
 *.temp
 *.mp3
+__pycache__/
+*.pyc
 
 # Local MCP config (user-specific)
 .mcp.json
