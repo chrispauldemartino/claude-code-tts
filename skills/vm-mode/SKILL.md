@@ -32,6 +32,16 @@ Manages the voice config file at `/tmp/claude-voice-config`. Each command reads 
 | "speak slower" | speed -= 50 (min 175) |
 | "use [device] mic" | mic_device=[device name] |
 
+`cue=source` and `cue=both` intentionally speak the AI name (`Claude`,
+`Codex`, or `Cursor`). Once a session nickname is persisted, its automatic
+name and provenance remain fixed; only `/vm name <nickname>` replaces it. The
+automatic tiers are handoff, worktree, main, custom title, tier 4b Claude
+`--name` (`launch_name`), then generated fallback.
+
+Mini-side hook files (`bin/session-metadata.py`, `hooks/session-start.sh`,
+`hooks/hooks.json`, and `hooks/auto-speak.sh`) execute from the plugin checkout
+on the Mini. They are not included in the MBP `/vm rebuild` sync.
+
 ## How to Apply Changes
 
 1. Read current config: `cat /tmp/claude-voice-config` (if exists)

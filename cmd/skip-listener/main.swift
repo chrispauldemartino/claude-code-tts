@@ -1301,7 +1301,8 @@ func killTTSProcesses() {
 func runProcessWithTimeout(
     _ process: Process,
     timeout: TimeInterval,
-    expectedGeneration: StopGenerationSnapshot? = nil
+    expectedGeneration: StopGenerationSnapshot? = nil,
+    onStarted: (() -> Void)? = nil
 ) -> Bool {
     let semaphore = DispatchSemaphore(value: 0)
     process.terminationHandler = { _ in
@@ -1314,11 +1315,11 @@ func runProcessWithTimeout(
     do {
         if let expectedGeneration {
             let launched = try stopGenerationStore.performIfCurrent(expectedGeneration) {
-                try process.run()
+                try launchProcess(process, onStarted: onStarted)
             }
             guard launched else { return false }
         } else {
-            try process.run()
+            try launchProcess(process, onStarted: onStarted)
         }
     } catch {
         debugPrint("PROCESS — failed to launch: \(error)")
@@ -1455,7 +1456,8 @@ func synthesizeSpeechAudio(
 func playAudioFile(
     _ path: String,
     volume: String,
-    expectedGeneration: StopGenerationSnapshot
+    expectedGeneration: StopGenerationSnapshot,
+    onStarted: (() -> Void)? = nil
 ) -> Bool {
     let playProc = Process()
     playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
@@ -1463,7 +1465,8 @@ func playAudioFile(
     return runProcessWithTimeout(
         playProc,
         timeout: 20,
-        expectedGeneration: expectedGeneration
+        expectedGeneration: expectedGeneration,
+        onStarted: onStarted
     )
 }
 
@@ -2016,7 +2019,6 @@ func playSessionAnnouncementIfNeeded(
     guard played, stopGenerationStore.isCurrent(expectedGeneration) else {
         return stopGenerationStore.isCurrent(expectedGeneration)
     }
-    lastAudiblyPlayedSessionKey = key
     debugPrint("SESSION CUE — announced \(announcement)")
     return true
 }
@@ -2318,7 +2320,13 @@ func speakText(
         let played = playAudioFile(
             outputFile,
             volume: volume,
-            expectedGeneration: playbackGeneration
+            expectedGeneration: playbackGeneration,
+            onStarted: {
+                if !startedAudiblePlayback {
+                    noteAudiblePlayback(sourceLabel: normalizedSource, sessionID: normalizedSession)
+                    startedAudiblePlayback = true
+                }
+            }
         )
 
         if shouldRemoveAfterPlayback {
@@ -2341,10 +2349,6 @@ func speakText(
             continue
         }
         guard stopGenerationStore.performIfCurrent(playbackGeneration, {
-            if !startedAudiblePlayback {
-                noteAudiblePlayback(sourceLabel: normalizedSource, sessionID: normalizedSession)
-                startedAudiblePlayback = true
-            }
             if idx == 0, let source = normalizedSource {
                 try? source.write(toFile: lastSourceFile, atomically: true, encoding: .utf8)
             }

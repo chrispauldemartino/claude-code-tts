@@ -29,6 +29,8 @@ mkdir -p "$PLUGIN_ROOT/cmd/skip-listener"
 echo "Copying skip-listener source and helpers from $HOST..."
 scp "$HOST:~/.claude/plugins/claude-code-tts/cmd/skip-listener/main.swift" \
     "$PLUGIN_ROOT/cmd/skip-listener/main.swift"
+scp "$HOST:~/.claude/plugins/claude-code-tts/cmd/skip-listener/ProcessLaunch.swift" \
+    "$PLUGIN_ROOT/cmd/skip-listener/ProcessLaunch.swift"
 scp "$HOST:~/.claude/plugins/claude-code-tts/cmd/skip-listener/StopGeneration.swift" \
     "$PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift"
 scp "$HOST:~/.claude/plugins/claude-code-tts/cmd/skip-listener/StopAllArchive.swift" \

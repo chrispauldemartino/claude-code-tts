@@ -3,6 +3,7 @@ set -euo pipefail
 
 PLUGIN_ROOT="${PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 SRC="$PLUGIN_ROOT/cmd/skip-listener/main.swift"
+PROCESS_LAUNCH_SRC="$PLUGIN_ROOT/cmd/skip-listener/ProcessLaunch.swift"
 STOP_GENERATION_SRC="$PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift"
 STOP_ARCHIVE_SRC="$PLUGIN_ROOT/cmd/skip-listener/StopAllArchive.swift"
 APP="$PLUGIN_ROOT/bin/SkipListener.app"
@@ -21,7 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ ! -f "$SRC" ] || [ ! -f "$STOP_GENERATION_SRC" ] || [ ! -f "$STOP_ARCHIVE_SRC" ]; then
+if [ ! -f "$SRC" ] || [ ! -f "$PROCESS_LAUNCH_SRC" ] || [ ! -f "$STOP_GENERATION_SRC" ] || [ ! -f "$STOP_ARCHIVE_SRC" ]; then
     echo "Missing skip-listener source" >&2
     exit 1
 fi
@@ -95,7 +96,7 @@ PLIST
 
 plutil -lint "$PLIST_STAGE" >/dev/null
 
-swiftc -O -o "$EXE_STAGE" "$SRC" "$STOP_GENERATION_SRC" "$STOP_ARCHIVE_SRC"
+swiftc -O -o "$EXE_STAGE" "$SRC" "$PROCESS_LAUNCH_SRC" "$STOP_GENERATION_SRC" "$STOP_ARCHIVE_SRC"
 cp "$EXE_STAGE" "$LEGACY_STAGE"
 chmod +x "$EXE_STAGE" "$LEGACY_STAGE"
 

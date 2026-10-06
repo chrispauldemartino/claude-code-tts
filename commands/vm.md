@@ -16,6 +16,9 @@ Session announcement controls:
 
 - `/vm name` shows the invoking session's nickname and provenance.
 - `/vm name <nickname>` stores a per-session override. Quote a nickname that contains spaces.
-- `/vm cue session|source|both|off` selects the standalone announcement content.
+- Once any nickname is persisted, automatic registration keeps that nickname and its provenance; only `/vm name <nickname>` may replace it.
+- Automatic nickname tiers are: handoff, worktree, main, custom title, tier 4b Claude `--name` (`launch_name`), then generated fallback.
+- `/vm cue session|source|both|off` selects the standalone announcement content. `source` and `both` intentionally speak the AI name (`Claude`, `Codex`, or `Cursor`).
 - `/vm cue-frequency change|always` announces only on a `(source, session_id)` transition (the default) or before every item.
 - `/vm status` includes the invoking session ID, nickname/provenance, allowlist state, and whether voice is on, open, or background-muted for that session.
+- Mini-side hook files (`bin/session-metadata.py`, `hooks/session-start.sh`, `hooks/hooks.json`, and `hooks/auto-speak.sh`) run from the plugin checkout on the Mini and are not part of the MBP `/vm rebuild` sync.

@@ -79,6 +79,17 @@ assert_eq "generated" "$(printf '%s' "$generated_first" | jq -r .name_provenance
 assert_eq "$(printf '%s' "$generated_first" | jq -r .display_name)" "$(printf '%s' "$generated_second" | jq -r .display_name)" "generated nickname persistence"
 test -f "$(printf '%s' "$generated_first" | jq -r .registry_path)"
 
+# Once persisted, an automatic name and its provenance are immutable even if a
+# higher-priority custom title appears later.
+persisted_name="$(printf '%s' "$generated_first" | jq -r .display_name)"
+late_title_transcript="$TEST_ROOT/late-title.jsonl"
+printf '%s\n' \
+    '{"type":"custom-title","customTitle":"Late Replacement","sessionId":"01234567-89ab-cdef-0123-456789abcdef"}' \
+    > "$late_title_transcript"
+generated_after_title="$(register "Codex" "01234567-89ab-cdef-0123-456789abcdef" "$TEST_ROOT/plain" "$late_title_transcript")"
+assert_eq "$persisted_name" "$(printf '%s' "$generated_after_title" | jq -r .display_name)" "persisted nickname resists later custom title"
+assert_eq "generated" "$(printf '%s' "$generated_after_title" | jq -r .name_provenance)" "persisted nickname keeps provenance"
+
 # Explicit override wins over all automatic tiers.
 override_result="$(python3 "$META" override --source "Claude Code" --session-id "env-session" --name "Night_Owl-8")"
 assert_eq "Night_Owl-8" "$(printf '%s' "$override_result" | jq -r .display_name)" "override display name"
@@ -141,6 +152,7 @@ assert_eq "Blue_Fox" "$(printf '%s' "$chained_name" | jq -r .display_name)" "cha
 swiftc -typecheck \
     -module-cache-path "$TEST_ROOT/module-cache" \
     "$ROOT/cmd/skip-listener/main.swift" \
+    "$ROOT/cmd/skip-listener/ProcessLaunch.swift" \
     "$ROOT/cmd/skip-listener/StopGeneration.swift" \
     "$ROOT/cmd/skip-listener/StopAllArchive.swift"
 

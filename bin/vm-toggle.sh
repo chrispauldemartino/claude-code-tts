@@ -33,6 +33,7 @@ MBP_STOPALL_PUBLISH_MODE="/Users/christopherdemartino/.claude-tts/bin/stopall-br
 SSH_OPTS=(-o ConnectTimeout=5 -o BatchMode=yes)
 
 LOCAL_SKIP_LISTENER_SRC="$PLUGIN_DIR/cmd/skip-listener/main.swift"
+LOCAL_PROCESS_LAUNCH_SRC="$PLUGIN_DIR/cmd/skip-listener/ProcessLaunch.swift"
 LOCAL_STOP_GENERATION_SRC="$PLUGIN_DIR/cmd/skip-listener/StopGeneration.swift"
 LOCAL_STOP_ARCHIVE_SRC="$PLUGIN_DIR/cmd/skip-listener/StopAllArchive.swift"
 LOCAL_SPEAK_TEXT_SRC="$PLUGIN_DIR/cmd/speak-text/main.go"
@@ -251,6 +252,7 @@ wait_for_remote_gui_rebuild() {
 rebuild_remote_skip_listener() {
     local required_files=(
         "$LOCAL_SKIP_LISTENER_SRC"
+        "$LOCAL_PROCESS_LAUNCH_SRC"
         "$LOCAL_STOP_GENERATION_SRC"
         "$LOCAL_STOP_ARCHIVE_SRC"
         "$LOCAL_SPEAK_TEXT_SRC"
@@ -275,6 +277,7 @@ rebuild_remote_skip_listener() {
     ssh_mbp "mkdir -p '$MBP_PLUGIN_ROOT/bin' '$MBP_PLUGIN_ROOT/cmd/skip-listener' '$MBP_PLUGIN_ROOT/cmd/speak-text'" || return 1
 
     scp_mbp "$LOCAL_SKIP_LISTENER_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/main.swift" || return 1
+    scp_mbp "$LOCAL_PROCESS_LAUNCH_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/ProcessLaunch.swift" || return 1
     scp_mbp "$LOCAL_STOP_GENERATION_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift" || return 1
     scp_mbp "$LOCAL_STOP_ARCHIVE_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/StopAllArchive.swift" || return 1
     scp_mbp "$LOCAL_SPEAK_TEXT_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/speak-text/main.go" || return 1

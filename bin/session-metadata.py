@@ -223,15 +223,17 @@ def register(args):
     if not args.source or not args.session_id:
         raise SystemExit("source and session id are required")
     existing = load_record(args.source, args.session_id)
-    if existing and existing.get("name_provenance") == "override":
+    if (
+        existing
+        and speakable(existing.get("display_name", ""))
+        and existing.get("name_provenance")
+    ):
         display_name = existing.get("display_name", "")
-        provenance = "override"
+        provenance = existing.get("name_provenance")
     else:
         display_name, provenance = automatic_name(
             args.session_id, args.cwd, args.transcript_path, args.launch_name
         )
-        if provenance == "generated" and existing and existing.get("name_provenance") == "generated":
-            display_name = existing.get("display_name") or display_name
 
     record = {
         "source": args.source,
