@@ -292,6 +292,20 @@ fi
 
 echo "  source_label: $SOURCE_LABEL" >> "$DEBUG_LOG"
 
+# Register metadata before background suppression so muted sessions still have
+# stable names for status, focus, and later playback.
+SESSION_METADATA_JSON=""
+SESSION_SPEECH_NAME=""
+if [ -n "$SESSION_ID" ]; then
+    SESSION_METADATA_JSON=$(python3 "$PLUGIN_BIN/session-metadata.py" register \
+        --source "$SOURCE_LABEL" \
+        --session-id "$SESSION_ID" \
+        --cwd "${SESSION_CWD:-$PWD}" \
+        --transcript-path "$transcript_path" 2>>"$DEBUG_LOG" || true)
+    SESSION_SPEECH_NAME=$(printf '%s' "$SESSION_METADATA_JSON" | jq -r '.speech_name // ""' 2>/dev/null)
+    [ -n "$SESSION_SPEECH_NAME" ] && echo "  session_name: $SESSION_SPEECH_NAME" >> "$DEBUG_LOG"
+fi
+
 # --- Feature B: Foreground allowlist suppression guard ---
 FOREGROUND_ALLOWLIST="/tmp/claude-tts-foreground-sessions"
 suppress_bg="$(grep '^suppress_background=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || true)"
@@ -998,7 +1012,6 @@ for i, p in enumerate(parts):
 if has_config; then
     VOICE=$(read_config "voice" "off")
     MIC=$(read_config "mic" "off")
-    CUE=$(read_config "cue" "off")
     SUBTITLE=$(read_config "subtitle" "off")
     SPEED=$(read_config "speed" "200")
     [[ "$SPEED" =~ ^[0-9]+$ ]] || SPEED=200
@@ -1125,10 +1138,25 @@ if has_config; then
                     echo "$VOL_LEVEL" > "$REMOTE_TTS_DIR/entry-${remote_ts}.volume"
                     echo "$SOURCE_LABEL" > "$REMOTE_TTS_DIR/entry-${remote_ts}.source"
                     [ -n "$SESSION_ID" ] && echo "$SESSION_ID" > "$REMOTE_TTS_DIR/entry-${remote_ts}.session"
+                    [ -n "$SESSION_SPEECH_NAME" ] && printf '%s' "$SESSION_SPEECH_NAME" > "$REMOTE_TTS_DIR/entry-${remote_ts}.session_name"
                     echo "$block_id" > "$REMOTE_TTS_DIR/entry-${remote_ts}.block"
                     printf '%s' "$text_to_queue" > "$REMOTE_TTS_DIR/entry-${remote_ts}.raw"
                     printf '%s' "$cleaned" > "$REMOTE_TTS_DIR/entry-${remote_ts}.normalized"
-                    echo "$filtered_text" > "$REMOTE_TTS_DIR/entry-${remote_ts}.txt"
+                    content_hash=$(printf '%s' "$cleaned" | shasum -a 256 | awk '{print $1}')
+                    item_timestamp=$(date +%s)
+                    jq -n \
+                        --arg origin "live" \
+                        --arg turn_id "$block_id" \
+                        --arg content_hash "$content_hash" \
+                        --argjson answered_at "$item_timestamp" \
+                        --argjson imported_at "$item_timestamp" \
+                        '{schema_version: 1, origin: $origin, autoplay: true,
+                          batch_id: null, batch_index: null, turn_id: $turn_id,
+                          answered_at: $answered_at, imported_at: $imported_at,
+                          content_hash: $content_hash, normalization_version: 1}' \
+                        > "$REMOTE_TTS_DIR/entry-${remote_ts}.meta.json"
+                    # .txt is the publication sentinel and must always be last.
+                    printf '%s\n' "$filtered_text" > "$REMOTE_TTS_DIR/entry-${remote_ts}.txt"
 
                     # Record what we just queued so future responses skip these sentences
                     record_spoken_hashes "$filtered_text"
@@ -1161,18 +1189,6 @@ if has_config; then
         echo "  [dedup] cleared prefix/length tracking (Stop event)" >> "$DEBUG_LOG"
     fi
 
-    # "Your turn" cue — ONLY on Stop event (full response complete), not PostToolUse
-    if [ "$HOOK_EVENT" = "Stop" ] && [ "$VOICE" = "on" ] && [ "$CUE" = "on" ] && [ "${queued_primary_text:-0}" -eq 1 ]; then
-        REMOTE_TTS_DIR="/tmp/claude-tts-remote"
-        mkdir -p "$REMOTE_TTS_DIR"
-        cue_ts=$(date +%s%N)
-        echo "250" > "$REMOTE_TTS_DIR/entry-${cue_ts}.speed"
-        echo "1.0" > "$REMOTE_TTS_DIR/entry-${cue_ts}.volume"
-        echo "Your turn." > "$REMOTE_TTS_DIR/entry-${cue_ts}.txt"
-        echo "  [cue] queued Your turn cue" >> "$DEBUG_LOG"
-    elif [ "$HOOK_EVENT" = "Stop" ] && [ "$VOICE" = "on" ]; then
-        echo "  [cue] skipped (cue=$CUE queued_primary_text=${queued_primary_text:-0})" >> "$DEBUG_LOG"
-    fi
 else
     # No config = text mode, no TTS
     exit 0

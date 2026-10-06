@@ -20,3 +20,9 @@ swiftc \
     "$ROOT/tests/stopall/StopAllArchiveHarness.swift" \
     -o "$TEST_ROOT/stop-archive-harness"
 "$TEST_ROOT/stop-archive-harness"
+swiftc \
+    -module-cache-path "$TEST_ROOT/module-cache" \
+    "$ROOT/cmd/skip-listener/ProcessLaunch.swift" \
+    "$ROOT/tests/stopall/ProcessLaunchHarness.swift" \
+    -o "$TEST_ROOT/process-launch-harness"
+"$TEST_ROOT/process-launch-harness"

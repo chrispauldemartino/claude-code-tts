@@ -3,7 +3,7 @@
 # Config file: /tmp/claude-voice-config
 # See: ELLE_Advanced_Voice_Mode_Toggles_Spec.md
 
-CONFIG="/tmp/claude-voice-config"
+CONFIG="${CLAUDE_VOICE_CONFIG:-/tmp/claude-voice-config}"
 PID_FILE="/tmp/claude-skip-listener.pid"
 ACTIVE_SESSION_ID_FILE="/tmp/claude-tts-active-session-id"
 ACTIVE_TRANSCRIPT_PATH_FILE="/tmp/claude-tts-active-transcript-path"
@@ -13,7 +13,7 @@ LAST_SOURCE_FILE="/tmp/claude-tts-last-source"
 LAST_SESSION_FILE="/tmp/claude-tts-last-session"
 FOCUSED_SESSION_ID_FILE="/tmp/claude-tts-focused-session-id"
 FOCUSED_SOURCE_LABEL_FILE="/tmp/claude-tts-focused-source"
-FOREGROUND_ALLOWLIST="/tmp/claude-tts-foreground-sessions"
+FOREGROUND_ALLOWLIST="${CLAUDE_TTS_FOREGROUND_ALLOWLIST:-/tmp/claude-tts-foreground-sessions}"
 RESTART_QUEUE_FLAG="/tmp/claude-tts-restart-queue"
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLUGIN_BIN="$PLUGIN_DIR/bin"
@@ -33,6 +33,7 @@ MBP_STOPALL_PUBLISH_MODE="/Users/christopherdemartino/.claude-tts/bin/stopall-br
 SSH_OPTS=(-o ConnectTimeout=5 -o BatchMode=yes)
 
 LOCAL_SKIP_LISTENER_SRC="$PLUGIN_DIR/cmd/skip-listener/main.swift"
+LOCAL_PROCESS_LAUNCH_SRC="$PLUGIN_DIR/cmd/skip-listener/ProcessLaunch.swift"
 LOCAL_STOP_GENERATION_SRC="$PLUGIN_DIR/cmd/skip-listener/StopGeneration.swift"
 LOCAL_STOP_ARCHIVE_SRC="$PLUGIN_DIR/cmd/skip-listener/StopAllArchive.swift"
 LOCAL_SPEAK_TEXT_SRC="$PLUGIN_DIR/cmd/speak-text/main.go"
@@ -53,7 +54,8 @@ engine=say
 openai_voice=nova
 summary=on
 code=silent
-cue=on
+cue=session
+cue_frequency=change
 subtitle=off
 mic_device="
 SPEED_MIN=150
@@ -71,7 +73,7 @@ scp_mbp() {
 
 detect_current_session_id() {
     local var value
-    for var in CODEX_THREAD_ID CLAUDE_SESSION_ID SESSION_ID CODEX_SESSION_ID CLAUDE_CONVERSATION_ID; do
+    for var in CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID CLAUDE_SESSION_ID SESSION_ID CODEX_SESSION_ID CLAUDE_CONVERSATION_ID; do
         value="${!var:-}"
         if [ -n "$value" ]; then
             printf '%s\n' "$value"
@@ -82,13 +84,17 @@ detect_current_session_id() {
 }
 
 detect_current_source_label() {
-    if [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SESSION_ID:-}" ]; then
-        printf '%s\n' "Codex"
+    if [ -n "${CLAUDE_TTS_SESSION_SOURCE:-}" ]; then
+        printf '%s\n' "$CLAUDE_TTS_SESSION_SOURCE"
+        return 0
+    fi
+    if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || [ -n "${CLAUDE_SESSION_ID:-}" ] || [ -n "${CLAUDE_CONVERSATION_ID:-}" ]; then
+        printf '%s\n' "Claude Code"
         return 0
     fi
 
-    if [ -n "${CLAUDE_SESSION_ID:-}" ] || [ -n "${CLAUDE_CONVERSATION_ID:-}" ]; then
-        printf '%s\n' "Claude Code"
+    if [ -n "${CODEX_THREAD_ID:-}" ] || [ -n "${CODEX_SESSION_ID:-}" ]; then
+        printf '%s\n' "Codex"
         return 0
     fi
 
@@ -246,6 +252,7 @@ wait_for_remote_gui_rebuild() {
 rebuild_remote_skip_listener() {
     local required_files=(
         "$LOCAL_SKIP_LISTENER_SRC"
+        "$LOCAL_PROCESS_LAUNCH_SRC"
         "$LOCAL_STOP_GENERATION_SRC"
         "$LOCAL_STOP_ARCHIVE_SRC"
         "$LOCAL_SPEAK_TEXT_SRC"
@@ -270,6 +277,7 @@ rebuild_remote_skip_listener() {
     ssh_mbp "mkdir -p '$MBP_PLUGIN_ROOT/bin' '$MBP_PLUGIN_ROOT/cmd/skip-listener' '$MBP_PLUGIN_ROOT/cmd/speak-text'" || return 1
 
     scp_mbp "$LOCAL_SKIP_LISTENER_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/main.swift" || return 1
+    scp_mbp "$LOCAL_PROCESS_LAUNCH_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/ProcessLaunch.swift" || return 1
     scp_mbp "$LOCAL_STOP_GENERATION_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift" || return 1
     scp_mbp "$LOCAL_STOP_ARCHIVE_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/StopAllArchive.swift" || return 1
     scp_mbp "$LOCAL_SPEAK_TEXT_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/speak-text/main.go" || return 1
@@ -309,6 +317,7 @@ write_full_config() {
     local tmp="${CONFIG}.tmp"
     printf '%s\n' "$1" > "$tmp"
     mv "$tmp" "$CONFIG"
+    [ "${CLAUDE_TTS_NO_SYNC:-0}" = "1" ] && return 0
     # Sync config to MBP
     ssh -o ConnectTimeout=3 -o BatchMode=yes "$MBP_HOST" "cat > /tmp/claude-voice-config" < "$CONFIG" 2>/dev/null &
     disown 2>/dev/null
@@ -324,9 +333,66 @@ update_toggle() {
     else
         echo "${key}=${value}" >> "$CONFIG"
     fi
+    [ "${CLAUDE_TTS_NO_SYNC:-0}" = "1" ] && return 0
     # Sync config to MBP
     ssh -o ConnectTimeout=3 -o BatchMode=yes "$MBP_HOST" "cat > /tmp/claude-voice-config" < "$CONFIG" 2>/dev/null &
     disown 2>/dev/null
+}
+
+migrate_cue_settings() {
+    local cue frequency
+    [ ! -f "$CONFIG" ] && return 0
+    cue="$(read_config "cue")"
+    case "$cue" in
+        on) update_toggle "cue" "session" ;;
+        session|source|both|off) ;;
+        *) update_toggle "cue" "session" ;;
+    esac
+    frequency="$(read_config "cue_frequency")"
+    case "$frequency" in
+        change|always) ;;
+        *) update_toggle "cue_frequency" "change" ;;
+    esac
+}
+
+current_session_metadata() {
+    local session_id source_label transcript_path
+    session_id="$(detect_current_session_id || true)"
+    source_label="$(detect_current_source_label || true)"
+    [ -z "$session_id" ] && return 1
+    [ -z "$source_label" ] && source_label="Claude Code"
+    transcript_path="${CLAUDE_TRANSCRIPT_PATH:-}"
+    if [ -z "$transcript_path" ] && [ -f "$ACTIVE_TRANSCRIPT_PATH_FILE" ]; then
+        transcript_path="$(cat "$ACTIVE_TRANSCRIPT_PATH_FILE" 2>/dev/null)"
+    fi
+    python3 "$PLUGIN_BIN/session-metadata.py" show \
+        --source "$source_label" --session-id "$session_id" 2>/dev/null || \
+    python3 "$PLUGIN_BIN/session-metadata.py" register \
+        --source "$source_label" --session-id "$session_id" \
+        --cwd "$PWD" --transcript-path "$transcript_path" 2>/dev/null
+}
+
+handle_name_command() {
+    local nickname="${1:-}" session_id source_label result
+    session_id="$(detect_current_session_id || true)"
+    source_label="$(detect_current_source_label || true)"
+    [ -z "$source_label" ] && source_label="Claude Code"
+    if [ -z "$session_id" ]; then
+        echo "No current Claude/Codex session ID was found in this shell." >&2
+        return 1
+    fi
+    if [ -n "$nickname" ]; then
+        result=$(python3 "$PLUGIN_BIN/session-metadata.py" override \
+            --source "$source_label" --session-id "$session_id" --name "$nickname") || return 1
+        echo "Session name: $(printf '%s' "$result" | jq -r '.display_name')"
+        echo "  speech_name=$(printf '%s' "$result" | jq -r '.speech_name')"
+        echo "  provenance=override"
+        return 0
+    fi
+    result="$(current_session_metadata)" || return 1
+    echo "Session name: $(printf '%s' "$result" | jq -r '.display_name')"
+    echo "  speech_name=$(printf '%s' "$result" | jq -r '.speech_name')"
+    echo "  provenance=$(printf '%s' "$result" | jq -r '.name_provenance')"
 }
 
 current_speed() {
@@ -532,7 +598,8 @@ stop_daemon() {
 }
 
 show_status() {
-    local deferred_count=0
+    local deferred_count=0 invoking_session_id source_label metadata
+    local allowlisted voice_state voice_setting suppress_bg
     if [ ! -f "$CONFIG" ]; then
         echo "Voice mode: OFF (text mode)"
         return
@@ -543,6 +610,37 @@ show_status() {
     echo "Voice mode: ACTIVE"
     echo "---"
     echo "  routing=global"
+    invoking_session_id="$(detect_current_session_id || true)"
+    source_label="$(detect_current_source_label || true)"
+    echo "  invoking_session_id=${invoking_session_id:-<not set>}"
+    metadata="$(current_session_metadata 2>/dev/null || true)"
+    if [ -n "$metadata" ]; then
+        echo "  nickname=$(printf '%s' "$metadata" | jq -r '.display_name')"
+        echo "  nickname_provenance=$(printf '%s' "$metadata" | jq -r '.name_provenance')"
+    else
+        echo "  nickname=<unresolved>"
+        echo "  nickname_provenance=unknown"
+    fi
+    if [ ! -s "$FOREGROUND_ALLOWLIST" ]; then
+        allowlisted="open"
+    elif [ -n "$invoking_session_id" ] && grep -Fxq -- "$invoking_session_id" "$FOREGROUND_ALLOWLIST" 2>/dev/null; then
+        allowlisted="yes"
+    else
+        allowlisted="no"
+    fi
+    voice_setting="$(read_config "voice")"
+    suppress_bg="$(read_config "suppress_background")"
+    if [ "$voice_setting" != "on" ]; then
+        voice_state="off"
+    elif [ "$suppress_bg" = "on" ] && [ "$allowlisted" = "no" ]; then
+        voice_state="muted (bg)"
+    elif [ "$suppress_bg" = "on" ] && [ "$allowlisted" = "open" ]; then
+        voice_state="on (open)"
+    else
+        voice_state="on"
+    fi
+    echo "  allowlisted=$allowlisted"
+    echo "  voice: $voice_state"
     while IFS= read -r line; do
         [ -n "$line" ] && echo "  $line"
     done < "$CONFIG"
@@ -1310,11 +1408,22 @@ case "${1:-status}" in
             *)   echo "Usage: /vm mic on|off" ;;
         esac
         ;;
+    name)
+        handle_name_command "${2:-}" || exit 1
+        ;;
     cue)
         case "$2" in
-            on)  update_toggle "cue" "on";  echo "Cue: on"  ;;
+            on|session) update_toggle "cue" "session"; echo "Cue: session" ;;
+            source) update_toggle "cue" "source"; echo "Cue: source" ;;
+            both) update_toggle "cue" "both"; echo "Cue: both" ;;
             off) update_toggle "cue" "off"; echo "Cue: off" ;;
-            *)   echo "Usage: /vm cue on|off" ;;
+            *) echo "Usage: /vm cue session|source|both|off" ;;
+        esac
+        ;;
+    cue-frequency)
+        case "$2" in
+            always|change) update_toggle "cue_frequency" "$2"; echo "Cue frequency: $2" ;;
+            *) echo "Usage: /vm cue-frequency always|change" ;;
         esac
         ;;
     subtitle)
@@ -1372,7 +1481,7 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|cue|subtitle|summary]"
+        echo "Usage: /vm [on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary]"
         ;;
 esac
 }
@@ -1424,8 +1533,24 @@ vm_chain_arg_count() {
                 printf '%s\n' 1
             fi
             ;;
+        name)
+            case "$next_arg" in
+                ""|on|off|rebuild|listen|test|dictation|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary|background)
+                    printf '%s\n' 1
+                    ;;
+                *) printf '%s\n' 2 ;;
+            esac
+            ;;
+        cue-frequency)
+            if [ "$next_arg" = "always" ] || [ "$next_arg" = "change" ]; then
+                printf '%s\n' 2
+            else
+                printf '%s\n' 1
+            fi
+            ;;
         voice|mic|cue|subtitle|summary)
-            if [ "$next_arg" = "on" ] || [ "$next_arg" = "off" ]; then
+            if [ "$next_arg" = "on" ] || [ "$next_arg" = "off" ] || \
+               { [ "$command" = "cue" ] && { [ "$next_arg" = "session" ] || [ "$next_arg" = "source" ] || [ "$next_arg" = "both" ]; }; }; then
                 printf '%s\n' 2
             else
                 printf '%s\n' 1
@@ -1439,6 +1564,8 @@ vm_chain_arg_count() {
             ;;
     esac
 }
+
+migrate_cue_settings
 
 vm_chain_args=("$@")
 if [ "${#vm_chain_args[@]}" -eq 0 ]; then

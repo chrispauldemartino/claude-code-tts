@@ -9,6 +9,7 @@ bin/*
 !bin/phone-audio-server.py
 !bin/phone-voice.sh
 !bin/vm-dispatch.sh
+!bin/session-metadata.py
 dist/
 *.exe
 *.dll

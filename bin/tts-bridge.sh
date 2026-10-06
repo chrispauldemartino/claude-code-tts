@@ -44,13 +44,15 @@ while [ ! -f "$STOP_FLAG" ]; do
             volume=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.volume' 2>/dev/null")
             source=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.source' 2>/dev/null")
             session=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.session' 2>/dev/null")
+            session_name=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.session_name' 2>/dev/null")
             block=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.block' 2>/dev/null")
             raw=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.raw' 2>/dev/null")
             normalized=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.normalized' 2>/dev/null")
+            metadata=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.meta.json' 2>/dev/null")
             # Keep the established at-most-once remote deletion ordering. A host
             # failure after this delete can still lose the bundle before local
             # publish; a concurrent stop marks the completed import archive-only.
-            ssh -o BatchMode=yes "$HOST" "rm -f '$txt_file' '${base}.speed' '${base}.volume' '${base}.source' '${base}.session' '${base}.block' '${base}.raw' '${base}.normalized'" 2>/dev/null
+            ssh -o BatchMode=yes "$HOST" "rm -f '$txt_file' '${base}.speed' '${base}.volume' '${base}.source' '${base}.session' '${base}.session_name' '${base}.block' '${base}.raw' '${base}.normalized' '${base}.meta.json'" 2>/dev/null
 
             [ -z "$speed" ] && speed="300"
             [ -z "$volume" ] && volume="1.0"
@@ -67,9 +69,11 @@ while [ ! -f "$STOP_FLAG" ]; do
             echo "$volume" > "$staging_entry/volume"
             echo "$source" > "$staging_entry/source"
             [ -n "$session" ] && echo "$session" > "$staging_entry/session"
+            [ -n "$session_name" ] && printf '%s' "$session_name" > "$staging_entry/session_name"
             [ -n "$block" ] && echo "$block" > "$staging_entry/block"
             [ -n "$raw" ] && printf '%s' "$raw" > "$staging_entry/raw"
             [ -n "$normalized" ] && printf '%s' "$normalized" > "$staging_entry/normalized"
+            [ -n "$metadata" ] && printf '%s' "$metadata" > "$staging_entry/meta.json"
             acquire_stop_transaction_lock
             publish_generation=$(read_stop_generation)
             publish_mode=$(bash "$PUBLISH_MODE" "$fetch_generation" "$publish_generation" 2>/dev/null || true)
@@ -96,6 +100,7 @@ while [ ! -f "$STOP_FLAG" ]; do
                 echo "$volume" > "$HISTORY_DIR/msg-${padded}.volume"
                 echo "$source" > "$HISTORY_DIR/msg-${padded}.source"
                 [ -n "$session" ] && echo "$session" > "$HISTORY_DIR/msg-${padded}.session"
+                [ -n "$session_name" ] && printf '%s' "$session_name" > "$HISTORY_DIR/msg-${padded}.session_name"
                 echo "$next" > "$HISTORY_DIR/total"
                 echo "$next" > "$HISTORY_DIR/current"
                 echo "$next" > /tmp/claude-tts-repeat-anchor

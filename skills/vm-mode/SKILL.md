@@ -11,7 +11,7 @@ Manages the voice config file at `/tmp/claude-voice-config`. Each command reads 
 
 | Trigger | Config Changes |
 |---|---|
-| "voice mode" | voice=on, mic=on, cue=on, speed=300, volume=normal, summary=off, code=silent (full reset) |
+| "voice mode" | voice=on, mic=on, cue=session, cue_frequency=change, speed=300, volume=normal, summary=off, code=silent (full reset) |
 | "text mode" | Delete config file entirely |
 | "listen mode" | voice=on, mic=off, cue=off |
 | "dictation mode" | voice=off, mic=on, cue=off |
@@ -23,12 +23,24 @@ Manages the voice config file at `/tmp/claude-voice-config`. Each command reads 
 |---|---|
 | "voice on" / "voice off" | voice=on / voice=off |
 | "mic on" / "mic off" | mic=on / mic=off |
-| "cue on" / "cue off" | cue=on / cue=off |
+| "session cue" / "source cue" / "both cues" / "cue off" | cue=session / source / both / off |
+| "announce every item" / "announce on session change" | cue_frequency=always / change |
+| "name this session <nickname>" | `/vm name <nickname>` |
 | "summary mode on" / "summary mode off" | summary=on / summary=off |
 | "narrate code" / "skip code" | code=narrate / code=silent |
 | "speak faster" | speed += 50 (cap 350) |
 | "speak slower" | speed -= 50 (min 175) |
 | "use [device] mic" | mic_device=[device name] |
+
+`cue=source` and `cue=both` intentionally speak the AI name (`Claude`,
+`Codex`, or `Cursor`). Once a session nickname is persisted, its automatic
+name and provenance remain fixed; only `/vm name <nickname>` replaces it. The
+automatic tiers are handoff, worktree, main, custom title, tier 4b Claude
+`--name` (`launch_name`), then generated fallback.
+
+Mini-side hook files (`bin/session-metadata.py`, `hooks/session-start.sh`,
+`hooks/hooks.json`, and `hooks/auto-speak.sh`) execute from the plugin checkout
+on the Mini. They are not included in the MBP `/vm rebuild` sync.
 
 ## How to Apply Changes
 

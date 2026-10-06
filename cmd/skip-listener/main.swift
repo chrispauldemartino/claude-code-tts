@@ -45,6 +45,7 @@ let lastSpeedFile = "/tmp/claude-tts-last-speed"
 let lastVolumeFile = "/tmp/claude-tts-last-volume"
 let lastSourceFile = "/tmp/claude-tts-last-source"
 let lastSessionFile = "/tmp/claude-tts-last-session"
+let lastSessionNameFile = "/tmp/claude-tts-last-session-name"
 let playbackCursorFile = "/tmp/claude-tts-playback-cursor"
 let currentPlaybackItemFile = "/tmp/claude-tts-current-item-id"
 let focusedSessionFile = "/tmp/claude-tts-focused-session-id"
@@ -162,6 +163,13 @@ let state = ControlState()
 let stopGenerationStore = StopGenerationStore(
     stateURL: URL(fileURLWithPath: stopGenerationFile)
 )
+
+struct SessionPlaybackKey: Equatable {
+    let sourceLabel: String
+    let sessionID: String
+}
+
+var lastAudiblyPlayedSessionKey: SessionPlaybackKey?
 
 final class OwnedProcessRegistry {
     private let lock = NSLock()
@@ -670,8 +678,35 @@ typealias PlaybackContext = (
     volume: String,
     sourceLabel: String?,
     sessionID: String?,
+    sessionName: String?,
     itemID: String?
 )
+
+struct QueueItemMetadata: Codable {
+    var schemaVersion: Int?
+    var origin: String?
+    var autoplay: Bool?
+    var batchID: String?
+    var batchIndex: Int?
+    var turnID: String?
+    var answeredAt: TimeInterval?
+    var importedAt: TimeInterval?
+    var contentHash: String?
+    var normalizationVersion: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case origin
+        case autoplay
+        case batchID = "batch_id"
+        case batchIndex = "batch_index"
+        case turnID = "turn_id"
+        case answeredAt = "answered_at"
+        case importedAt = "imported_at"
+        case contentHash = "content_hash"
+        case normalizationVersion = "normalization_version"
+    }
+}
 
 struct PlaybackSentence: Codable {
     var index: Int
@@ -684,6 +719,7 @@ struct PlaybackLogItem: Codable {
     var timestamp: TimeInterval
     var sourceLabel: String?
     var sessionID: String?
+    var sessionName: String?
     var requestedEngine: String
     var engine: String
     var fallbackReason: String?
@@ -696,6 +732,16 @@ struct PlaybackLogItem: Codable {
     var sentenceMapPath: String
     var playbackState: String?
     var skippedAt: TimeInterval?
+    var schemaVersion: Int?
+    var origin: String?
+    var autoplay: Bool?
+    var batchID: String?
+    var batchIndex: Int?
+    var turnID: String?
+    var answeredAt: TimeInterval?
+    var importedAt: TimeInterval?
+    var contentHash: String?
+    var normalizationVersion: Int?
 
     var preview: String {
         let base = String((try? String(contentsOfFile: normalizedTextPath, encoding: .utf8))?.prefix(60) ?? "")
@@ -925,14 +971,21 @@ func rewritePlaybackTexts(rawText: String, normalizedText: String, item: Playbac
     writeString(normalizedText, to: item.normalizedTextPath)
 }
 
+func readQueueItemMetadata(at path: String) -> QueueItemMetadata? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+    return try? JSONDecoder().decode(QueueItemMetadata.self, from: data)
+}
+
 func upsertPlaybackLogItem(
     blockID: String?,
     rawText: String,
     normalizedText: String,
     sourceLabel: String?,
     sessionID: String?,
+    sessionName: String?,
     speed: String,
     volume: String,
+    metadata: QueueItemMetadata? = nil,
     timestamp: TimeInterval? = nil,
     playbackState: String? = nil,
     skippedAt: TimeInterval? = nil,
@@ -973,12 +1026,25 @@ func upsertPlaybackLogItem(
         item.timestamp = timestamp ?? Date().timeIntervalSince1970
         item.speed = speed
         item.volume = volume
+        item.sessionName = sessionName ?? item.sessionName
         item.requestedEngine = requestedEngine
         if let playbackState {
             item.playbackState = playbackState
         }
         if let skippedAt {
             item.skippedAt = skippedAt
+        }
+        if let metadata {
+            item.schemaVersion = metadata.schemaVersion
+            item.origin = metadata.origin
+            item.autoplay = metadata.autoplay
+            item.batchID = metadata.batchID
+            item.batchIndex = metadata.batchIndex
+            item.turnID = metadata.turnID
+            item.answeredAt = metadata.answeredAt
+            item.importedAt = metadata.importedAt
+            item.contentHash = metadata.contentHash
+            item.normalizationVersion = metadata.normalizationVersion
         }
         rewritePlaybackTexts(rawText: rawText, normalizedText: normalizedText, item: item)
         saveSentenceMap(updatedSentences, for: item)
@@ -1001,6 +1067,7 @@ func upsertPlaybackLogItem(
         timestamp: timestamp ?? Date().timeIntervalSince1970,
         sourceLabel: sourceLabel,
         sessionID: sessionID,
+        sessionName: sessionName,
         requestedEngine: requestedEngine,
         engine: requestedEngine,
         fallbackReason: nil,
@@ -1012,7 +1079,17 @@ func upsertPlaybackLogItem(
         normalizedTextPath: "\(itemDir)/normalized.txt",
         sentenceMapPath: "\(itemDir)/sentence-map.json",
         playbackState: playbackState,
-        skippedAt: skippedAt
+        skippedAt: skippedAt,
+        schemaVersion: metadata?.schemaVersion,
+        origin: metadata?.origin,
+        autoplay: metadata?.autoplay,
+        batchID: metadata?.batchID,
+        batchIndex: metadata?.batchIndex,
+        turnID: metadata?.turnID,
+        answeredAt: metadata?.answeredAt,
+        importedAt: metadata?.importedAt,
+        contentHash: metadata?.contentHash,
+        normalizationVersion: metadata?.normalizationVersion
     )
     rewritePlaybackTexts(rawText: rawText, normalizedText: normalizedText, item: item)
     let sentenceMap = normalizedSentences.enumerated().map { offset, sentenceText in
@@ -1049,6 +1126,9 @@ func archiveQueueEntryToPlaybackLog(_ entryURL: URL) -> String? {
     let sessionID = normalizeSessionID(
         try? String(contentsOf: entryURL.appendingPathComponent("session"), encoding: .utf8)
     )
+    let sessionName = normalizeSessionID(
+        try? String(contentsOf: entryURL.appendingPathComponent("session_name"), encoding: .utf8)
+    )
     let blockID = normalizeSessionID(
         try? String(contentsOf: entryURL.appendingPathComponent("block"), encoding: .utf8)
     )
@@ -1057,6 +1137,7 @@ func archiveQueueEntryToPlaybackLog(_ entryURL: URL) -> String? {
         contentsOf: entryURL.appendingPathComponent("normalized"),
         encoding: .utf8
     )) ?? text
+    let metadata = readQueueItemMetadata(at: entryURL.appendingPathComponent("meta.json").path)
     let modified = (try? entryURL.resourceValues(forKeys: [.contentModificationDateKey]))?
         .contentModificationDate?.timeIntervalSince1970 ?? Date().timeIntervalSince1970
 
@@ -1066,8 +1147,10 @@ func archiveQueueEntryToPlaybackLog(_ entryURL: URL) -> String? {
         normalizedText: normalizedText,
         sourceLabel: sourceLabel,
         sessionID: sessionID,
+        sessionName: sessionName,
         speed: speed,
         volume: volume,
+        metadata: metadata,
         timestamp: modified,
         playbackState: "skipped",
         skippedAt: Date().timeIntervalSince1970,
@@ -1205,21 +1288,6 @@ func playbackPreview(_ context: PlaybackContext) -> String {
     return previewBase
 }
 
-func sentenceStartsWithSource(_ sentence: String, source: String) -> Bool {
-    let normalizedSentence = sentence
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-    let normalizedSource = source
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-
-    guard !normalizedSource.isEmpty else { return false }
-    return normalizedSentence == normalizedSource ||
-        normalizedSentence.hasPrefix("\(normalizedSource) ") ||
-        normalizedSentence.hasPrefix("\(normalizedSource).") ||
-        normalizedSentence.hasPrefix("\(normalizedSource):")
-}
-
 func killTTSProcesses() {
     for name in ["say", "afplay"] {
         let proc = Process()
@@ -1233,7 +1301,8 @@ func killTTSProcesses() {
 func runProcessWithTimeout(
     _ process: Process,
     timeout: TimeInterval,
-    expectedGeneration: StopGenerationSnapshot? = nil
+    expectedGeneration: StopGenerationSnapshot? = nil,
+    onStarted: (() -> Void)? = nil
 ) -> Bool {
     let semaphore = DispatchSemaphore(value: 0)
     process.terminationHandler = { _ in
@@ -1246,11 +1315,11 @@ func runProcessWithTimeout(
     do {
         if let expectedGeneration {
             let launched = try stopGenerationStore.performIfCurrent(expectedGeneration) {
-                try process.run()
+                try launchProcess(process, onStarted: onStarted)
             }
             guard launched else { return false }
         } else {
-            try process.run()
+            try launchProcess(process, onStarted: onStarted)
         }
     } catch {
         debugPrint("PROCESS — failed to launch: \(error)")
@@ -1387,7 +1456,8 @@ func synthesizeSpeechAudio(
 func playAudioFile(
     _ path: String,
     volume: String,
-    expectedGeneration: StopGenerationSnapshot
+    expectedGeneration: StopGenerationSnapshot,
+    onStarted: (() -> Void)? = nil
 ) -> Bool {
     let playProc = Process()
     playProc.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
@@ -1395,7 +1465,8 @@ func playAudioFile(
     return runProcessWithTimeout(
         playProc,
         timeout: 20,
-        expectedGeneration: expectedGeneration
+        expectedGeneration: expectedGeneration,
+        onStarted: onStarted
     )
 }
 
@@ -1660,6 +1731,7 @@ func readHistoryMessage(at index: Int) -> PlaybackContext? {
         .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
     let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(histDir)/msg-\(padded).source", encoding: .utf8))
     let sessionID = normalizeSessionID(try? String(contentsOfFile: "\(histDir)/msg-\(padded).session", encoding: .utf8))
+    let sessionName = normalizeSessionID(try? String(contentsOfFile: "\(histDir)/msg-\(padded).session_name", encoding: .utf8))
 
     return (
         text: text,
@@ -1667,6 +1739,7 @@ func readHistoryMessage(at index: Int) -> PlaybackContext? {
         volume: volume,
         sourceLabel: sourceLabel,
         sessionID: sessionID,
+        sessionName: sessionName,
         itemID: nil
     )
 }
@@ -1797,6 +1870,7 @@ func playbackContext(from item: PlaybackLogItem) -> PlaybackContext? {
         volume: item.volume,
         sourceLabel: item.sourceLabel,
         sessionID: item.sessionID,
+        sessionName: item.sessionName,
         itemID: item.id
     )
 }
@@ -1816,6 +1890,12 @@ func persistPlaybackContext(_ context: PlaybackContext) {
         try? session.write(toFile: lastSessionFile, atomically: true, encoding: .utf8)
     } else {
         try? FileManager.default.removeItem(atPath: lastSessionFile)
+    }
+
+    if let sessionName = context.sessionName {
+        try? sessionName.write(toFile: lastSessionNameFile, atomically: true, encoding: .utf8)
+    } else {
+        try? FileManager.default.removeItem(atPath: lastSessionNameFile)
     }
 
     writeCurrentPlaybackItemID(context.itemID)
@@ -1843,6 +1923,7 @@ func loadReplayContext() -> PlaybackContext? {
         .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
     let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: lastSourceFile, encoding: .utf8))
     let sessionID = normalizeSessionID(try? String(contentsOfFile: lastSessionFile, encoding: .utf8))
+    let sessionName = normalizeSessionID(try? String(contentsOfFile: lastSessionNameFile, encoding: .utf8))
 
     return (
         text: text,
@@ -1850,8 +1931,96 @@ func loadReplayContext() -> PlaybackContext? {
         volume: volume,
         sourceLabel: sourceLabel,
         sessionID: sessionID,
+        sessionName: sessionName,
         itemID: nil
     )
+}
+
+func currentCueMode() -> String {
+    let raw = readConfigValue("cue").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    if raw == "on" {
+        writeConfigValue("cue", value: "session")
+        return "session"
+    }
+    switch raw {
+    case "source", "both", "off":
+        return raw
+    case "session", "":
+        return "session"
+    default:
+        return "session"
+    }
+}
+
+func currentCueFrequency() -> String {
+    readConfigValue("cue_frequency").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "always"
+        ? "always"
+        : "change"
+}
+
+func playbackSessionKey(sourceLabel: String?, sessionID: String?) -> SessionPlaybackKey? {
+    guard let source = normalizeSourceLabel(sourceLabel),
+          let session = normalizeSessionID(sessionID) else { return nil }
+    return SessionPlaybackKey(sourceLabel: source, sessionID: session)
+}
+
+func noteAudiblePlayback(sourceLabel: String?, sessionID: String?) {
+    if let key = playbackSessionKey(sourceLabel: sourceLabel, sessionID: sessionID) {
+        lastAudiblyPlayedSessionKey = key
+    }
+}
+
+func playSessionAnnouncementIfNeeded(
+    sourceLabel: String?,
+    sessionID: String?,
+    sessionName: String?,
+    speed: String,
+    volume: String,
+    expectedGeneration: StopGenerationSnapshot
+) -> Bool {
+    guard stopGenerationStore.isCurrent(expectedGeneration) else { return false }
+    let mode = currentCueMode()
+    guard mode != "off",
+          let key = playbackSessionKey(sourceLabel: sourceLabel, sessionID: sessionID) else { return true }
+    if currentCueFrequency() == "change" && key == lastAudiblyPlayedSessionKey {
+        return true
+    }
+
+    let normalizedName = normalizeSessionID(sessionName)
+    let normalizedSource = normalizeSourceLabel(sourceLabel)
+    let announcement: String?
+    switch mode {
+    case "source":
+        announcement = normalizedSource
+    case "both":
+        announcement = [normalizedName, normalizedSource].compactMap { $0 }.joined(separator: ". ")
+    default:
+        announcement = normalizedName
+    }
+    guard let announcement, !announcement.isEmpty else { return true }
+
+    let outputBase = "/tmp/claude-tts-session-cue-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)"
+    let synthesis = synthesizeSpeechAudio(
+        announcement,
+        speed: speed,
+        requestedEngine: currentRequestedEngine(),
+        openAIVoice: currentOpenAIVoice(),
+        outputBasePath: outputBase,
+        expectedGeneration: expectedGeneration
+    )
+    guard synthesis.success, let outputFile = synthesis.outputFile else {
+        return stopGenerationStore.isCurrent(expectedGeneration)
+    }
+    defer { try? FileManager.default.removeItem(atPath: outputFile) }
+    guard stopGenerationStore.isCurrent(expectedGeneration),
+          !FileManager.default.fileExists(atPath: skipFlag),
+          waitWhilePaused(expectedGeneration: expectedGeneration) else { return false }
+    let played = playAudioFile(outputFile, volume: volume, expectedGeneration: expectedGeneration)
+    guard played, stopGenerationStore.isCurrent(expectedGeneration) else {
+        return stopGenerationStore.isCurrent(expectedGeneration)
+    }
+    debugPrint("SESSION CUE — announced \(announcement)")
+    return true
 }
 
 func playContext(
@@ -1894,6 +2063,18 @@ func playContext(
             writeActiveSegment(preview: playbackPreview(context), status: status)
         }
         guard prepared else {
+            releaseTTSLock(ownerToken: lockOwner)
+            return
+        }
+
+        guard playSessionAnnouncementIfNeeded(
+            sourceLabel: context.sourceLabel,
+            sessionID: context.sessionID,
+            sessionName: context.sessionName,
+            speed: context.speed,
+            volume: context.volume,
+            expectedGeneration: playbackGeneration
+        ) else {
             releaseTTSLock(ownerToken: lockOwner)
             return
         }
@@ -2018,13 +2199,9 @@ func speakText(
 
     let normalizedSource = normalizeSourceLabel(sourceLabel)
     let normalizedSession = normalizeSessionID(sessionID)
-    let lastSpokenSource = normalizeSourceLabel(try? String(contentsOfFile: lastSourceFile, encoding: .utf8))
-    let lastSpokenSession = normalizeSessionID(try? String(contentsOfFile: lastSessionFile, encoding: .utf8))
-    let shouldAnnounceSource =
-        normalizedSource != nil &&
-        (normalizedSource != lastSpokenSource || normalizedSession != nil && normalizedSession != lastSpokenSession)
 
     var idx = min(max(startIndex, 0), max(sentences.count - 1, 0))
+    var startedAudiblePlayback = false
     while idx < sentences.count {
         guard stopGenerationStore.isCurrent(playbackGeneration) else { break }
         if FileManager.default.fileExists(atPath: skipFlag) { break }
@@ -2058,11 +2235,7 @@ func speakText(
 
         if let source = normalizedSource {
             subtitleText = "[\(source)] \(sentence)"
-            if idx == 0 && shouldAnnounceSource && !sentenceStartsWithSource(sentence, source: source) {
-                spokenText = "\(source). \(sentence)"
-            } else {
-                spokenText = sentence
-            }
+            spokenText = sentence
         } else {
             subtitleText = sentence
             spokenText = sentence
@@ -2147,7 +2320,13 @@ func speakText(
         let played = playAudioFile(
             outputFile,
             volume: volume,
-            expectedGeneration: playbackGeneration
+            expectedGeneration: playbackGeneration,
+            onStarted: {
+                if !startedAudiblePlayback {
+                    noteAudiblePlayback(sourceLabel: normalizedSource, sessionID: normalizedSession)
+                    startedAudiblePlayback = true
+                }
+            }
         )
 
         if shouldRemoveAfterPlayback {
@@ -2733,6 +2912,7 @@ func triggerMessageNav(direction: String) {
             volume: "1.0",
             sourceLabel: nil,
             sessionID: nil,
+            sessionName: nil,
             itemID: nil
         )
         debugPrint("MESSAGE NAV — playing transcript \(current + 1)/\(total)")
@@ -2838,11 +3018,13 @@ func processQueue() {
                 .trimmingCharacters(in: .whitespacesAndNewlines)) ?? "1.0"
             let sourceLabel = normalizeSourceLabel(try? String(contentsOfFile: "\(entryPath)/source", encoding: .utf8))
             let sessionID = normalizeSessionID(try? String(contentsOfFile: "\(entryPath)/session", encoding: .utf8))
+            let sessionName = normalizeSessionID(try? String(contentsOfFile: "\(entryPath)/session_name", encoding: .utf8))
             let blockID = normalizeSessionID(try? String(contentsOfFile: "\(entryPath)/block", encoding: .utf8))
             let rawText = (try? String(contentsOfFile: "\(entryPath)/raw", encoding: .utf8))
                 ?? text
             let normalizedText = (try? String(contentsOfFile: "\(entryPath)/normalized", encoding: .utf8))
                 ?? text
+            let metadata = readQueueItemMetadata(at: "\(entryPath)/meta.json")
             let effectiveSpeed = currentSpeechSpeed(fallback: speed)
             if !sourceMatchesTarget(sourceLabel, target: target) {
                 if targetDropNonmatchingEnabled() {
@@ -2869,8 +3051,10 @@ func processQueue() {
                     normalizedText: normalizedText,
                     sourceLabel: sourceLabel,
                     sessionID: sessionID,
+                    sessionName: sessionName,
                     speed: effectiveSpeed,
-                    volume: volume
+                    volume: volume,
+                    metadata: metadata
                 )
                 writeCurrentPlaybackItemID(result.item.id)
                 writeString(result.item.id, to: "\(entryPath)/playback-item-id")
@@ -2881,6 +3065,14 @@ func processQueue() {
             let liveText = (logResult.newSentenceText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? logResult.newSentenceText!
                 : text
+            guard playSessionAnnouncementIfNeeded(
+                sourceLabel: sourceLabel,
+                sessionID: sessionID,
+                sessionName: sessionName,
+                speed: effectiveSpeed,
+                volume: volume,
+                expectedGeneration: queueGeneration
+            ) else { break }
             speakText(
                 liveText,
                 speed: effectiveSpeed,
