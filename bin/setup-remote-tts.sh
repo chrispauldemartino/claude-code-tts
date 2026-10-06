@@ -29,6 +29,12 @@ mkdir -p "$PLUGIN_ROOT/cmd/skip-listener"
 echo "Copying skip-listener source and helpers from $HOST..."
 scp "$HOST:~/.claude/plugins/claude-code-tts/cmd/skip-listener/main.swift" \
     "$PLUGIN_ROOT/cmd/skip-listener/main.swift"
+scp "$HOST:~/.claude/plugins/claude-code-tts/cmd/skip-listener/StopGeneration.swift" \
+    "$PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift"
+scp "$HOST:~/.claude/plugins/claude-code-tts/cmd/skip-listener/StopAllArchive.swift" \
+    "$PLUGIN_ROOT/cmd/skip-listener/StopAllArchive.swift"
+scp "$HOST:~/.claude/plugins/claude-code-tts/bin/stopall-drain.sh" \
+    "$PLUGIN_ROOT/bin/stopall-drain.sh"
 scp "$HOST:~/.claude/plugins/claude-code-tts/bin/build-skip-listener-app.sh" \
     "$PLUGIN_ROOT/bin/build-skip-listener-app.sh"
 scp "$HOST:~/.claude/plugins/claude-code-tts/bin/install-skip-listener-launchagent.sh" \
@@ -37,11 +43,15 @@ scp "$HOST:~/.claude/plugins/claude-code-tts/bin/restart-skip-listener-launchage
     "$PLUGIN_ROOT/bin/restart-skip-listener-launchagent.sh"
 scp "$HOST:~/.claude/plugins/claude-code-tts/bin/tts-bridge.sh" \
     "$INSTALL_DIR/bin/tts-bridge.sh"
+scp "$HOST:~/.claude/plugins/claude-code-tts/bin/stopall-bridge-publish-mode.sh" \
+    "$INSTALL_DIR/bin/stopall-bridge-publish-mode.sh"
 chmod +x \
     "$PLUGIN_ROOT/bin/build-skip-listener-app.sh" \
     "$PLUGIN_ROOT/bin/install-skip-listener-launchagent.sh" \
     "$PLUGIN_ROOT/bin/restart-skip-listener-launchagent.sh" \
-    "$INSTALL_DIR/bin/tts-bridge.sh"
+    "$PLUGIN_ROOT/bin/stopall-drain.sh" \
+    "$INSTALL_DIR/bin/tts-bridge.sh" \
+    "$INSTALL_DIR/bin/stopall-bridge-publish-mode.sh"
 
 echo "Building SkipListener.app..."
 "$PLUGIN_ROOT/bin/build-skip-listener-app.sh"

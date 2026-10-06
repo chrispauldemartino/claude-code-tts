@@ -35,7 +35,14 @@ cat > "$PLIST" <<PLIST
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>StandardOutPath</key>
     <string>/tmp/elle-skip-listener.log</string>
     <key>StandardErrorPath</key>

@@ -6,9 +6,28 @@
 HOST="${1:-mac-mini-ts}"
 REMOTE_DIR="/tmp/claude-tts-remote"
 LOCAL_QUEUE="/tmp/claude-tts-queue"
+BRIDGE_STAGING="/tmp/claude-tts-bridge-staging"
 STOP_FLAG="/tmp/claude-tts-bridge-stop"
+STOP_GENERATION_FILE="/tmp/claude-tts-stop-generation"
+STOP_GENERATION_FAILURE_FILE="${STOP_GENERATION_FILE}.failed"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PUBLISH_MODE="$SCRIPT_DIR/stopall-bridge-publish-mode.sh"
+# shellcheck source=stopall-lock.sh
+source "$SCRIPT_DIR/stopall-lock.sh"
+
+read_stop_generation() {
+    local generation
+    if [ -f "$STOP_GENERATION_FAILURE_FILE" ]; then
+        printf '%s\n' "failed"
+        return 0
+    fi
+    generation=$(awk -F= '$1 == "generation" { print $2; exit }' \
+        "$STOP_GENERATION_FILE" 2>/dev/null || true)
+    printf '%s\n' "${generation:-0}"
+}
 
 mkdir -p "$LOCAL_QUEUE"
+mkdir -p "$BRIDGE_STAGING"
 rm -f "$STOP_FLAG"
 
 while [ ! -f "$STOP_FLAG" ]; do
@@ -18,6 +37,7 @@ while [ ! -f "$STOP_FLAG" ]; do
         for txt_file in $entries; do
             base="${txt_file%.txt}"
             entry_name=$(basename "$base")
+            fetch_generation=$(read_stop_generation)
 
             text=$(ssh -o BatchMode=yes "$HOST" "cat '$txt_file' 2>/dev/null")
             speed=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.speed' 2>/dev/null")
@@ -27,6 +47,9 @@ while [ ! -f "$STOP_FLAG" ]; do
             block=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.block' 2>/dev/null")
             raw=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.raw' 2>/dev/null")
             normalized=$(ssh -o BatchMode=yes "$HOST" "cat '${base}.normalized' 2>/dev/null")
+            # Keep the established at-most-once remote deletion ordering. A host
+            # failure after this delete can still lose the bundle before local
+            # publish; a concurrent stop marks the completed import archive-only.
             ssh -o BatchMode=yes "$HOST" "rm -f '$txt_file' '${base}.speed' '${base}.volume' '${base}.source' '${base}.session' '${base}.block' '${base}.raw' '${base}.normalized'" 2>/dev/null
 
             [ -z "$speed" ] && speed="300"
@@ -34,7 +57,9 @@ while [ ! -f "$STOP_FLAG" ]; do
             [ -z "$text" ] && continue
 
             local_entry="$LOCAL_QUEUE/entry-${entry_name}"
-            staging_entry="$LOCAL_QUEUE/.entry-${entry_name}.tmp"
+            # Stage outside LOCAL_QUEUE so Stop-all cannot discard a fully
+            # captured bundle after the remote at-most-once deletion.
+            staging_entry="$BRIDGE_STAGING/.entry-${entry_name}.tmp"
             rm -rf "$staging_entry" "$local_entry"
             mkdir -p "$staging_entry"
             echo "$text" > "$staging_entry/text"
@@ -45,29 +70,38 @@ while [ ! -f "$STOP_FLAG" ]; do
             [ -n "$block" ] && echo "$block" > "$staging_entry/block"
             [ -n "$raw" ] && printf '%s' "$raw" > "$staging_entry/raw"
             [ -n "$normalized" ] && printf '%s' "$normalized" > "$staging_entry/normalized"
+            acquire_stop_transaction_lock
+            publish_generation=$(read_stop_generation)
+            publish_mode=$(bash "$PUBLISH_MODE" "$fetch_generation" "$publish_generation" 2>/dev/null || true)
+            if [ "$publish_mode" != "play" ]; then
+                : > "$staging_entry/archive-only"
+            fi
             mv "$staging_entry" "$local_entry"
 
-            # Save for repeat — skip-listener reads these for cmd+shift repeat
-            echo "$text" > /tmp/claude-tts-last-text
-            echo "$speed" > /tmp/claude-tts-last-speed
-            echo "$volume" > /tmp/claude-tts-last-volume
+            if [ "$publish_mode" = "play" ]; then
+                # Save for repeat — skip-listener reads these for cmd+shift repeat
+                echo "$text" > /tmp/claude-tts-last-text
+                echo "$speed" > /tmp/claude-tts-last-speed
+                echo "$volume" > /tmp/claude-tts-last-volume
 
-            # Save to session history for message nav (opt+shift+arrow)
-            HISTORY_DIR="/tmp/claude-tts-history-$$"
-            mkdir -p "$HISTORY_DIR"
-            total=0
-            [ -f "$HISTORY_DIR/total" ] && total=$(cat "$HISTORY_DIR/total")
-            next=$((total + 1))
-            padded=$(printf "%03d" "$next")
-            echo "$text" > "$HISTORY_DIR/msg-${padded}.txt"
-            echo "$speed" > "$HISTORY_DIR/msg-${padded}.speed"
-            echo "$volume" > "$HISTORY_DIR/msg-${padded}.volume"
-            echo "$source" > "$HISTORY_DIR/msg-${padded}.source"
-            [ -n "$session" ] && echo "$session" > "$HISTORY_DIR/msg-${padded}.session"
-            echo "$next" > "$HISTORY_DIR/total"
-            echo "$next" > "$HISTORY_DIR/current"
-            echo "$next" > /tmp/claude-tts-repeat-anchor
-            echo "$HISTORY_DIR" > /tmp/claude-tts-history-dir
+                # Save to session history for message nav (opt+shift+arrow)
+                HISTORY_DIR="/tmp/claude-tts-history-$$"
+                mkdir -p "$HISTORY_DIR"
+                total=0
+                [ -f "$HISTORY_DIR/total" ] && total=$(cat "$HISTORY_DIR/total")
+                next=$((total + 1))
+                padded=$(printf "%03d" "$next")
+                echo "$text" > "$HISTORY_DIR/msg-${padded}.txt"
+                echo "$speed" > "$HISTORY_DIR/msg-${padded}.speed"
+                echo "$volume" > "$HISTORY_DIR/msg-${padded}.volume"
+                echo "$source" > "$HISTORY_DIR/msg-${padded}.source"
+                [ -n "$session" ] && echo "$session" > "$HISTORY_DIR/msg-${padded}.session"
+                echo "$next" > "$HISTORY_DIR/total"
+                echo "$next" > "$HISTORY_DIR/current"
+                echo "$next" > /tmp/claude-tts-repeat-anchor
+                echo "$HISTORY_DIR" > /tmp/claude-tts-history-dir
+            fi
+            release_stop_transaction_lock
         done
     fi
 

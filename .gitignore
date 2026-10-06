@@ -3,6 +3,9 @@ bin/
 !bin/
 bin/*
 !bin/build-voice-input.sh
+!bin/stopall-drain.sh
+!bin/stopall-bridge-publish-mode.sh
+!bin/stopall-lock.sh
 dist/
 *.exe
 *.dll

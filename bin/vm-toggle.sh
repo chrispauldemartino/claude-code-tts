@@ -29,14 +29,19 @@ MBP_SKIP_LISTENER_BUILD="$MBP_PLUGIN_ROOT/bin/build-skip-listener-app.sh"
 MBP_SKIP_LISTENER_INSTALL="$MBP_PLUGIN_ROOT/bin/install-skip-listener-launchagent.sh"
 MBP_SKIP_LISTENER_RESTART="$MBP_PLUGIN_ROOT/bin/restart-skip-listener-launchagent.sh"
 MBP_TTS_BRIDGE="/Users/christopherdemartino/.claude-tts/bin/tts-bridge.sh"
+MBP_STOPALL_PUBLISH_MODE="/Users/christopherdemartino/.claude-tts/bin/stopall-bridge-publish-mode.sh"
 SSH_OPTS=(-o ConnectTimeout=5 -o BatchMode=yes)
 
 LOCAL_SKIP_LISTENER_SRC="$PLUGIN_DIR/cmd/skip-listener/main.swift"
+LOCAL_STOP_GENERATION_SRC="$PLUGIN_DIR/cmd/skip-listener/StopGeneration.swift"
+LOCAL_STOP_ARCHIVE_SRC="$PLUGIN_DIR/cmd/skip-listener/StopAllArchive.swift"
 LOCAL_SPEAK_TEXT_SRC="$PLUGIN_DIR/cmd/speak-text/main.go"
+LOCAL_STOPALL_DRAIN="$PLUGIN_BIN/stopall-drain.sh"
 LOCAL_SKIP_LISTENER_BUILD="$PLUGIN_BIN/build-skip-listener-app.sh"
 LOCAL_SKIP_LISTENER_INSTALL="$PLUGIN_BIN/install-skip-listener-launchagent.sh"
 LOCAL_SKIP_LISTENER_RESTART="$PLUGIN_BIN/restart-skip-listener-launchagent.sh"
 LOCAL_TTS_BRIDGE="$PLUGIN_BIN/tts-bridge.sh"
+LOCAL_STOPALL_PUBLISH_MODE="$PLUGIN_BIN/stopall-bridge-publish-mode.sh"
 
 DEFAULTS="voice=on
 mic=on
@@ -241,11 +246,15 @@ wait_for_remote_gui_rebuild() {
 rebuild_remote_skip_listener() {
     local required_files=(
         "$LOCAL_SKIP_LISTENER_SRC"
+        "$LOCAL_STOP_GENERATION_SRC"
+        "$LOCAL_STOP_ARCHIVE_SRC"
         "$LOCAL_SPEAK_TEXT_SRC"
+        "$LOCAL_STOPALL_DRAIN"
         "$LOCAL_SKIP_LISTENER_BUILD"
         "$LOCAL_SKIP_LISTENER_INSTALL"
         "$LOCAL_SKIP_LISTENER_RESTART"
         "$LOCAL_TTS_BRIDGE"
+        "$LOCAL_STOPALL_PUBLISH_MODE"
     )
     local file
     local signer
@@ -261,17 +270,21 @@ rebuild_remote_skip_listener() {
     ssh_mbp "mkdir -p '$MBP_PLUGIN_ROOT/bin' '$MBP_PLUGIN_ROOT/cmd/skip-listener' '$MBP_PLUGIN_ROOT/cmd/speak-text'" || return 1
 
     scp_mbp "$LOCAL_SKIP_LISTENER_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/main.swift" || return 1
+    scp_mbp "$LOCAL_STOP_GENERATION_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift" || return 1
+    scp_mbp "$LOCAL_STOP_ARCHIVE_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/skip-listener/StopAllArchive.swift" || return 1
     scp_mbp "$LOCAL_SPEAK_TEXT_SRC" "$MBP_HOST:$MBP_PLUGIN_ROOT/cmd/speak-text/main.go" || return 1
+    scp_mbp "$LOCAL_STOPALL_DRAIN" "$MBP_HOST:$MBP_PLUGIN_ROOT/bin/stopall-drain.sh" || return 1
     scp_mbp "$LOCAL_SKIP_LISTENER_BUILD" "$MBP_HOST:$MBP_SKIP_LISTENER_BUILD" || return 1
     scp_mbp "$LOCAL_SKIP_LISTENER_INSTALL" "$MBP_HOST:$MBP_SKIP_LISTENER_INSTALL" || return 1
     scp_mbp "$LOCAL_SKIP_LISTENER_RESTART" "$MBP_HOST:$MBP_SKIP_LISTENER_RESTART" || return 1
     scp_mbp "$LOCAL_TTS_BRIDGE" "$MBP_HOST:$MBP_TTS_BRIDGE" || return 1
+    scp_mbp "$LOCAL_STOPALL_PUBLISH_MODE" "$MBP_HOST:$MBP_STOPALL_PUBLISH_MODE" || return 1
 
     kill_remote_tts_bridge || return 1
     signer="$(remote_skip_listener_identity)"
 
     if ssh_mbp "
-        chmod +x '$MBP_SKIP_LISTENER_BUILD' '$MBP_SKIP_LISTENER_INSTALL' '$MBP_SKIP_LISTENER_RESTART' '$MBP_TTS_BRIDGE' && \
+        chmod +x '$MBP_SKIP_LISTENER_BUILD' '$MBP_SKIP_LISTENER_INSTALL' '$MBP_SKIP_LISTENER_RESTART' '$MBP_TTS_BRIDGE' '$MBP_STOPALL_PUBLISH_MODE' '$MBP_PLUGIN_ROOT/bin/stopall-drain.sh' && \
         cd '$MBP_PLUGIN_ROOT' && go build -o '$MBP_PLUGIN_ROOT/bin/speak-text' ./cmd/speak-text && \
         chmod +x '$MBP_PLUGIN_ROOT/bin/speak-text' && \
         '$MBP_SKIP_LISTENER_BUILD' && \
@@ -712,61 +725,12 @@ remote_skip() {
 
 remote_stop_all() {
     ssh_mbp "
-        : > /tmp/claude-tts-skip
-        rm -f /tmp/claude-tts-pause /tmp/claude-tts-playing /tmp/claude-voice-listening
-        rm -f /tmp/claude-tts-active-segment /tmp/claude-voice-input-stop
-        rm -f /tmp/claude-tts-reading-file
-        rm -rf /tmp/claude-tts-speaking.lock
-        rm -f /tmp/claude-tts-nav-index
-
-        hist_dir=\$(cat /tmp/claude-tts-history-dir 2>/dev/null || true)
-        if [ -n \"\$hist_dir\" ] && [ -f \"\$hist_dir/total\" ]; then
-            cat \"\$hist_dir/total\" > /tmp/claude-tts-repeat-anchor
-        fi
-
-        python3 - <<'PY'
-import json
-import os
-
-manifest = '/tmp/claude-tts-playback-log/manifest.jsonl'
-focus_file = '/tmp/claude-tts-focused-session-id'
-current_file = '/tmp/claude-tts-current-item-id'
-
-def read_text(path):
-    try:
-        return open(path, 'r', encoding='utf-8').read().strip()
-    except FileNotFoundError:
-        return ''
-
-items = []
-if os.path.exists(manifest):
-    with open(manifest, 'r', encoding='utf-8') as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                items.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-
-focus_session = read_text(focus_file)
-if focus_session:
-    filtered = [item for item in items if (item.get('sessionID') or '').strip() == focus_session]
-else:
-    filtered = items
-latest = filtered[-1] if filtered else None
-if latest:
-    with open(current_file, 'w', encoding='utf-8') as fh:
-        fh.write(latest.get('id', ''))
-PY
-
-        pkill -f read-file.sh 2>/dev/null || true
-        pkill say 2>/dev/null || true
-        pkill afplay 2>/dev/null || true
-        pkill -f voice-input 2>/dev/null || true
-        pkill -f whisper-stream 2>/dev/null || true
+        : > /tmp/claude-tts-stop-all-request
     "
+}
+
+remote_clear_autoplay_hold() {
+    ssh_mbp ": > /tmp/claude-tts-autoplay-resume"
 }
 
 remote_pause() {
@@ -1101,6 +1065,7 @@ case "${1:-status}" in
             *) echo "Usage: /vm on [claude|codex]"; exit 1 ;;
         esac
         start_daemon
+        remote_clear_autoplay_hold || exit 1
         echo "Voice mode ON — global speech + dictation enabled ($scope_label)"
         ;;
     off)
@@ -1124,6 +1089,7 @@ case "${1:-status}" in
             *) echo "Usage: /vm listen [claude|codex]"; exit 1 ;;
         esac
         start_daemon
+        remote_clear_autoplay_hold || exit 1
         echo "Listen mode — TTS on, you type ($scope_label)"
         ;;
     test)
@@ -1284,6 +1250,7 @@ case "${1:-status}" in
                 append_foreground_allowlist "$focus_session"
 
                 set_local_focus "$focus_session" "$focus_source"
+                remote_clear_autoplay_hold || exit 1
                 focus_result="$(remote_focus_session "$focus_session" "$focus_source")" || exit 1
                 match_count="$(parse_focus_field "$focus_result" "match_count")"
                 log_match_count="$(parse_focus_field "$focus_result" "log_match_count")"

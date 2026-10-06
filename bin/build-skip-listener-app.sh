@@ -3,6 +3,8 @@ set -euo pipefail
 
 PLUGIN_ROOT="${PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 SRC="$PLUGIN_ROOT/cmd/skip-listener/main.swift"
+STOP_GENERATION_SRC="$PLUGIN_ROOT/cmd/skip-listener/StopGeneration.swift"
+STOP_ARCHIVE_SRC="$PLUGIN_ROOT/cmd/skip-listener/StopAllArchive.swift"
 APP="$PLUGIN_ROOT/bin/SkipListener.app"
 EXE="$APP/Contents/MacOS/skip-listener"
 PLIST="$APP/Contents/Info.plist"
@@ -19,8 +21,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ ! -f "$SRC" ]; then
-    echo "Missing source: $SRC" >&2
+if [ ! -f "$SRC" ] || [ ! -f "$STOP_GENERATION_SRC" ] || [ ! -f "$STOP_ARCHIVE_SRC" ]; then
+    echo "Missing skip-listener source" >&2
     exit 1
 fi
 
@@ -93,14 +95,14 @@ PLIST
 
 plutil -lint "$PLIST_STAGE" >/dev/null
 
-swiftc -O -o "$EXE_STAGE" "$SRC"
+swiftc -O -o "$EXE_STAGE" "$SRC" "$STOP_GENERATION_SRC" "$STOP_ARCHIVE_SRC"
 cp "$EXE_STAGE" "$LEGACY_STAGE"
 chmod +x "$EXE_STAGE" "$LEGACY_STAGE"
 
 CODESIGN_IDENTITY="$(choose_codesign_identity || true)"
 if [ -n "$CODESIGN_IDENTITY" ]; then
-    if codesign --force --sign "$CODESIGN_IDENTITY" --timestamp=none "$APP_STAGE" && \
-       codesign --force --sign "$CODESIGN_IDENTITY" --identifier "com.elleai.skip-listener" --timestamp=none "$LEGACY_STAGE"; then
+    if codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --timestamp "$APP_STAGE" && \
+       codesign --force --options runtime --sign "$CODESIGN_IDENTITY" --identifier "com.elleai.skip-listener" --timestamp "$LEGACY_STAGE"; then
         echo "Signed with identity: $CODESIGN_IDENTITY"
     else
         if [ "$ALLOW_ADHOC" = "1" ]; then
