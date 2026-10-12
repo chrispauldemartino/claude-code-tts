@@ -7,8 +7,11 @@ import ApplicationServices
 // - Double-Control tap (ctrl+ctrl): PAUSE/RESUME — SIGSTOP/SIGCONT
 // - Command+Shift (single tap): REPEAT — replay last TTS response
 // - Function+Function tap (fn+fn): PLAY LOG — continue playback-log timeline
-// - Control+Arrow (keyDown): FORWARD/REWIND — skip ±1 sentence
-// - Control+Shift+Arrow (keyDown): MESSAGE NAV — play prev/next history message
+// - Control+Left/Right (keyDown): FORWARD/REWIND — skip ±1 sentence while speaking;
+//   navigate playback-log items while idle
+// - Control+Shift+Left/Right (keyDown): MESSAGE NAV — play prev/next history message;
+//   skip ±20 lines during an active file read
+// - Control+Up/Down (keyDown): SPEED — adjust speech speed ±25 WPM
 // - Enter (keyDown): STOP — kills entire voice session
 //
 // Usage: skip-listener [--debug]

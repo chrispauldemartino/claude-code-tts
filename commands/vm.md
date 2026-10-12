@@ -24,7 +24,8 @@ Session announcement controls:
 - `/vm backfill [N]` imports the invoking session's last completed answers into the playback log without playing them. `N` defaults to 10 and must be 1–100.
 - `/vm backfill status` shows the most recent completed import counts. Repeating an import is safe; matching answers are counted as duplicates.
 - Keyboard playback controls are `ctrl + ctrl` for pause/resume, `ctrl + left/right`
-  for one-sentence rewind/forward, `ctrl + shift + left/right` for previous/next
-  playback-log item, and `ctrl + up/down` for ±25 WPM. `shift + shift`,
+  for one-sentence rewind/forward (or playback-log navigation while idle),
+  `ctrl + shift + left/right` for previous/next message in session history (or a
+  20-line skip during an active file read), and `ctrl + up/down` for ±25 WPM. `shift + shift`,
   `cmd + cmd`, `cmd + shift`, and Enter keep their existing actions.
 - Mini-side hook files (`bin/session-metadata.py`, `bin/backfill-transcript.py`, `bin/prepare-speech.sh`, `hooks/session-start.sh`, `hooks/hooks.json`, and `hooks/auto-speak.sh`) run from the plugin checkout on the Mini and are not part of the MBP `/vm rebuild` sync.

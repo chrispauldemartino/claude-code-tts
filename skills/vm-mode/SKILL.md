@@ -83,7 +83,8 @@ active:
 - `ctrl + ctrl` pauses or resumes playback.
 - `ctrl + left/right` rewinds or advances one sentence; while idle, it moves
   through playback-log items.
-- `ctrl + shift + left/right` moves to the previous or next playback-log item.
+- `ctrl + shift + left/right` moves to the previous or next message in session
+  history; during an active file read, it skips backward or forward 20 lines.
 - `ctrl + up/down` changes speech speed by 25 WPM.
 - `cmd + shift` repeats the active or paused item; while idle it follows the
   same timeline behavior.

@@ -1573,7 +1573,7 @@ case "${1:-status}" in
         ;;
     *)
         echo "Usage: /vm [help|on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|backfill [N|status]|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary]"
-        echo "Keyboard: ctrl+ctrl pause/resume; ctrl+left/right sentence seek; ctrl+shift+left/right playback-log navigation; ctrl+up/down speed ±25 WPM."
+        echo "Keyboard: ctrl+ctrl pause/resume; ctrl+left/right sentence seek (playback-log nav while idle); ctrl+shift+left/right message/session-history nav (20-line skip during active file read); ctrl+up/down speed ±25 WPM."
         ;;
 esac
 }

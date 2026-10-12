@@ -169,7 +169,8 @@ Keyboard playback controls on the MBP:
 - `ctrl + ctrl`: pause or resume.
 - `ctrl + left/right`: rewind or advance one sentence; while idle, move through
   playback-log items.
-- `ctrl + shift + left/right`: previous or next playback-log item.
+- `ctrl + shift + left/right`: navigate to the previous or next message in
+  session history; during an active file read, skip backward or forward 20 lines.
 - `ctrl + up/down`: change speech speed by 25 WPM.
 - `shift + shift`, `cmd + cmd`, `cmd + shift`, and Enter retain their existing
   actions.
