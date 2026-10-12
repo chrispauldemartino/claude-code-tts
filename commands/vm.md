@@ -1,6 +1,6 @@
 ---
 description: "Global voice mode toggle for Claude Code + Codex — including per-session names, session/source announcement cues, focus, playback, and status."
-argument-hint: "[on [claude|codex]|off|listen [claude|codex]|dictation [claude|codex]|backfill [N|status]|name [nickname]|cue session/source/both/off|cue-frequency always/change|focus|log|speed|engine|doctor|status|voice on/off|mic on/off|subtitle on/off|summary on/off]"
+argument-hint: "[help|on [claude|codex]|off|listen [claude|codex]|dictation [claude|codex]|backfill [N|status]|name [nickname]|cue session/source/both/off|cue-frequency always/change|focus|log|speed|engine|doctor|status|voice on/off|mic on/off|subtitle on/off|summary on/off]"
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/vm-toggle.sh:*)
 ---
 
@@ -23,4 +23,8 @@ Session announcement controls:
 - `/vm status` includes the invoking session ID, nickname/provenance, allowlist state, and whether voice is on, open, or background-muted for that session.
 - `/vm backfill [N]` imports the invoking session's last completed answers into the playback log without playing them. `N` defaults to 10 and must be 1–100.
 - `/vm backfill status` shows the most recent completed import counts. Repeating an import is safe; matching answers are counted as duplicates.
+- Keyboard playback controls are `ctrl + ctrl` for pause/resume, `ctrl + left/right`
+  for one-sentence rewind/forward, `ctrl + shift + left/right` for previous/next
+  playback-log item, and `ctrl + up/down` for ±25 WPM. `shift + shift`,
+  `cmd + cmd`, `cmd + shift`, and Enter keep their existing actions.
 - Mini-side hook files (`bin/session-metadata.py`, `bin/backfill-transcript.py`, `bin/prepare-speech.sh`, `hooks/session-start.sh`, `hooks/hooks.json`, and `hooks/auto-speak.sh`) run from the plugin checkout on the Mini and are not part of the MBP `/vm rebuild` sync.

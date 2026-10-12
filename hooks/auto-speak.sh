@@ -811,7 +811,7 @@ is_vm_status() {
     return 1
 }
 
-# Save text for repeat (cmd+shift) and session history (opt+shift+arrow)
+# Save text for repeat (cmd+shift) and session history (ctrl+shift+arrow)
 # Called with the FULL response text (not deltas). If this is the same response
 # block (BLOCK_START already consumed), OVERWRITE the current history entry
 # instead of creating a new one — prevents duplicate entries from growing text.

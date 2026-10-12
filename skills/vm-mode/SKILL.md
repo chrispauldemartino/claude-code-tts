@@ -80,10 +80,15 @@ The MBP `skip-listener` owns keyboard playback controls while voice mode is
 active:
 
 - `fn + fn` continues the playback timeline. It does not wrap at the end.
+- `ctrl + ctrl` pauses or resumes playback.
+- `ctrl + left/right` rewinds or advances one sentence; while idle, it moves
+  through playback-log items.
+- `ctrl + shift + left/right` moves to the previous or next playback-log item.
+- `ctrl + up/down` changes speech speed by 25 WPM.
 - `cmd + shift` repeats the active or paused item; while idle it follows the
   same timeline behavior.
 - `/vm log play` mirrors `fn + fn`.
-- `/vm backfill [N]` adds completed transcript turns as unplayed log items and moves navigation to the newest import. It never starts playback; use `option + shift + left` to walk backward.
+- `/vm backfill [N]` adds completed transcript turns as unplayed log items and moves navigation to the newest import. It never starts playback; use `ctrl + shift + left` to walk backward.
 - `/vm backfill status` reports the latest import, skip, and duplicate counts.
 - `/vm log first` and `/vm log latest` explicitly move the timeline cursor.
 - If the 200-item playback manifest is empty, timeline playback falls back to

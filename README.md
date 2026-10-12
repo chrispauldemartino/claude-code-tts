@@ -164,6 +164,16 @@ mode runtime:
 - Spoken replies are prefixed with a source and short title, for example
   `Codex Queue Cleanup` or `Claude Code Subscription Consumption`.
 
+Keyboard playback controls on the MBP:
+
+- `ctrl + ctrl`: pause or resume.
+- `ctrl + left/right`: rewind or advance one sentence; while idle, move through
+  playback-log items.
+- `ctrl + shift + left/right`: previous or next playback-log item.
+- `ctrl + up/down`: change speech speed by 25 WPM.
+- `shift + shift`, `cmd + cmd`, `cmd + shift`, and Enter retain their existing
+  actions.
+
 ### speak-text CLI
 
 A standalone binary for direct TTS without going through MCP:

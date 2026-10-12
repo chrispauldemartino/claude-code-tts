@@ -1572,7 +1572,8 @@ case "${1:-status}" in
         esac
         ;;
     *)
-        echo "Usage: /vm [on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|backfill [N|status]|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary]"
+        echo "Usage: /vm [help|on [claude|codex]|off|rebuild|listen [claude|codex]|test|dictation [claude|codex]|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|focus|log|backfill [N|status]|speed|engine|status|doctor|voice|mic|name|cue|cue-frequency|subtitle|summary]"
+        echo "Keyboard: ctrl+ctrl pause/resume; ctrl+left/right sentence seek; ctrl+shift+left/right playback-log navigation; ctrl+up/down speed ±25 WPM."
         ;;
 esac
 }
@@ -1654,7 +1655,7 @@ vm_chain_arg_count() {
                 printf '%s\n' 1
             fi
             ;;
-        off|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|test|doctor|status|rebuild)
+        help|-h|--help|off|quiet|mute|unmute|repeat|skip|stop|pause|resume|forward|rewind|test|doctor|status|rebuild)
             printf '%s\n' 1
             ;;
         *)

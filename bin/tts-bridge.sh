@@ -125,7 +125,7 @@ EOF
                 echo "$speed" > /tmp/claude-tts-last-speed
                 echo "$volume" > /tmp/claude-tts-last-volume
 
-                # Save to session history for message nav (opt+shift+arrow)
+                # Save to session history for message nav (ctrl+shift+arrow)
                 HISTORY_DIR="/tmp/claude-tts-history-$$"
                 mkdir -p "$HISTORY_DIR"
                 total=0

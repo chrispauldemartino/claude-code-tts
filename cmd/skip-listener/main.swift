@@ -4,11 +4,11 @@ import ApplicationServices
 
 // Monitors modifier keys and key combos for voice mode controls:
 // - Double-Command tap (cmd+cmd): SKIP — kills audio + mic
-// - Double-Option tap (opt+opt): PAUSE/RESUME — SIGSTOP/SIGCONT
+// - Double-Control tap (ctrl+ctrl): PAUSE/RESUME — SIGSTOP/SIGCONT
 // - Command+Shift (single tap): REPEAT — replay last TTS response
 // - Function+Function tap (fn+fn): PLAY LOG — continue playback-log timeline
-// - Option+Arrow (keyDown): FORWARD/REWIND — skip ±1 sentence
-// - Option+Shift+Arrow (keyDown): MESSAGE NAV — play prev/next history message
+// - Control+Arrow (keyDown): FORWARD/REWIND — skip ±1 sentence
+// - Control+Shift+Arrow (keyDown): MESSAGE NAV — play prev/next history message
 // - Enter (keyDown): STOP — kills entire voice session
 //
 // Usage: skip-listener [--debug]
@@ -134,10 +134,10 @@ class ControlState {
     // Command double-tap (skip segment)
     var lastCommandUp: Date?
     var commandIsDown = false
-    // Option double-tap (pause)
-    var lastOptionUp: Date?
-    var optionIsDown = false
-    var lastOptionComboUse: Date?
+    // Control double-tap (pause)
+    var lastControlUp: Date?
+    var controlIsDown = false
+    var lastControlComboUse: Date?
     var isPaused = false
     // Shift double-tap (stop all)
     var lastShiftUp: Date?
@@ -149,9 +149,9 @@ class ControlState {
     var cmdShiftTriggered = false
     // Track if a regular key was pressed while cmd+shift held (prevents false triggers)
     var regularKeyDuringCmdShift = false
-    // Option+Shift double-tap (drill-down)
-    var optShiftTriggered = false
-    var lastOptShiftUp: Date?
+    // Control+Shift double-tap (drill-down)
+    var controlShiftTriggered = false
+    var lastControlShiftUp: Date?
     // Voice active cache
     var voiceActive = false
     var lastVoiceCheck: Date = .distantPast
@@ -1397,9 +1397,9 @@ func shouldRestartQueuePlayback() -> Bool {
     FileManager.default.fileExists(atPath: restartQueueFlag)
 }
 
-func markOptionComboUse() {
-    state.lastOptionComboUse = Date()
-    state.lastOptionUp = nil
+func markControlComboUse() {
+    state.lastControlComboUse = Date()
+    state.lastControlUp = nil
 }
 
 func playbackPreview(_ context: PlaybackContext) -> String {
@@ -2508,7 +2508,7 @@ func adjustSpeechSpeed(delta: Int) {
     playChime()
 }
 
-// MARK: - Drill-Down (opt+shift double-tap or voice keyword)
+// MARK: - Drill-Down (ctrl+shift double-tap or voice keyword)
 
 func triggerDrillDown(target: String? = nil) {
     stopGenerationStore.clearAutoplayHold()
@@ -2701,7 +2701,7 @@ func performDrillDown(
     }
 }
 
-// MARK: - Message Navigation (opt+shift+arrow)
+// MARK: - Message Navigation (ctrl+shift+arrow)
 
 func interruptPlaybackForReplay() {
     FileManager.default.createFile(atPath: skipFlag, contents: nil)
@@ -3300,33 +3300,33 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         // Arrow keys with modifiers
         let isArrowKey = (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode || keyCode == upArrowKeyCode || keyCode == downArrowKeyCode)
         if isArrowKey {
-            let hasOption = flags.contains(.maskAlternate)
+            let hasAlternate = flags.contains(.maskAlternate)
             let hasShift = flags.contains(.maskShift)
             let hasCommand = flags.contains(.maskCommand)
             let hasControl = flags.contains(.maskControl)
 
-            if hasOption && !hasShift && !hasCommand && !hasControl && (keyCode == upArrowKeyCode || keyCode == downArrowKeyCode) {
-                markOptionComboUse()
+            if hasControl && !hasShift && !hasCommand && !hasAlternate && (keyCode == upArrowKeyCode || keyCode == downArrowKeyCode) {
+                markControlComboUse()
                 if keyCode == upArrowKeyCode {
-                    debugPrint("OPT+UP — increase speed")
+                    debugPrint("CTRL+UP — increase speed")
                     DispatchQueue.main.async { adjustSpeechSpeed(delta: speechSpeedStep) }
                 } else {
-                    debugPrint("OPT+DOWN — decrease speed")
+                    debugPrint("CTRL+DOWN — decrease speed")
                     DispatchQueue.main.async { adjustSpeechSpeed(delta: -speechSpeedStep) }
                 }
                 return Unmanaged.passUnretained(event)
             }
 
-            // opt+shift+arrow: during file read = 20-line skip, otherwise = message nav
-            if hasOption && hasShift && !hasCommand && !hasControl && (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode) {
-                markOptionComboUse()
+            // ctrl+shift+arrow: during file read = 20-line skip, otherwise = message nav
+            if hasControl && hasShift && !hasCommand && !hasAlternate && (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode) {
+                markControlComboUse()
                 if isReadingFile() {
                     // File read active — skip 20 lines forward/back
                     if keyCode == rightArrowKeyCode {
-                        debugPrint("OPT+SHIFT+RIGHT — big forward 20 lines (file read)")
+                        debugPrint("CTRL+SHIFT+RIGHT — big forward 20 lines (file read)")
                         FileManager.default.createFile(atPath: bigForwardFlag, contents: nil)
                     } else {
-                        debugPrint("OPT+SHIFT+LEFT — big rewind 20 lines (file read)")
+                        debugPrint("CTRL+SHIFT+LEFT — big rewind 20 lines (file read)")
                         FileManager.default.createFile(atPath: bigRewindFlag, contents: nil)
                     }
                     killTTSProcesses()
@@ -3335,38 +3335,38 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
                 } else {
                     // Terminal mode — message navigation
                     let direction = (keyCode == rightArrowKeyCode) ? "next" : "prev"
-                    debugPrint("OPT+SHIFT+ARROW — message nav \(direction)")
+                    debugPrint("CTRL+SHIFT+ARROW — message nav \(direction)")
                     DispatchQueue.main.async { triggerMessageNav(direction: direction) }
                 }
                 return Unmanaged.passUnretained(event)
             }
 
-            // opt+arrow: forward/rewind. While speaking, seek within the active playback.
+            // ctrl+arrow: forward/rewind. While speaking, seek within the active playback.
             // When idle, move through the playback log instead.
-            if hasOption && !hasShift && !hasCommand && !hasControl && (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode) {
-                markOptionComboUse()
+            if hasControl && !hasShift && !hasCommand && !hasAlternate && (keyCode == leftArrowKeyCode || keyCode == rightArrowKeyCode) {
+                markControlComboUse()
                 if keyCode == rightArrowKeyCode {
                     if isTTSPlaying() {
-                        debugPrint("OPT+RIGHT — forward 1 sentence")
+                        debugPrint("CTRL+RIGHT — forward 1 sentence")
                         FileManager.default.createFile(atPath: forwardFlag, contents: nil)
                         killTTSProcesses()
                         usleep(100_000)
                         playChime()
                     } else {
-                        debugPrint("OPT+RIGHT — playback log next")
+                        debugPrint("CTRL+RIGHT — playback log next")
                         DispatchQueue.main.async {
                             _ = triggerPlaybackLogAction(direction: "next", status: "nav")
                         }
                     }
                 } else {
                     if isTTSPlaying() {
-                        debugPrint("OPT+LEFT — rewind 1 sentence")
+                        debugPrint("CTRL+LEFT — rewind 1 sentence")
                         FileManager.default.createFile(atPath: rewindFlag, contents: nil)
                         killTTSProcesses()
                         usleep(100_000)
                         playChime()
                     } else {
-                        debugPrint("OPT+LEFT — playback log previous")
+                        debugPrint("CTRL+LEFT — playback log previous")
                         DispatchQueue.main.async {
                             _ = triggerPlaybackLogAction(direction: "prev", status: "nav")
                         }
@@ -3395,14 +3395,14 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
 
     // Command keys: 55 (left), 54 (right)
     let isCommandKey = (keyCode == 55 || keyCode == 54)
-    // Option keys: 58 (left), 61 (right)
-    let isOptionKey = (keyCode == 58 || keyCode == 61)
+    // Control keys: 59 (left), 62 (right)
+    let isControlKey = (keyCode == 59 || keyCode == 62)
     // Shift keys: 56 (left), 60 (right)
     let isShiftKey = (keyCode == 56 || keyCode == 60)
     // Function key: 63 on Apple keyboards
     let isFunctionKey = (keyCode == functionKeyCode || flags.contains(.maskSecondaryFn))
 
-    if !isCommandKey && !isOptionKey && !isShiftKey && !isFunctionKey {
+    if !isCommandKey && !isControlKey && !isShiftKey && !isFunctionKey {
         return Unmanaged.passUnretained(event)
     }
 
@@ -3439,37 +3439,37 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         return Unmanaged.passUnretained(event)
     }
 
-    // --- OPT+SHIFT DOUBLE-TAP: DRILL-DOWN ---
-    // Detect opt+shift held together then released twice. Does NOT interfere
-    // with opt+shift+arrow (that's a keyDown event, this is flagsChanged).
-    if isOptionKey || isShiftKey {
-        let hasOption = flags.contains(.maskAlternate)
+    // --- CTRL+SHIFT DOUBLE-TAP: DRILL-DOWN ---
+    // Detect ctrl+shift held together then released twice. Does NOT interfere
+    // with ctrl+shift+arrow (that's a keyDown event, this is flagsChanged).
+    if isControlKey || isShiftKey {
+        let hasAlternate = flags.contains(.maskAlternate)
         let hasShift = flags.contains(.maskShift)
         let hasCommand = flags.contains(.maskCommand)
         let hasControl = flags.contains(.maskControl)
 
-        // When both opt+shift are pressed (and no cmd/ctrl)
-        if hasOption && hasShift && !hasCommand && !hasControl {
-            if !state.optShiftTriggered {
-                state.optShiftTriggered = true
-                debugPrint("OPT+SHIFT down — armed for drill-down")
+        // When both ctrl+shift are pressed (and no cmd/alternate)
+        if hasControl && hasShift && !hasCommand && !hasAlternate {
+            if !state.controlShiftTriggered {
+                state.controlShiftTriggered = true
+                debugPrint("CTRL+SHIFT down — armed for drill-down")
             }
         }
 
         // When all modifiers released (keys release one at a time, so this fires
-        // on the SECOND release — e.g., opt releases, then shift releases)
-        if state.optShiftTriggered && !hasOption && !hasShift && !hasCommand && !hasControl {
-            state.optShiftTriggered = false
+        // on the SECOND release — e.g., ctrl releases, then shift releases)
+        if state.controlShiftTriggered && !hasAlternate && !hasShift && !hasCommand && !hasControl {
+            state.controlShiftTriggered = false
             let now = Date()
-            state.lastOptionComboUse = now
+            state.lastControlComboUse = now
 
-            if let last = state.lastOptShiftUp, now.timeIntervalSince(last) < doubleTapWindow {
-                state.lastOptShiftUp = nil
-                debugPrint("OPT+SHIFT DOUBLE TAP — triggering drill-down")
+            if let last = state.lastControlShiftUp, now.timeIntervalSince(last) < doubleTapWindow {
+                state.lastControlShiftUp = nil
+                debugPrint("CTRL+SHIFT DOUBLE TAP — triggering drill-down")
                 playChime()
                 DispatchQueue.main.async { triggerDrillDown() }
             } else {
-                state.lastOptShiftUp = now
+                state.lastControlShiftUp = now
             }
         }
 
@@ -3483,10 +3483,10 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         let hasCommand = flags.contains(.maskCommand)
         let hasShift = flags.contains(.maskShift)
         let hasControl = flags.contains(.maskControl)
-        let hasOption = flags.contains(.maskAlternate)
+        let hasAlternate = flags.contains(.maskAlternate)
 
-        // When both cmd+shift are pressed (and no ctrl/opt)
-        if hasCommand && hasShift && !hasControl && !hasOption {
+        // When both cmd+shift are pressed (and no ctrl/alternate)
+        if hasCommand && hasShift && !hasControl && !hasAlternate {
             if !state.cmdShiftTriggered {
                 state.cmdShiftTriggered = true
                 state.regularKeyDuringCmdShift = false
@@ -3541,39 +3541,39 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
         }
     }
 
-    // --- OPTION DOUBLE-TAP: PAUSE/RESUME ---
-    if isOptionKey {
-        let hasOption = flags.contains(.maskAlternate)
+    // --- CONTROL DOUBLE-TAP: PAUSE/RESUME ---
+    if isControlKey {
+        let hasControl = flags.contains(.maskControl)
 
         // Ignore if other modifiers held
-        if !flags.intersection([.maskShift, .maskControl, .maskCommand]).isEmpty {
-            state.optionIsDown = false
-            state.lastOptionUp = nil
+        if !flags.intersection([.maskShift, .maskAlternate, .maskCommand]).isEmpty {
+            state.controlIsDown = false
+            state.lastControlUp = nil
             return Unmanaged.passUnretained(event)
         }
 
-        debugPrint("Option flagsChanged: keyCode=\(keyCode) hasOption=\(hasOption)")
+        debugPrint("Control flagsChanged: keyCode=\(keyCode) hasControl=\(hasControl)")
 
-        if hasOption && !state.optionIsDown {
-            state.optionIsDown = true
-        } else if !hasOption && state.optionIsDown {
-            state.optionIsDown = false
+        if hasControl && !state.controlIsDown {
+            state.controlIsDown = true
+        } else if !hasControl && state.controlIsDown {
+            state.controlIsDown = false
             let now = Date()
 
-            if let lastCombo = state.lastOptionComboUse, now.timeIntervalSince(lastCombo) < doubleTapWindow {
-                debugPrint("OPTION DOUBLE TAP — suppressed after option-based combo")
-                state.lastOptionUp = nil
+            if let lastCombo = state.lastControlComboUse, now.timeIntervalSince(lastCombo) < doubleTapWindow {
+                debugPrint("CONTROL DOUBLE TAP — suppressed after control-based combo")
+                state.lastControlUp = nil
                 return Unmanaged.passUnretained(event)
             }
 
-            if let last = state.lastOptionUp, now.timeIntervalSince(last) < doubleTapWindow {
-                state.lastOptionUp = nil
-                // Always allow pause toggle — if user double-taps opt, they want to pause/resume.
+            if let last = state.lastControlUp, now.timeIntervalSince(last) < doubleTapWindow {
+                state.lastControlUp = nil
+                // Always allow pause toggle — if user double-taps ctrl, they want to pause/resume.
                 // Checking isVoiceActive() was too strict: the flag can be cleared between sentences.
-                debugPrint("OPTION DOUBLE TAP — toggling pause")
+                debugPrint("CONTROL DOUBLE TAP — toggling pause")
                 DispatchQueue.main.async { togglePause() }
             } else {
-                state.lastOptionUp = now
+                state.lastControlUp = now
             }
         }
     }
@@ -3582,15 +3582,15 @@ let callback: CGEventTapCallBack = { proxy, type, event, userInfo in
     if isShiftKey {
         let hasShift = flags.contains(.maskShift)
 
-        // Only trigger when shift alone (no cmd, opt, ctrl)
+        // Only trigger when shift alone (no cmd, alternate, ctrl)
         if !flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty {
             state.shiftIsDown = false
             state.lastShiftUp = nil
             return Unmanaged.passUnretained(event)
         }
 
-        // Don't trigger if cmd+shift repeat or opt+shift drill-down is armed
-        if state.cmdShiftTriggered || state.optShiftTriggered {
+        // Don't trigger if cmd+shift repeat or ctrl+shift drill-down is armed
+        if state.cmdShiftTriggered || state.controlShiftTriggered {
             return Unmanaged.passUnretained(event)
         }
 
