@@ -1803,6 +1803,8 @@ func triggerStopAll() {
     if ownsTransactionLock {
         releaseStopTransactionLock()
     }
+    // Play after pkill so the stop-all loop cannot kill the chime.
+    playChime()
     debugPrint("STOP ALL — generation \(stoppedGeneration.generation), archived \(archivedIDs.count) queued item(s), autoplay held")
 }
 
