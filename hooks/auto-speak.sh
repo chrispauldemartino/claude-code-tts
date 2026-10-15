@@ -307,7 +307,7 @@ if [ -n "$SESSION_ID" ]; then
 fi
 
 # --- Feature B: Foreground allowlist suppression guard ---
-FOREGROUND_ALLOWLIST="/tmp/claude-tts-foreground-sessions"
+FOREGROUND_ALLOWLIST="${CLAUDE_TTS_FOREGROUND_ALLOWLIST:-/tmp/claude-tts-foreground-sessions}"
 suppress_bg="$(grep '^suppress_background=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || true)"
 if [ "$suppress_bg" = "on" ]; then
     if [ -z "$SESSION_ID" ]; then
