@@ -31,11 +31,24 @@ check_self_heal_idempotent() {
 }
 
 check_doctor_failure() {
-    grep -F '[FAIL] active session NOT in foreground allowlist' "$VM_TOGGLE" >/dev/null
+    grep -Eq 'echo "  \[FAIL\] active session \$\{?active_id\}? NOT in foreground allowlist \(forwarder silently blocked\)"' "$VM_TOGGLE"
+}
+
+handler_body() {
+    local command="$1"
+    awk -v command="$command" '
+        $0 ~ "^    " command "\\)" { in_handler = 1 }
+        in_handler { print }
+        in_handler && $0 == "        ;;" { exit }
+    ' "$VM_TOGGLE"
 }
 
 check_no_cue_off_update() {
-    ! grep -F 'update_toggle "cue" "off"' "$VM_TOGGLE" >/dev/null
+    local command body
+    for command in listen test dictation; do
+        body="$(handler_body "$command")"
+        ! grep -F 'update_toggle "cue" "off"' <<< "$body" >/dev/null || return 1
+    done
 }
 
 check_remote_focus_timeline() {
@@ -63,7 +76,8 @@ check_allowlist_clear_audit() {
         grep -F 'vm off' <<< "$audit_line" >/dev/null &&
         grep -F '$$' <<< "$audit_line" >/dev/null &&
         grep -F '${PPID:-' <<< "$audit_line" >/dev/null &&
-        grep -F '$allowlist_session_count' <<< "$audit_line" >/dev/null &&
+        grep -F 'session_count=%s' <<< "$audit_line" >/dev/null &&
+        grep -F '"$allowlist_session_count"' <<< "$audit_line" >/dev/null &&
         grep -F "date '+%Y-%m-%d %H:%M:%S'" <<< "$audit_line" >/dev/null &&
         grep -F '|| true' <<< "$audit_line" >/dev/null
 }

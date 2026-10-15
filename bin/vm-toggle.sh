@@ -782,7 +782,7 @@ run_doctor() {
         if [ -f "$FOREGROUND_ALLOWLIST" ] && grep -Fxq -- "$active_id" "$FOREGROUND_ALLOWLIST" 2>/dev/null; then
             echo "  [OK] active session in foreground allowlist (${active_id})"
         else
-            echo "  [FAIL] active session NOT in foreground allowlist (${active_id}; forwarder silently blocked)"
+            echo "  [FAIL] active session ${active_id} NOT in foreground allowlist (forwarder silently blocked)"
             overall=1
         fi
     else
@@ -1260,7 +1260,7 @@ case "${1:-status}" in
         if [ -f "$FOREGROUND_ALLOWLIST" ]; then
             allowlist_session_count="$(awk 'NF { count++ } END { print count + 0 }' "$FOREGROUND_ALLOWLIST" 2>/dev/null || printf '0\n')"
         fi
-        printf '%s [%s] allowlist-clear reason="vm off" ppid=%s session_ids=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "${PPID:-unknown}" "$allowlist_session_count" >> /tmp/claude-tts-debug.log 2>/dev/null || true
+        printf '%s [%s] allowlist-clear reason="vm off" ppid=%s session_count=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "${PPID:-unknown}" "$allowlist_session_count" >> /tmp/claude-tts-debug.log 2>/dev/null || true
         rm -f "$FOREGROUND_ALLOWLIST"
         clear_voice_session_claim
         stop_daemon
@@ -1512,7 +1512,7 @@ case "${1:-status}" in
             on|session) update_toggle "cue" "session"; echo "Cue: session" ;;
             source) update_toggle "cue" "source"; echo "Cue: source" ;;
             both) update_toggle "cue" "both"; echo "Cue: both" ;;
-            off) cue_setting="off"; update_toggle "cue" "$cue_setting"; echo "Cue: off" ;;
+            off) update_toggle "cue" "off"; echo "Cue: off" ;;
             *) echo "Usage: /vm cue session|source|both|off" ;;
         esac
         ;;
